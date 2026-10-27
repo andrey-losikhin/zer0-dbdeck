@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<style-scheme id="dbdeck-dark" name="dbdeck-dark" version="1.0" parent-scheme="Adwaita-dark">
+  <style name="text" foreground="#d7e1eb" background="#111923"/>
+  <style name="selection" foreground="#d7e1eb" background="#314b64"/>
+  <style name="selection-unfocused" foreground="#d7e1eb" background="#314b64"/>
+  <style name="cursor" foreground="#d7e1eb"/>
+  <style name="current-line" background="#1b2632"/>
+  <style name="line-numbers" foreground="#8b9eb2" background="#151f2b"/>
+  <style name="current-line-number" foreground="#d7e1eb" background="#1b2632"/>
+  <style name="def:keyword" foreground="#c3a6f5" bold="true"/>
+  <style name="def:statement" foreground="#c3a6f5"/>
+  <style name="def:string" foreground="#8cceac"/>
+  <style name="def:comment" foreground="#8b9eb2" italic="true"/>
+  <style name="def:decimal" foreground="#eab683"/>
+  <style name="def:floating-point" foreground="#eab683"/>
+  <style name="def:boolean" foreground="#eab683"/>
+  <style name="def:function" foreground="#80b8ed"/>
+  <style name="def:type" foreground="#e6ce8c"/>
+  <style name="def:preprocessor" foreground="#c3a6f5"/>
+  <style name="bracket-match" foreground="#d7e1eb" background="#314b64"/>
+</style-scheme>

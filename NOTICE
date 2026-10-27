@@ -1,0 +1,19 @@
+zer0-dbdeck
+Copyright 2026 Andrey Losikhin
+
+Original project code is licensed under Apache License 2.0.
+This product includes third-party material under separate licenses:
+
+- Tabulator by Oli Folkerd, MIT License; bundled license files in assets/vendor/.
+- Simple Icons by Simple Icons Collaborators, CC0-1.0; assets/icons/vendors/.
+- Material Design Icons by Pictogrammers, under the Pictogrammers Free License
+  (including Apache-2.0 icon terms); assets/icons/vendors/.
+- Solar UI icon adaptations by 480 Design, CC BY 4.0. The SVGs in
+  assets/icons/penpot/ and assets/icons/symbolic/ include recolored, resized and
+  stroke-converted adaptations. Source: https://www.figma.com/community/file/1166831539721848736
+- Tokyo Night palette by enkia and contributors, MIT License.
+- Catppuccin palette by Catppuccin, MIT License.
+
+See docs/THIRD_PARTY_NOTICES.md and the referenced license files.
+Product names and vendor logos remain the property of their respective owners;
+no affiliation or endorsement is implied.

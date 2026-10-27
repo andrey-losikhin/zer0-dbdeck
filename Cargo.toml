@@ -1,0 +1,30 @@
+[package]
+name = "zer0-dbdeck"
+version = "0.1.0"
+edition = "2024"
+description = "A native Wayland database client for PostgreSQL and MySQL/MariaDB"
+license = "Apache-2.0"
+authors = ["Andrey Losikhin"]
+repository = "https://github.com/andrey-losikhin/zer0-dbdeck"
+homepage = "https://github.com/andrey-losikhin/zer0-dbdeck"
+readme = "README.md"
+keywords = ["database", "postgresql", "mysql", "gtk4", "wayland"]
+categories = ["database", "gui"]
+publish = false
+
+[dependencies]
+base64 = "0.22"
+libc = "0.2"
+directories = "6.0"
+futures-util = "0.3"
+relm4 = { version = "0.10", features = ["libadwaita"] }
+ring = "0.17"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sourceview5 = "0.10"
+sqlparser = { version = "0.63", default-features = false, features = ["std"] }
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio-rustls", "postgres", "mysql"] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "time", "sync"] }
+uuid = { version = "1.0", features = ["serde", "v4"] }
+webkit6 = "=0.5.0"
+zeroize = "1.9"

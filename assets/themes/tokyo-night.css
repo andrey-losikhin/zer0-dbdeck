@@ -1,0 +1,125 @@
+/* Tokyo Night palette: https://github.com/tokyo-night/tokyo-night-vscode-theme#color-palette */
+@define-color window_bg_color #1a1b26;
+@define-color window_fg_color #c0caf5;
+@define-color view_bg_color #16161e;
+@define-color view_fg_color #c0caf5;
+@define-color headerbar_bg_color #16161e;
+@define-color headerbar_fg_color #c0caf5;
+@define-color card_bg_color #1f2335;
+@define-color card_fg_color #c0caf5;
+@define-color popover_bg_color #1f2335;
+@define-color popover_fg_color #c0caf5;
+@define-color dialog_bg_color #1a1b26;
+@define-color dialog_fg_color #c0caf5;
+
+@define-color accent_color #7aa2f7;
+@define-color accent_bg_color #7aa2f7;
+@define-color accent_fg_color #1a1b26;
+window { background: #1a1b26; color: #c0caf5; font-family: "Roboto Flex", "Noto Sans", sans-serif; }
+headerbar { background: #1f2335; color: #c0caf5; border-bottom: 0; box-shadow: none; }
+.sql-editor { font-family: monospace; font-size: 12px; }
+.sql-editor-region, .sql-results-region { background: #1a1b26; }
+.sql-toolbar { background: #1f2335; border-top: 1px solid #414868; padding: 6px 8px; }
+.query-risk-indicator { border-radius: 999px; padding: 2px 8px; }
+.query-risk-indicator.status-pending { background: #352c29; color: #e0af68; }
+.query-risk-indicator.status-success { background: #23312f; }
+.query-error-message { color: #f7768e; background: #3b2535; border-radius: 6px; }
+.table-edit-toolbar { background: #1f2335; border-top: 1px solid #414868; padding: 6px 8px; }
+.grid-cell-edited { color: #e0af68; background: #352c29; border-color: #e0af68; }
+button.suggested-action.table-save-ready, button.suggested-action.table-save-ready:hover { background: #9ece6a; color: #16161e; }
+.grid-column-selected { background: #292e42; }
+.sql-tab-add { min-width: 28px; min-height: 28px; padding: 4px; }
+notebook > header.top > tabs { background: #1a1b26; border-bottom: 1px solid #414868; padding: 0; }
+notebook > header.top > tabs > tab { background: #1a1b26; color: #9aa5ce; padding: 3px 8px; margin: 0; border-radius: 0; border-right: 0; border-bottom: 2px solid transparent; }
+notebook > header.top > tabs > tab:hover { background: #1f2335; color: #c0caf5; }
+notebook > header.top > tabs > tab:checked { background: #1f2335; color: #c0caf5; border-bottom: 2px solid #7aa2f7; }
+.add-connection-button:hover, .connected-action:hover { background: #24283b; }
+.compact-tab-close:hover { background: #24283b; }
+window.preferences, preferencespage { background: #1a1b26; color: #c0caf5; }
+preferencesgroup { color: #c0caf5; }
+.preferences row { background: #1f2335; color: #c0caf5; border-color: #414868; }
+.preferences row:hover { background: #24283b; }
+.navigation-rail { background: #16161e; border-right: 1px solid #414868; }
+.sidebar-panel, .sidebar-stack { background: #1f2335; color: #c0caf5; }
+.sidebar-title, .dim-label, .connection-details { color: #9aa5ce; }
+.sidebar-nav-button { color: #9aa5ce; }
+.sidebar-nav-button:hover, .table-nav-item:hover { background: #24283b; color: #c0caf5; }
+button:hover image { color: #7aa2f7; }
+.sidebar-nav-active { background: transparent; color: #7aa2f7; }
+.schema-tree-row:hover { background: #24283b; color: #c0caf5; }
+.schema-tree-row-active, .schema-tree-row-active:hover { background: transparent; color: #7aa2f7; }
+.schema-tree-row-active label { color: #7aa2f7; }
+.table-nav-item-selected, .table-nav-item-selected:hover { background: transparent; color: #7aa2f7; }
+.table-nav-item-selected label { color: #7aa2f7; opacity: 1; }
+.table-nav-item-selected:hover { background: #292e42; }
+.connection-card { background: #24283b; color: #c0caf5; border: 1px solid #414868; }
+.connection-card-active.connection-color-blue { border-color: #4f8fe8; }
+.connection-card-active.connection-color-teal { border-color: #7aa2f7; }
+.connection-card-active.connection-color-green { border-color: #55b879; }
+.connection-card-active.connection-color-yellow { border-color: #e4b84f; }
+.connection-card-active.connection-color-orange { border-color: #e58b4f; }
+.connection-card-active.connection-color-red { border-color: #df626b; }
+.connection-card-active.connection-color-purple { border-color: #a57be8; }
+.active-connection-header { background: #24283b; color: #c0caf5; border: 1px solid #414868; }
+.active-connection-header.connection-color-blue { border-left-color: #7aa2f7; }
+.active-connection-header.connection-color-teal { border-left-color: #4fc4bb; }
+.active-connection-header.connection-color-green { border-left-color: #5dcc86; }
+.active-connection-header.connection-color-yellow { border-left-color: #e0af68; }
+.active-connection-header.connection-color-orange { border-left-color: #f09a5b; }
+.active-connection-header.connection-color-red { border-left-color: #ed737d; }
+.active-connection-header.connection-color-purple { border-left-color: #b293f2; }
+.table-nav-item { color: #c0caf5; }
+.table-filter-panel { background: #1f2335; border-bottom: 1px solid #414868; }
+.table-filter-row entry, .table-filter-row combobox, entry, combobox { background: #16161e; color: #c0caf5; border-color: #414868; }
+entry:focus, combobox:focus { border-color: #7aa2f7; }
+button.grid-header, .grid-header { background: #24283b; color: #c0caf5; border-color: #414868; min-width: 0; padding: 0; }
+button.grid-header:hover { background: #292e42; }
+.grid-sort-button { min-width: 24px; min-height: 24px; padding: 2px 4px; margin: 0; border-radius: 4px; }
+.grid-header-label { min-height: 0; padding: 3px 6px; margin: 0; }
+.grid-column-resize-handle { min-width: 6px; background: transparent; }
+.grid-column-resize-handle:hover { background: color-mix(in srgb, #7aa2f7 22%, transparent); }
+.grid-row-header { min-width: 38px; min-height: 28px; padding: 2px 5px; border-radius: 0; color: #9aa5ce; background: #16161e; font-weight: 400; }
+.grid-row-header-selected { color: #7aa2f7; background: #292e42; }
+.grid-cell { background: #16161e; color: #c0caf5; border-color: #414868; min-width: 48px; padding: 4px 8px; border: 1px solid transparent; }
+.grid-cell-inline-editor, .grid-cell-inline-editor:focus { background: #16161e; color: #c0caf5; border: 1px solid #414868; border-radius: 0; box-shadow: inset 0 0 0 2px #7aa2f7; padding: 4px 8px; }
+.grid-cell.alternate { background: #16161e; }
+.grid-cell.row-hover, .grid-cell.alternate.row-hover { border-top-color: #7aa2f7; border-bottom-color: #7aa2f7; }
+.grid-cell.grid-row-first.row-hover { border-left-color: #7aa2f7; }
+.grid-cell.grid-row-last.row-hover { border-right-color: #7aa2f7; }
+.grid-cell.grid-cell-selected { box-shadow: inset 0 0 0 2px #7aa2f7; }
+.grid-cell.row-hover.grid-cell-selected, .grid-cell.alternate.row-hover.grid-cell-selected { box-shadow: inset 0 0 0 2px #7aa2f7; }
+.grid-cell.grid-cell-range { background: color-mix(in srgb, #7aa2f7 12%, var(--view-bg-color)); }
+.grid-cell.grid-cell-copied { outline: 1px dashed #7aa2f7; outline-offset: -2px; }
+.grid-cell.grid-cell-edited { color: #e0af68; background: #352c29; border-color: #e0af68; }
+.grid-cell.grid-cell-edited.grid-cell-selected { box-shadow: inset 0 0 0 2px #e0af68; }
+.grid-cell.null-cell, .dim-label { color: #9aa5ce; }
+.grid-cell.truncated-cell, .status-pending { color: #e0af68; }
+.grid-cell.decode-error, .status-error { color: #f7768e; }
+.tag-prod { background: #3b2535; color: #f7768e; }
+.tag-stage { background: #352c29; color: #e0af68; }
+.tag-local { background: #23312f; color: #9ece6a; }
+.status-success { color: #9ece6a; }
+.tag-active { background: #7aa2f7; color: #1a1b26; }
+.table-context-popover > contents, popover > contents { background: #24283b; color: #c0caf5; border: 1px solid #7aa2f7; }
+.table-context-popover.connection-color-blue > contents { border-color: #4f8fe8; }
+.table-context-popover.connection-color-teal > contents { border-color: #7aa2f7; }
+.table-context-popover.connection-color-green > contents { border-color: #55b879; }
+.table-context-popover.connection-color-yellow > contents { border-color: #e4b84f; }
+.table-context-popover.connection-color-orange > contents { border-color: #e58b4f; }
+.table-context-popover.connection-color-red > contents { border-color: #df626b; }
+.table-context-popover.connection-color-purple > contents { border-color: #a57be8; }
+.table-context-action:hover { background: #292e42; }
+.table-context-action image { color: #c0caf5; opacity: 1; }
+.color-option-selected { outline-color: #7aa2f7; }
+button.suggested-action { background: #7aa2f7; color: #1a1b26; }
+button.suggested-action:hover { background: #4fc4bb; color: #1a1b26; }
+button:focus { outline-color: #7aa2f7; }
+frame { border-color: #414868; }
+
+/* Compact data/query tabs; the surrounding header stays transparent. */
+notebook.workspace-tabs > header.top { background: transparent; border: 0; box-shadow: none; padding: 0; }
+notebook.workspace-tabs > header.top > tabs { background: transparent; border: 0; padding: 0; min-height: 28px; }
+notebook.workspace-tabs > header.top > tabs > tab { background: #1f2335; padding: 2px 8px; margin: 0 2px 0 0; border: 0; border-radius: 5px 5px 0 0; min-height: 22px; box-shadow: none; }
+notebook.workspace-tabs > header.top > tabs > tab:checked { background: #16161e; color: #c0caf5; border: 0; box-shadow: none; font-weight: 600; }
+notebook.workspace-tabs > header.top > button.sql-tab-add { background: transparent; border: 1px solid #414868; border-radius: 999px; padding: 2px; margin: 0 0 0 1px; min-width: 24px; min-height: 24px; box-shadow: none; }
+notebook.workspace-tabs > header.top > button.sql-tab-add:hover { background: #1f2335; }

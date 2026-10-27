@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<style-scheme id="dbdeck-mocha" name="dbdeck-mocha" version="1.0" parent-scheme="Adwaita-dark">
+  <style name="text" foreground="#cdd6f4" background="#11111b"/>
+  <style name="selection" foreground="#cdd6f4" background="#45475a"/>
+  <style name="selection-unfocused" foreground="#cdd6f4" background="#45475a"/>
+  <style name="cursor" foreground="#f5e0dc"/>
+  <style name="current-line" background="#1e1e2e"/>
+  <style name="line-numbers" foreground="#7f849c" background="#181825"/>
+  <style name="current-line-number" foreground="#cdd6f4" background="#1e1e2e"/>
+  <style name="def:keyword" foreground="#cba6f7" bold="true"/>
+  <style name="def:statement" foreground="#cba6f7"/>
+  <style name="def:string" foreground="#a6e3a1"/>
+  <style name="def:comment" foreground="#9399b2" italic="true"/>
+  <style name="def:decimal" foreground="#fab387"/>
+  <style name="def:floating-point" foreground="#fab387"/>
+  <style name="def:boolean" foreground="#fab387"/>
+  <style name="def:function" foreground="#89b4fa"/>
+  <style name="def:type" foreground="#f9e2af"/>
+  <style name="def:preprocessor" foreground="#cba6f7"/>
+  <style name="bracket-match" foreground="#cdd6f4" background="#45475a"/>
+</style-scheme>

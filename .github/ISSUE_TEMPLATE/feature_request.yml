@@ -1,0 +1,22 @@
+name: Feature request
+description: Propose a focused improvement for a daily database workflow.
+title: "[Feature]: "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Workflow and problem
+      description: What are you trying to do, and what gets in the way?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives and scope
+      description: Include keyboard interaction where relevant. Avoid real connection details.

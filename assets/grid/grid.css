@@ -1,0 +1,46 @@
+html,body,#grid{width:100%;height:100%;margin:0;background:var(--grid-bg);color:var(--grid-fg);font:12px "Noto Sans",sans-serif;overflow:hidden}
+.tabulator{border:1px solid var(--grid-border);background:var(--grid-bg);color:var(--grid-fg);font-size:12px}
+.tabulator .tabulator-header{background:var(--grid-panel);border-bottom:1px solid var(--grid-border);color:var(--grid-fg);font-weight:600}
+.tabulator .tabulator-header .tabulator-col{background:var(--grid-panel);border-right:1px solid var(--grid-border)}
+.tabulator .tabulator-header .tabulator-col:hover{background:var(--grid-selection)}
+.tabulator .tabulator-row{background:var(--grid-bg)!important;color:var(--grid-fg)!important;border-bottom:1px solid var(--grid-border);min-height:28px}
+.tabulator .tabulator-row:nth-child(even){background:var(--grid-alt)!important}
+.tabulator .tabulator-row:hover{background:var(--grid-selection)!important}
+.tabulator .tabulator-row .tabulator-cell{height:28px;padding:5px 8px;border-right:1px solid var(--grid-border);outline:none;color:var(--grid-fg)!important}
+.tabulator .tabulator-row .tabulator-cell.tabulator-row-header{background:var(--grid-panel)!important;color:var(--grid-muted)!important;border-right:1px solid var(--grid-border)}
+.tabulator .tabulator-row .tabulator-cell.tabulator-range-selected{background:var(--grid-range-bg)!important}
+.tabulator .tabulator-tableholder .tabulator-range-overlay .tabulator-range{box-sizing:border-box;border:1px solid var(--grid-accent)!important;background:transparent}
+.tabulator .tabulator-tableholder .tabulator-range-overlay .tabulator-range-cell-active{border:0!important;background:transparent;pointer-events:none}
+.tabulator-range::after{content:"";position:absolute;right:-3px;bottom:-3px;width:5px;height:5px;background:var(--grid-accent);border:1px solid var(--grid-panel)}
+.tabulator .tabulator-header .tabulator-col.tabulator-range-highlight,.tabulator .tabulator-header .tabulator-col.tabulator-range-selected,.tabulator .tabulator-row.tabulator-range-selected .tabulator-row-header{background:var(--grid-selection)!important;color:var(--grid-fg)!important}
+.dbdeck-copied-range{position:absolute;border:1px dashed var(--grid-accent)!important;pointer-events:none;box-sizing:border-box;z-index:15}
+.dbdeck-copied-range::after{display:none}
+.tabulator-cell.dbdeck-edited{background:var(--grid-edited-bg)!important}
+.tabulator-cell:focus{outline:none}
+.tabulator-col-resize-handle{width:8px;cursor:col-resize!important}
+.tabulator-col-resize-handle:hover{background:var(--grid-accent)}
+.tabulator .tabulator-row .tabulator-cell:not(.tabulator-editing){white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tabulator-popup-container{background:var(--grid-panel);color:var(--grid-fg);border-color:var(--grid-border)}
+.tabulator-menu .tabulator-menu-item:not(.tabulator-menu-item-disabled):hover,
+.tabulator-menu .tabulator-menu-item:focus{background:var(--grid-selection);outline:1px solid var(--grid-accent);outline-offset:-1px}
+
+.tabulator .tabulator-tableholder:focus{outline:none}
+
+.tabulator .tabulator-tableholder .tabulator-range-overlay .tabulator-range.dbdeck-source-copied{border-color:transparent!important}
+.tabulator-range.dbdeck-source-copied::after{display:none}
+
+/* Range selection owns table text; only an open inline editor accepts text selection. */
+#grid{-webkit-user-select:none;user-select:none;cursor:default}
+.tabulator .tabulator-row .tabulator-cell,
+.tabulator .tabulator-row .tabulator-cell.tabulator-editable:hover{cursor:default!important;-webkit-user-select:none;user-select:none}
+.tabulator .tabulator-row .tabulator-cell.tabulator-editing input,
+.tabulator .tabulator-row .tabulator-cell.tabulator-editing textarea{
+    cursor:text!important;-webkit-user-select:text!important;user-select:text!important;
+    color:var(--grid-fg)!important;-webkit-text-fill-color:var(--grid-fg)!important;
+    background:var(--grid-panel)!important;caret-color:var(--grid-fg);font:inherit;
+    border:0;outline:none;
+}
+
+.tabulator .tabulator-header .tabulator-col[aria-sort="none"] .tabulator-arrow{opacity:.35}
+.tabulator .tabulator-header .tabulator-col[aria-sort="ascending"] .tabulator-arrow{opacity:1;border-top:0!important;border-bottom:6px solid var(--grid-accent)!important}
+.tabulator .tabulator-header .tabulator-col[aria-sort="descending"] .tabulator-arrow{opacity:1;border-bottom:0!important;border-top:6px solid var(--grid-accent)!important}

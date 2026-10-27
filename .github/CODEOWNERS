@@ -1,0 +1,7 @@
+* @andrey-losikhin
+
+/.github/ @andrey-losikhin
+/src/settings.rs @andrey-losikhin
+/src/secret_store.rs @andrey-losikhin
+/src/sql_session.rs @andrey-losikhin
+/SECURITY.md @andrey-losikhin

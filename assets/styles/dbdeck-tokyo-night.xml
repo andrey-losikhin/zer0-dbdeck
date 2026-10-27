@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<style-scheme id="dbdeck-tokyo-night" name="dbdeck-tokyo-night" version="1.0" parent-scheme="Adwaita-dark">
+  <style name="text" foreground="#c0caf5" background="#1a1b26"/>
+  <style name="selection" foreground="#c0caf5" background="#292e42"/>
+  <style name="selection-unfocused" foreground="#c0caf5" background="#292e42"/>
+  <style name="cursor" foreground="#c0caf5"/>
+  <style name="current-line" background="#1f2335"/>
+  <style name="line-numbers" foreground="#9aa5ce" background="#16161e"/>
+  <style name="current-line-number" foreground="#c0caf5" background="#1f2335"/>
+  <style name="def:keyword" foreground="#bb9af7" bold="true"/>
+  <style name="def:statement" foreground="#bb9af7"/>
+  <style name="def:string" foreground="#9ece6a"/>
+  <style name="def:comment" foreground="#9aa5ce" italic="true"/>
+  <style name="def:decimal" foreground="#ff9e64"/>
+  <style name="def:floating-point" foreground="#ff9e64"/>
+  <style name="def:boolean" foreground="#ff9e64"/>
+  <style name="def:function" foreground="#7aa2f7"/>
+  <style name="def:type" foreground="#7dcfff"/>
+  <style name="def:preprocessor" foreground="#bb9af7"/>
+  <style name="bracket-match" foreground="#c0caf5" background="#292e42"/>
+</style-scheme>

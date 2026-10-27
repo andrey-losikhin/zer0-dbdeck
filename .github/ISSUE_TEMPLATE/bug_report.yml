@@ -1,0 +1,38 @@
+name: Bug report
+description: Report a reproducible problem using synthetic data.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: "For suspected vulnerabilities, follow SECURITY.md. Do not attach live credentials, private keys, connection stores or production data."
+  - type: input
+    id: version
+    attributes:
+      label: Application version or commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Linux distribution, display backend, database engine/server version and relevant native-client version.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Use a minimal synthetic schema or query when needed.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized diagnostics
+      description: Remove passwords, tokens, private hostnames and personal data first.
