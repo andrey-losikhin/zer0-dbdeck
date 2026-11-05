@@ -6,7 +6,6 @@ use std::{
     path::PathBuf,
 };
 
-use directories::ProjectDirs;
 use ring::{
     aead, pbkdf2,
     rand::{SecureRandom, SystemRandom},
@@ -219,7 +218,8 @@ pub enum ProfileSaveError {
 
 impl SettingsStore {
     pub fn load() -> Result<Self, String> {
-        let project_dirs = ProjectDirs::from("io", "zer0", "zer0-dbdeck")
+        let project_dirs = crate::app_instance::AppInstance::current()
+            .project_dirs()
             .ok_or_else(|| "Не удалось определить каталог конфигурации XDG".to_owned())?;
         Self::load_from(
             project_dirs.data_dir().join("connections.dbdeck"),

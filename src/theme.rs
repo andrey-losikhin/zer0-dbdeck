@@ -1,6 +1,5 @@
 use std::{fs, path::PathBuf};
 
-use directories::ProjectDirs;
 use relm4::{adw, gtk};
 use serde::{Deserialize, Serialize};
 
@@ -37,7 +36,8 @@ impl ThemeMode {
 }
 
 fn config_dir() -> Result<PathBuf, String> {
-    ProjectDirs::from("io", "zer0", "zer0-dbdeck")
+    crate::app_instance::AppInstance::current()
+        .project_dirs()
         .map(|dirs| dirs.config_dir().to_owned())
         .ok_or_else(|| "Не удалось определить каталог настроек XDG".to_owned())
 }
@@ -74,7 +74,8 @@ struct ThemePreferences {
 pub fn sql_style_schemes() -> sourceview5::StyleSchemeManager {
     let manager = sourceview5::StyleSchemeManager::new();
     let install = || -> Result<PathBuf, String> {
-        let path = ProjectDirs::from("io", "zer0", "zer0-dbdeck")
+        let path = crate::app_instance::AppInstance::current()
+            .project_dirs()
             .ok_or("Не удалось определить каталог схем SQL")?
             .cache_dir()
             .join("sql-styles");

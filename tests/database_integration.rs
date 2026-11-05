@@ -1,5 +1,7 @@
 #![allow(dead_code)]
 
+#[path = "../src/app_instance.rs"]
+mod app_instance;
 #[path = "../src/csv.rs"]
 mod csv;
 #[path = "../src/csv_input.rs"]

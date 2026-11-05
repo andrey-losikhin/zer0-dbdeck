@@ -482,7 +482,8 @@ struct MachinePreferences {
     device_id: Option<String>,
 }
 fn preferences_path() -> Result<PathBuf, String> {
-    directories::ProjectDirs::from("io", "zer0", "zer0-dbdeck")
+    crate::app_instance::AppInstance::current()
+        .project_dirs()
         .map(|p| p.config_dir().join("security.json"))
         .ok_or_else(|| "Нет каталога настроек".to_owned())
 }

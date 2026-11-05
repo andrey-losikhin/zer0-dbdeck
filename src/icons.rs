@@ -1,4 +1,3 @@
-use directories::ProjectDirs;
 use gtk::prelude::*;
 use relm4::gtk;
 use std::{cell::OnceCell, fs};
@@ -112,7 +111,8 @@ fn recolor(svg: &str, color: &str) -> String {
 fn install() -> bool {
     INSTALLED.with(|installed| *installed.get_or_init(|| {
         let write = || -> Result<(), String> {
-            let root = ProjectDirs::from("io", "zer0", "zer0-dbdeck").ok_or("Нет каталога иконок")?
+            let root = crate::app_instance::AppInstance::current()
+                .project_dirs().ok_or("Нет каталога иконок")?
                 .cache_dir().join("icons");
             let directory = root.join("hicolor/scalable/actions");
             fs::create_dir_all(&directory).map_err(|e| e.to_string())?;

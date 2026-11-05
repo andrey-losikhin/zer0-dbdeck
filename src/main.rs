@@ -1,3 +1,4 @@
+mod app_instance;
 mod catalog_tree;
 mod csv;
 mod csv_import_ui;
@@ -267,6 +268,7 @@ struct TableEditState {
 }
 
 fn main() {
+    let instance = app_instance::AppInstance::current();
     gtk::init().expect("GTK initialization");
     adw::init().expect("libadwaita initialization");
     if let Some(settings) = gtk::Settings::default() {
@@ -281,7 +283,7 @@ fn main() {
             .expect("Tokio runtime"),
     );
     let app = adw::Application::builder()
-        .application_id("io.github.andrey-losikhin.zer0-dbdeck")
+        .application_id(instance.app_id())
         .build();
     app.connect_activate(move |app| {
         build_window(app, runtime.clone());
@@ -290,17 +292,18 @@ fn main() {
 }
 
 fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -> Rc<Ui> {
+    let app_title = app_instance::AppInstance::current().title();
     dialogs::watch_toplevels();
     let (sender, receiver) = mpsc::channel();
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("DBDeck")
+        .title(app_title)
         .default_width(1280)
         .default_height(820)
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     let header = adw::HeaderBar::new();
-    let title = gtk::Label::new(Some("DBDeck"));
+    let title = gtk::Label::new(Some(app_title));
     title.add_css_class("title");
     header.set_title_widget(Some(&title));
     let application_menu = gtk::MenuButton::builder()
