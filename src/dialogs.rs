@@ -2,6 +2,78 @@
 use relm4::gtk::{self, prelude::*};
 use std::cell::RefCell;
 
+/// Keep the existing label as the source of truth for dynamic status messages.
+pub fn copyable_label(label: &gtk::Label) -> gtk::Box {
+    label.set_selectable(true);
+    label.set_hexpand(true);
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    row.add_css_class("copyable-message");
+    row.set_hexpand(true);
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.add_css_class("flat");
+    copy.add_css_class("copy-message-button");
+    copy.set_tooltip_text(Some("Копировать сообщение"));
+    copy.set_valign(gtk::Align::Center);
+    copy.set_visible(!label.text().is_empty());
+    let source = label.downgrade();
+    copy.connect_clicked(move |button| {
+        if let Some(label) = source.upgrade() {
+            button.clipboard().set_text(&label.text());
+        }
+    });
+    let button = copy.downgrade();
+    label.connect_label_notify(move |label| {
+        if let Some(button) = button.upgrade() {
+            button.set_visible(!label.text().is_empty());
+        }
+        label.set_tooltip_text(Some(&label.text()));
+    });
+    label.set_tooltip_text(Some(&label.text()));
+    row.append(label);
+    row.append(&copy);
+    label
+        .bind_property("visible", &row, "visible")
+        .sync_create()
+        .build();
+    row
+}
+
+fn copyable_dialog(dialog: &gtk::MessageDialog) {
+    fn selectable(widget: &gtk::Widget) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>() {
+            label.set_selectable(true);
+        }
+        let mut child = widget.first_child();
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            selectable(&widget);
+        }
+    }
+    let area = dialog.message_area();
+    selectable(&area);
+    let Ok(area) = area.downcast::<gtk::Box>() else {
+        return;
+    };
+    let copy = gtk::Button::with_label("Копировать");
+    copy.set_icon_name("edit-copy-symbolic");
+    copy.add_css_class("copy-message-button");
+    copy.set_tooltip_text(Some("Копировать сообщение"));
+    copy.set_halign(gtk::Align::End);
+    let source = dialog.downgrade();
+    copy.connect_clicked(move |button| {
+        if let Some(dialog) = source.upgrade() {
+            let text = [dialog.text(), dialog.secondary_text()]
+                .into_iter()
+                .flatten()
+                .map(|text| text.to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            button.clipboard().set_text(&text);
+        }
+    });
+    area.append(&copy);
+}
+
 thread_local! {
     static WATCHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static SURFACES: RefCell<Vec<gtk::glib::WeakRef<gtk::Window>>> = const { RefCell::new(Vec::new()) };
@@ -49,6 +121,9 @@ pub fn install(window: &impl IsA<gtk::Window>) {
     });
     if exists {
         return;
+    }
+    if let Some(dialog) = window.downcast_ref::<gtk::MessageDialog>() {
+        copyable_dialog(dialog);
     }
     // A native modal surface consumes the parent's pointer events on Wayland.
     // Keep a transient window and consume the outside click before its action.

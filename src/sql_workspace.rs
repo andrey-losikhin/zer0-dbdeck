@@ -12,6 +12,8 @@ pub struct SqlHistoryEntry {
     pub profile_id: String,
     #[serde(default)]
     pub connection_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     pub name: String,
     pub sql: String,
     pub executed_at: u64,
@@ -26,6 +28,8 @@ pub struct SqlDraft {
     pub profile_id: String,
     #[serde(default)]
     pub connection_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
     pub name: String,
     pub sql: String,
 }
@@ -43,7 +47,12 @@ impl SqlWorkspace {
         }
         let mut ids = std::collections::HashSet::new();
         for entry in &self.history {
-            if entry.connection_key.len() > 4096 {
+            if entry.connection_key.len() > 4096
+                || entry
+                    .schema
+                    .as_ref()
+                    .is_some_and(|s| s.len() > 1024 || s.contains('\0'))
+            {
                 return Err("Некорректное подключение истории SQL".into());
             }
             validate_record(&entry.id, &entry.profile_id, &entry.name, &entry.sql)?;
@@ -53,7 +62,12 @@ impl SqlWorkspace {
         }
         ids.clear();
         for draft in &self.drafts {
-            if draft.connection_key.len() > 4096 {
+            if draft.connection_key.len() > 4096
+                || draft
+                    .schema
+                    .as_ref()
+                    .is_some_and(|s| s.len() > 1024 || s.contains('\0'))
+            {
                 return Err("Некорректное подключение SQL-вкладки".into());
             }
             validate_record(&draft.id, &draft.profile_id, &draft.name, &draft.sql)?;
@@ -126,11 +140,28 @@ fn validate_record(id: &str, profile: &str, name: &str, sql: &str) -> Result<(),
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn schema_context_is_optional_and_roundtrips() {
+        let legacy = r#"{"id":"draft","profile_id":"test","connection_key":"endpoint","name":"SQL","sql":"SELECT 1"}"#;
+        let mut draft: SqlDraft = serde_json::from_str(legacy).unwrap();
+        assert!(draft.schema.is_none());
+        draft.schema = Some("audit".into());
+        let copy: SqlDraft = serde_json::from_str(&serde_json::to_string(&draft).unwrap()).unwrap();
+        assert_eq!(copy.schema.as_deref(), Some("audit"));
+        let mut workspace = SqlWorkspace {
+            drafts: vec![copy],
+            ..Default::default()
+        };
+        workspace.validate().unwrap();
+        workspace.drafts[0].schema = Some("invalid\0schema".into());
+        assert!(workspace.validate().is_err());
+    }
     fn entry(id: usize) -> SqlHistoryEntry {
         SqlHistoryEntry {
             id: id.to_string(),
             profile_id: "test".into(),
             connection_key: "test-key".into(),
+            schema: None,
             name: "SQL".into(),
             sql: "SELECT 1".into(),
             executed_at: 0,
@@ -155,6 +186,7 @@ mod tests {
                     id: "draft".into(),
                     profile_id: "test".into(),
                     connection_key: "test-key".into(),
+                    schema: None,
                     name: "SQL".into(),
                     sql: "SELECT 1".into(),
                 }],

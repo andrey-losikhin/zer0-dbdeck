@@ -131,7 +131,7 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
     status.set_widget_name("csv-import-status");
     status.set_wrap(true);
     status.set_xalign(0.0);
-    root.append(&status);
+    root.append(&dialogs::copyable_label(&status));
     let mapping_title = gtk::Label::new(Some("Столбец CSV → Столбец таблицы"));
     mapping_title.set_xalign(0.0);
     mapping_title.add_css_class("heading");

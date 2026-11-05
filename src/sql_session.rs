@@ -68,6 +68,7 @@ pub struct SqlSession {
     cancel_notify: Arc<Notify>,
     read_only: bool,
     production: bool,
+    schema: Option<String>,
 }
 impl SqlSession {
     pub fn new(pool: DbPool) -> Self {
@@ -82,6 +83,7 @@ impl SqlSession {
             cancel_notify: Arc::new(Notify::new()),
             read_only: false,
             production: false,
+            schema: None,
         }
     }
     pub fn with_profile(pool: DbPool, profile: &crate::settings::ConnectionProfile) -> Self {
@@ -89,6 +91,20 @@ impl SqlSession {
             read_only: profile.read_only,
             production: matches!(profile.environment, crate::settings::EnvironmentTag::Prod),
             ..Self::new(pool)
+        }
+    }
+    pub fn with_profile_and_schema(
+        pool: DbPool,
+        profile: &crate::settings::ConnectionProfile,
+        schema: Option<String>,
+    ) -> Self {
+        Self {
+            schema: if matches!(profile.kind, crate::settings::DatabaseKind::PostgreSql) {
+                schema
+            } else {
+                None
+            },
+            ..Self::with_profile(pool, profile)
         }
     }
     pub fn requires_write_approval(&self, sql: &str, state: TransactionState) -> bool {
@@ -113,15 +129,30 @@ impl SqlSession {
     pub fn has_pending_transaction(&self) -> bool {
         self.pending.load(Ordering::Acquire)
     }
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+    pub fn schema(&self) -> Option<&str> {
+        self.schema.as_deref()
+    }
     async fn connect(&self, inner: &mut Inner) -> Result<(), String> {
         if self.closed.load(Ordering::Acquire) {
             return Err("SQL-сессия закрыта".into());
         }
         if inner.connection.is_none() {
             inner.connection = Some(match &self.pool {
-                DbPool::PostgreSql(pool) => Connection::PostgreSql(
-                    pool.acquire().await.map_err(|e| e.to_string())?.detach(),
-                ),
+                DbPool::PostgreSql(pool) => {
+                    let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+                    if let Some(schema) = &self.schema {
+                        let path = format!("\"{}\"", schema.replace('"', "\"\""));
+                        sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+                            .bind(path)
+                            .execute(&mut connection)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Connection::PostgreSql(connection)
+                }
                 DbPool::MySql(pool) => {
                     Connection::MySql(pool.acquire().await.map_err(|e| e.to_string())?.detach())
                 }

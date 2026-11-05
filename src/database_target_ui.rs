@@ -68,7 +68,7 @@ fn show(
     root.append(&search);
     let status = gtk::Label::new(Some("Загрузка списка баз…"));
     status.set_wrap(true);
-    root.append(&status);
+    root.append(&dialogs::copyable_label(&status));
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.set_activate_on_single_click(false);

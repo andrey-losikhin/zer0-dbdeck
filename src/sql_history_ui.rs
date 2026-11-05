@@ -46,6 +46,7 @@ pub(super) fn save_drafts_except(
             id: id.clone(),
             profile_id: profile.to_owned(),
             connection_key: tab.session_key.clone(),
+            schema: tab.schema.clone(),
             name: tab.query_name.clone(),
             sql: query_text(tab),
         })
@@ -57,13 +58,20 @@ pub(super) fn save_drafts_except(
         .filter(|s| s.vault_is_unlocked())
         .ok_or("Разблокируйте хранилище для сохранения SQL-вкладок")?;
     // Preserve drafts belonging to an earlier endpoint of the same profile.
-    let active: std::collections::HashSet<_> = ui.sessions.borrow().keys().cloned().collect();
+    let active: std::collections::HashSet<_> =
+        ui.workspace_groups.borrow().keys().cloned().collect();
     drafts.extend(
         store
             .sql_workspace()
             .drafts
             .iter()
-            .filter(|d| d.profile_id == profile && !active.contains(&d.connection_key))
+            .filter(|d| {
+                d.profile_id == profile
+                    && !active.contains(&workspace_ui::key_from_session(
+                        &d.connection_key,
+                        d.schema.as_deref(),
+                    ))
+            })
             .cloned(),
     );
     store.replace_sql_drafts(profile, drafts)?;
@@ -71,11 +79,37 @@ pub(super) fn save_drafts_except(
 }
 
 pub(super) fn restore_drafts(ui: &Rc<Ui>, profile: &ConnectionProfile) {
+    let schemas: std::collections::HashSet<_> = ui
+        .store
+        .borrow()
+        .as_ref()
+        .filter(|s| s.vault_is_unlocked())
+        .map(|s| {
+            s.sql_workspace()
+                .drafts
+                .iter()
+                .filter(|d| {
+                    d.profile_id == profile.id && d.connection_key == profile_session_key(profile)
+                })
+                .map(|d| d.schema.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    for schema in schemas {
+        restore_group_drafts(ui, profile, schema.as_deref());
+    }
+}
+
+pub(super) fn restore_group_drafts(ui: &Rc<Ui>, profile: &ConnectionProfile, schema: Option<&str>) {
+    if ui.restoring_drafts.get() {
+        return;
+    }
+    let group = workspace_ui::key(profile, schema);
     if ui
         .sql_tabs
         .borrow()
         .values()
-        .any(|tab| tab.profile_id == profile.id)
+        .any(|tab| tab.group_key == group)
     {
         return;
     }
@@ -89,7 +123,10 @@ pub(super) fn restore_drafts(ui: &Rc<Ui>, profile: &ConnectionProfile) {
                 .drafts
                 .iter()
                 .filter(|d| {
-                    d.profile_id == profile.id && d.connection_key == profile_session_key(profile)
+                    d.profile_id == profile.id
+                        && d.connection_key == profile_session_key(profile)
+                        && workspace_ui::key_from_session(&d.connection_key, d.schema.as_deref())
+                            == group
                 })
                 .cloned()
                 .collect()
@@ -100,13 +137,14 @@ pub(super) fn restore_drafts(ui: &Rc<Ui>, profile: &ConnectionProfile) {
     }
     ui.restoring_drafts.set(true);
     let session = profile_session_key(profile);
+    let group = workspace_ui::ensure(ui, &session, schema);
     for draft in drafts {
         let before = ui.sql_tabs.borrow().len();
-        create_sql_tab(ui, &session);
+        create_sql_tab_in_group(ui, &group);
         if ui.sql_tabs.borrow().len() == before {
             break;
         }
-        if let Some(key) = ui.active_table_by_session.borrow().get(&session) {
+        if let Some(key) = ui.active_table_by_session.borrow().get(&group) {
             if let Some(id) = key.strip_prefix("sql::") {
                 if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) {
                     tab.buffer.set_text(&draft.sql);
@@ -135,6 +173,7 @@ pub(super) fn record(
         id: Uuid::new_v4().to_string(),
         profile_id: tab.profile_id.clone(),
         connection_key: tab.session_key.clone(),
+        schema: tab.schema.clone(),
         name: tab.query_name.clone(),
         sql: sql.clone(),
         executed_at: std::time::SystemTime::now()
@@ -181,6 +220,7 @@ fn show_unlocked(ui: &Rc<Ui>) {
                         id: draft.id.clone(),
                         profile_id: draft.profile_id.clone(),
                         connection_key: draft.connection_key.clone(),
+                        schema: draft.schema.clone(),
                         name: draft.name.clone(),
                         sql: draft.sql.clone(),
                         executed_at: 0,
@@ -305,7 +345,7 @@ fn show_unlocked(ui: &Rc<Ui>) {
     ));
     split.set_position(240);
     root.append(&split);
-    root.append(&status);
+    root.append(&dialogs::copyable_label(&status));
     let actions = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     actions.set_halign(gtk::Align::End);
     let clear = gtk::Button::with_label("Очистить всю историю…");
@@ -449,11 +489,12 @@ fn show_unlocked(ui: &Rc<Ui>) {
         let Some(ui) = weak.upgrade() else { return };
         let session = ui.sessions.borrow().iter().find(|(_, (profile, _))| profile.id == entry.profile_id && profile_session_key(profile) == entry.connection_key).map(|(key, _)| key.clone());
         let Some(session) = session else { detail.set_text("Сначала подключите исходную БД с теми же параметрами подключения. Запрос можно скопировать через Ctrl+Shift+C."); return };
-        select_session(&ui, &session);
+        let group = workspace_ui::ensure(&ui, &session, entry.schema.as_deref());
+        workspace_ui::select(&ui, &group);
         let before = ui.sql_tabs.borrow().len();
-        create_sql_tab(&ui, &session);
+        create_sql_tab_in_group(&ui, &group);
         if ui.sql_tabs.borrow().len() == before { return; }
-        if let Some(key) = ui.active_table_by_session.borrow().get(&session) { if let Some(id) = key.strip_prefix("sql::") { if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) { tab.buffer.set_text(&entry.sql); tab.query_name = entry.name.clone(); tab.title.set_text(&tab.query_name); } } }
+        if let Some(key) = ui.active_table_by_session.borrow().get(&group) { if let Some(id) = key.strip_prefix("sql::") { if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) { tab.buffer.set_text(&entry.sql); tab.query_name = entry.name.clone(); tab.title.set_text(&tab.query_name); } } }
         if let Some(window) = weak_window.upgrade() { window.close(); }
     });
     let open_selected = open.clone();

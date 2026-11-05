@@ -5,7 +5,11 @@ pub(super) fn show_active(ui: &Rc<Ui>) {
         return;
     };
     let session = profile_session_key(&profile);
-    let key = ui.active_table_by_session.borrow().get(&session).cloned();
+    let key = ui
+        .active_table_by_session
+        .borrow()
+        .get(&workspace_ui::active(ui, &session))
+        .cloned();
     let object = key.and_then(|key| ui.table_objects.borrow().get(&key).cloned());
     if let Some(object) = object {
         show(ui, &profile, &object);
@@ -42,7 +46,7 @@ pub(super) fn show(ui: &Rc<Ui>, profile: &ConnectionProfile, object: &DbObject) 
     status.set_wrap(true);
     status.set_margin_start(8);
     status.set_margin_end(8);
-    root.append(&status);
+    root.append(&dialogs::copyable_label(&status));
     let notebook = gtk::Notebook::new();
     notebook.set_widget_name("structure-tabs");
     notebook.set_vexpand(true);
@@ -132,17 +136,20 @@ pub(super) fn show(ui: &Rc<Ui>, profile: &ConnectionProfile, object: &DbObject) 
     let weak_ui = Rc::downgrade(ui);
     let weak = window.downgrade();
     let buffer = ddl_buffer.clone();
+    let schema = object.schema.clone();
     open.connect_clicked(move |_| {
         if let Some(ui) = weak_ui.upgrade() {
+            let group = workspace_ui::ensure(&ui, &session, Some(&schema));
+            workspace_ui::select(&ui, &group);
             let before = ui.sql_tabs.borrow().len();
-            create_sql_tab(&ui, &session);
+            create_sql_tab_in_group(&ui, &group);
             if ui.sql_tabs.borrow().len() == before {
                 return;
             }
             let id = ui
                 .active_table_by_session
                 .borrow()
-                .get(&session)
+                .get(&group)
                 .and_then(|key| key.strip_prefix("sql::").map(str::to_owned));
             if let Some(id) = id {
                 if let Some(tab) = ui.sql_tabs.borrow().get(&id) {

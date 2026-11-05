@@ -367,7 +367,7 @@ impl DbPool {
                 "SELECT datname::text, 'Владелец: ' || pg_get_userbyid(datdba) || ' · Кодировка: ' || pg_encoding_to_char(encoding) FROM pg_catalog.pg_database WHERE datallowconn AND NOT datistemplate AND has_database_privilege(oid, 'CONNECT') ORDER BY (datname = $1) DESC, datname LIMIT 1001",
             ).bind(preferred).fetch_all(pool).await,
             Self::MySql(pool) => sqlx::query_as::<_, (String, String)>(
-                "SELECT SCHEMA_NAME, CONCAT('Кодировка: ', DEFAULT_CHARACTER_SET_NAME, ' · Сравнение: ', DEFAULT_COLLATION_NAME) FROM information_schema.SCHEMATA ORDER BY (SCHEMA_NAME = ?) DESC, SCHEMA_NAME LIMIT 1001",
+                "SELECT CAST(SCHEMA_NAME AS CHAR), CAST(CONCAT('Кодировка: ', DEFAULT_CHARACTER_SET_NAME, ' · Сравнение: ', DEFAULT_COLLATION_NAME) AS CHAR) FROM information_schema.SCHEMATA ORDER BY (SCHEMA_NAME = ?) DESC, SCHEMA_NAME LIMIT 1001",
             ).bind(preferred).fetch_all(pool).await,
         }.map_err(|e| format_database_error(&e.to_string()))
     }

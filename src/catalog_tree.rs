@@ -41,6 +41,7 @@ pub(super) fn databases_loaded(ui: &Rc<Ui>, profile: &ConnectionProfile, databas
 }
 
 pub(super) fn loaded(ui: &Rc<Ui>, profile: &ConnectionProfile, catalog: TableCatalog) {
+    namespace_ui::schemas_loaded(ui, profile, catalog.schemas.clone());
     ui.catalog_tree
         .borrow_mut()
         .catalogs

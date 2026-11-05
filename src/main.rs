@@ -10,6 +10,8 @@ mod database_structure;
 mod database_target_ui;
 mod dialogs;
 mod icons;
+mod markdown_export;
+mod namespace_ui;
 mod native_backup;
 mod output_file;
 mod preferences_ui;
@@ -17,6 +19,8 @@ mod production_ui;
 mod secret_store;
 mod settings;
 mod shortcuts;
+mod sql_batch;
+mod sql_batch_ui;
 mod sql_editor;
 mod sql_history_ui;
 mod sql_risk;
@@ -27,6 +31,7 @@ mod structure_ui;
 mod tabulator;
 mod theme;
 mod transfer;
+mod workspace_ui;
 
 use std::{
     cell::{Cell, RefCell},
@@ -62,6 +67,7 @@ enum Event {
     ServerIcon(String, &'static str),
     TablesLoaded(u64, u64, Result<TableCatalog, String>),
     DatabasesLoaded(u64, u64, Result<Vec<String>, String>),
+    NamespaceChoices(String, u64, Result<Vec<String>, String>),
     TableLoaded(String, String, String, Result<TableData, String>),
     TablePageLoaded(String, String, usize, Result<TableData, String>),
     TableEditsSaved(String, Result<u64, String>),
@@ -77,6 +83,8 @@ enum Event {
     SqlCompletionsLoaded(String, Result<Vec<String>, String>),
     CsvExported(usize, Result<(), String>),
     ExportProgress(usize),
+    SqlBatchProgress(usize, usize),
+    SqlBatchFinished(PathBuf, Result<sql_batch::Summary, String>),
     CsvImportProgress(u64),
     CsvImported(ConnectionProfile, DbObject, Result<u64, String>),
     RestoreFinished(ConnectionProfile, Result<String, String>),
@@ -113,6 +121,10 @@ struct Ui {
     profiles: gtk::Box,
     objects: gtk::Box,
     table_filter: gtk::SearchEntry,
+    namespace_row: gtk::Box,
+    namespace_label: gtk::Label,
+    namespace_selector: gtk::DropDown,
+    namespace_state: RefCell<namespace_ui::State>,
     table_list_items: RefCell<Vec<(gtk::Button, DbObject)>>,
     landing: gtk::Box,
     empty_session: gtk::Box,
@@ -121,6 +133,8 @@ struct Ui {
     session_tabs: gtk::Notebook,
     table_tabs: gtk::Stack,
     session_table_tabs: RefCell<HashMap<String, gtk::Notebook>>,
+    workspace_groups: RefCell<HashMap<String, workspace_ui::Group>>,
+    active_group_by_session: RefCell<HashMap<String, String>>,
     status: gtk::Label,
     active: gtk::Label,
     test_feedback: RefCell<Option<gtk::Label>>,
@@ -163,6 +177,8 @@ struct Ui {
 
 struct SqlTab {
     session_key: String,
+    group_key: String,
+    schema: Option<String>,
     profile_id: String,
     session: sql_session::SqlSession,
     transaction_state: sql_session::TransactionState,
@@ -386,6 +402,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     sidebar.append(&profile_scroll);
     let objects_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
     objects_page.add_css_class("sidebar-panel");
+    let (namespace_row, namespace_label, namespace_selector) = namespace_ui::widgets();
+    objects_page.append(&namespace_row);
     let table_filter = gtk::SearchEntry::new();
     table_filter.set_placeholder_text(Some("Фильтр таблиц"));
     table_filter.set_visible(false);
@@ -486,7 +504,9 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     let status = gtk::Label::new(Some("Готово"));
     status.set_xalign(0.0);
     status.set_hexpand(true);
-    footer.append(&status);
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.set_width_chars(1);
+    footer.append(&dialogs::copyable_label(&status));
     let transfer_cancel_button = gtk::Button::with_label("Отменить операцию");
     transfer_cancel_button.set_visible(false);
     footer.append(&transfer_cancel_button);
@@ -540,6 +560,10 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         profiles,
         objects,
         table_filter,
+        namespace_row,
+        namespace_label,
+        namespace_selector,
+        namespace_state: RefCell::new(namespace_ui::State::default()),
         table_list_items: RefCell::new(Vec::new()),
         landing,
         empty_session,
@@ -548,6 +572,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         session_tabs,
         table_tabs,
         session_table_tabs: RefCell::new(HashMap::new()),
+        workspace_groups: RefCell::new(HashMap::new()),
+        active_group_by_session: RefCell::new(HashMap::new()),
         status,
         active,
         test_feedback: RefCell::new(None),
@@ -639,6 +665,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
             button.set_sensitive(false);
         }
     });
+    namespace_ui::install(&ui);
     refresh_file_location_labels(&ui);
     let weak = Rc::downgrade(&ui);
     sql_directory.connect_clicked(move |_| {
@@ -679,7 +706,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
             ui.tab_switching.set(false);
             return;
         };
-        select_session(&ui, session_key.as_str());
+        workspace_ui::select(&ui, session_key.as_str());
         ui.tab_switching.set(false);
     });
     let weak = Rc::downgrade(&ui);
@@ -932,7 +959,11 @@ fn refresh_profiles(ui: &Rc<Ui>) {
                 status.set_wrap(true);
                 status.add_css_class("connection-status");
                 status.add_css_class(style);
-                card.append(&status);
+                if matches!(state, ProfileStatus::Error(_)) {
+                    card.append(&dialogs::copyable_label(&status));
+                } else {
+                    card.append(&status);
+                }
             }
         }
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1089,31 +1120,45 @@ fn select_connection_database(ui: &Rc<Ui>, profile: &ConnectionProfile) {
 }
 
 fn add_session_tab(ui: &Rc<Ui>, profile: &ConnectionProfile) {
-    let session_key = profile_session_key(profile);
-    if let Some(index) = session_page_index(ui, &session_key) {
+    // Server-only connections provide navigation, never a workspace group.
+    if profile.database.trim().is_empty() {
+        return;
+    }
+    workspace_ui::ensure(ui, &profile_session_key(profile), None);
+}
+
+fn add_workspace_tab(
+    ui: &Rc<Ui>,
+    profile: &ConnectionProfile,
+    group_key: &str,
+    schema: Option<&str>,
+) {
+    if let Some(index) = session_page_index(ui, group_key) {
         ui.session_tabs.set_current_page(Some(index));
         return;
     }
     let page = gtk::Box::new(gtk::Orientation::Vertical, 0);
     page.set_size_request(1, 1);
-    page.set_tooltip_text(Some(&session_key));
-    let database_name = if profile.database.trim().is_empty() {
-        "Все доступные базы"
-    } else {
-        profile.database.as_str()
-    };
-    let title_text = format!("{} · {database_name}", profile.name);
+    page.set_tooltip_text(Some(group_key));
+    let database = schema
+        .map(|schema| format!("{}.{}", profile.database, schema))
+        .unwrap_or_else(|| profile.database.clone());
+    let title_text = format!("{} · {database}", profile.name);
     let title = gtk::Label::new(Some(&title_text));
     title.set_tooltip_text(Some(&format!(
         "{} · {}:{} · {}",
         profile.kind.label(),
         profile.host,
         profile.port,
-        profile.database
+        database
     )));
-    title.set_ellipsize(gtk::pango::EllipsizeMode::End);
-    title.set_width_chars(22);
-    title.set_max_width_chars(32);
+    title.set_ellipsize(if schema.is_some() {
+        gtk::pango::EllipsizeMode::Middle
+    } else {
+        gtk::pango::EllipsizeMode::End
+    });
+    title.set_width_chars(if schema.is_some() { 28 } else { 22 });
+    title.set_max_width_chars(if schema.is_some() { 40 } else { 32 });
     let tab_label = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     tab_label.add_css_class("compact-tab-label");
     tab_label.append(&profile_tab_icon("database", &profile.color));
@@ -1123,14 +1168,14 @@ fn add_session_tab(ui: &Rc<Ui>, profile: &ConnectionProfile) {
     close.add_css_class("flat");
     close.add_css_class("circular");
     close.add_css_class("compact-tab-close");
-    close.set_tooltip_text(Some("Отключить и закрыть вкладку"));
+    close.set_tooltip_text(Some("Закрыть группу вкладок"));
     tab_label.append(&close);
     ui.session_tabs.append_page(&page, Some(&tab_label));
     let weak = Rc::downgrade(ui);
-    let profile_id = session_key.clone();
+    let group_key = group_key.to_owned();
     close.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
-            close_session(&ui, &profile_id);
+            workspace_ui::close(&ui, &group_key);
         }
     });
     ui.session_tabs.set_visible(true);
@@ -1160,12 +1205,20 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
             ui.tab_switching.set(false);
             return;
         };
+        let session = workspace_ui::source(&ui, &name);
+        ui.active_group_by_session
+            .borrow_mut()
+            .insert(session.clone(), name.clone());
         if let Some(query_id) = key.strip_prefix("sql::") {
             ui.active_table_by_session
                 .borrow_mut()
                 .insert(name.clone(), key.clone());
-            if let Some((profile, _)) = ui.sessions.borrow().get(&name).cloned() {
+            if let Some((profile, pool)) = ui.sessions.borrow().get(&session).cloned() {
                 *ui.current_profile.borrow_mut() = Some(profile);
+                *ui.pool.borrow_mut() = Some(pool);
+            }
+            if let Some(index) = session_page_index(&ui, &name) {
+                ui.session_tabs.set_current_page(Some(index));
             }
             ui.table_tabs.set_visible_child_name(&name);
             ui.table_tabs.set_visible(true);
@@ -1182,8 +1235,9 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
         if let Some(index) = session_page_index(&ui, &name) {
             ui.session_tabs.set_current_page(Some(index));
         }
-        if let Some((profile, _)) = ui.sessions.borrow().get(&name).cloned() {
+        if let Some((profile, pool)) = ui.sessions.borrow().get(&session).cloned() {
             *ui.current_profile.borrow_mut() = Some(profile);
+            *ui.pool.borrow_mut() = Some(pool);
         }
         ui.table_tabs.set_visible_child_name(&name);
         ui.table_tabs.set_visible(true);
@@ -1194,10 +1248,11 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
         .borrow_mut()
         .insert(session_key.to_owned(), notebook.clone());
     let sql_button = gtk::Button::new();
+    let source = workspace_ui::source(ui, session_key);
     let profile_color = ui
         .sessions
         .borrow()
-        .get(session_key)
+        .get(&source)
         .map(|(profile, _)| profile.color.clone())
         .unwrap_or_else(|| "#4f8fe8".to_owned());
     let sql_icon = profile_tab_icon("sql-query", &profile_color);
@@ -1361,44 +1416,32 @@ fn sql_empty_results() -> gtk::Box {
 }
 
 fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
+    let source = workspace_ui::source(ui, session_key);
+    let group = if source == session_key {
+        workspace_ui::active(ui, &source)
+    } else {
+        session_key.to_owned()
+    };
+    create_sql_tab_in_group(ui, &group);
+}
+
+fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
+    let source = workspace_ui::source(ui, requested_group);
+    let session_key = source.as_str();
     let Some((profile, pool)) = ui.sessions.borrow().get(session_key).cloned() else {
         return;
     };
     if profile.database.trim().is_empty() {
         database_target_ui::choose(ui, &profile, move |ui, target| {
-            let key = profile_session_key(&target);
-            open_database_session(ui, target.clone(), pool.clone(), &target.database);
-            let owner = Rc::downgrade(ui);
-            gtk::glib::timeout_add_local(Duration::from_millis(40), move || {
-                let Some(ui) = owner.upgrade() else {
-                    return gtk::glib::ControlFlow::Break;
-                };
-                if ui.desired_database_session.borrow().as_deref() != Some(&key) {
-                    return gtk::glib::ControlFlow::Break;
-                }
-                if ui
-                    .current_profile
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|p| profile_session_key(p) == key)
-                {
-                    create_sql_tab(&ui, &key);
-                    return gtk::glib::ControlFlow::Break;
-                }
-                if ui.connect_requests.borrow().contains_key(&key) {
-                    gtk::glib::ControlFlow::Continue
-                } else {
-                    gtk::glib::ControlFlow::Break
-                }
-            });
+            with_database_session(ui, target, pool.clone(), create_sql_tab);
         });
         return;
     }
     // Count disconnected drafts too: the encrypted workspace has one global limit.
     if !ui.restoring_drafts.get() {
         let tabs = ui.sql_tabs.borrow();
-        let profiles: std::collections::HashSet<_> =
-            tabs.values().map(|t| t.session_key.as_str()).collect();
+        let groups: std::collections::HashSet<_> =
+            tabs.values().map(|t| t.group_key.as_str()).collect();
         let saved = ui.store.borrow();
         let inactive = saved
             .as_ref()
@@ -1406,7 +1449,12 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
                 s.sql_workspace()
                     .drafts
                     .iter()
-                    .filter(|d| !profiles.contains(d.connection_key.as_str()))
+                    .filter(|d| {
+                        !groups.contains(
+                            workspace_ui::key_from_session(&d.connection_key, d.schema.as_deref())
+                                .as_str(),
+                        )
+                    })
                     .count()
             })
             .unwrap_or(0);
@@ -1421,7 +1469,19 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
     } else {
         sql_risk::Dialect::PostgreSql
     };
-    let notebook = ensure_session_table_tabs(ui, session_key);
+    let schema = ui
+        .workspace_groups
+        .borrow()
+        .get(requested_group)
+        .and_then(|g| g.schema.clone());
+    let group_key = workspace_ui::ensure(ui, session_key, schema.as_deref());
+    workspace_ui::select(ui, &group_key);
+    let schema = ui
+        .workspace_groups
+        .borrow()
+        .get(&group_key)
+        .and_then(|g| g.schema.clone());
+    let notebook = ensure_session_table_tabs(ui, &group_key);
     let query_number = ui
         .sql_tabs
         .borrow()
@@ -1481,7 +1541,7 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     status.set_width_chars(1);
     status.add_css_class("dim-label");
-    toolbar.append(&status);
+    toolbar.append(&dialogs::copyable_label(&status));
     let risk_indicator = gtk::Label::new(None);
     risk_indicator.add_css_class("query-risk-indicator");
     toolbar.append(&risk_indicator);
@@ -1569,6 +1629,18 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
     run_button.add_css_class("sql-run-button");
     run_button.set_tooltip_text(Some("Выполнить выделенный SQL или весь текст (Ctrl+Enter)"));
     toolbar.append(&run_button);
+    let batch_button = gtk::Button::with_label("Выполнить в Markdown…");
+    batch_button.set_tooltip_text(Some(
+        "Выполнить весь текст по одному читающему запросу и сохранить результаты и ошибки в .md",
+    ));
+    let owner = Rc::downgrade(ui);
+    let batch_id = id.clone();
+    batch_button.connect_clicked(move |_| {
+        if let Some(ui) = owner.upgrade() {
+            sql_batch_ui::choose_report(&ui, &batch_id);
+        }
+    });
+    toolbar.append(&batch_button);
     let stop_button = gtk::Button::from_icon_name("media-playback-stop-symbolic");
     stop_button.set_tooltip_text(Some("Остановить запрос (Ctrl+Shift+.)"));
     stop_button.set_sensitive(false);
@@ -1590,15 +1662,17 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
     error_message.set_margin_bottom(6);
     error_message.add_css_class("query-error-message");
     error_message.set_visible(false);
-    editor_region.append(&error_message);
+    editor_region.append(&dialogs::copyable_label(&error_message));
     let syntax_message = gtk::Label::new(None);
     syntax_message.set_xalign(0.0);
-    syntax_message.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    syntax_message.set_selectable(true);
+    syntax_message.set_wrap(true);
+    syntax_message.set_wrap_mode(gtk::pango::WrapMode::WordChar);
     syntax_message.set_max_width_chars(100);
     syntax_message.add_css_class("sql-syntax-diagnostic");
     syntax_message.set_visible(false);
     syntax_message.set_tooltip_text(Some("Локальная проверка синтаксиса. Существование таблиц и полей проверяет сервер при выполнении."));
-    editor_region.append(&syntax_message);
+    editor_region.append(&dialogs::copyable_label(&syntax_message));
     let diagnostics = sql_editor::Diagnostics::install(
         &buffer,
         &syntax_message,
@@ -1722,8 +1796,14 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
         id.clone(),
         SqlTab {
             session_key: session_key.to_owned(),
+            group_key: group_key.clone(),
+            schema: schema.clone(),
             profile_id: profile.id.clone(),
-            session: sql_session::SqlSession::with_profile(pool.clone(), &profile),
+            session: sql_session::SqlSession::with_profile_and_schema(
+                pool.clone(),
+                &profile,
+                schema,
+            ),
             transaction_state: sql_session::TransactionState::default(),
             transaction_label,
             transaction_buttons: vec![
@@ -1766,8 +1846,8 @@ fn create_sql_tab(ui: &Rc<Ui>, session_key: &str) {
     notebook.set_current_page(Some(tab_index));
     ui.active_table_by_session
         .borrow_mut()
-        .insert(session_key.to_owned(), page_key);
-    ui.table_tabs.set_visible_child_name(session_key);
+        .insert(group_key.clone(), page_key);
+    ui.table_tabs.set_visible_child_name(&group_key);
     ui.table_tabs.set_visible(true);
     ui.empty_session.set_visible(false);
     ui.active_header.set_visible(false);
@@ -2142,7 +2222,7 @@ fn reset_sql_session(ui: &Rc<Ui>, id: &str) {
         };
         let previous = std::mem::replace(
             &mut tab.session,
-            sql_session::SqlSession::with_profile(pool, &profile),
+            sql_session::SqlSession::with_profile_and_schema(pool, &profile, tab.schema.clone()),
         );
         ui.runtime.spawn(async move {
             previous.close().await;
@@ -2296,7 +2376,7 @@ fn close_sql_tab(ui: &Rc<Ui>, id: &str) {
     ui.runtime.spawn(async move {
         session.close().await;
     });
-    let session_key = tab.session_key.clone();
+    let group_key = tab.group_key.clone();
     tab.editor.completion().hide();
     tab.diagnostics.close();
     let page = tab.page.clone();
@@ -2306,25 +2386,20 @@ fn close_sql_tab(ui: &Rc<Ui>, id: &str) {
     let was_active = ui
         .active_table_by_session
         .borrow()
-        .get(&session_key)
+        .get(&group_key)
         .is_some_and(|key| key == &page_key);
     drop(tabs);
     if let Some(style_notify) = style_notify {
         style_manager.disconnect(style_notify);
     }
-    let notebook = ui.session_table_tabs.borrow().get(&session_key).cloned();
+    let notebook = ui.session_table_tabs.borrow().get(&group_key).cloned();
     if let Some(notebook) = notebook
         && let Some(index) = notebook.page_num(&page)
     {
         notebook.remove_page(Some(index));
         if was_active && notebook.n_pages() == 0 {
-            ui.active_table_by_session.borrow_mut().remove(&session_key);
-            if ui
-                .current_profile
-                .borrow()
-                .as_ref()
-                .is_some_and(|profile| profile_session_key(profile) == session_key)
-            {
+            ui.active_table_by_session.borrow_mut().remove(&group_key);
+            if workspace_ui::is_active(ui, &group_key) {
                 ui.table_tabs.set_visible(false);
                 ui.empty_session.set_visible(true);
                 ui.active_header.set_visible(false);
@@ -2953,9 +3028,19 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
         .borrow()
         .as_ref()
         .is_some_and(|profile| profile_session_key(profile) == session_key);
-    if let Some(index) = session_page_index(ui, session_key) {
-        ui.session_tabs.remove_page(Some(index));
+    let groups: Vec<_> = ui
+        .workspace_groups
+        .borrow()
+        .iter()
+        .filter(|(_, g)| g.session_key == session_key)
+        .map(|(key, _)| key.clone())
+        .collect();
+    for group in &groups {
+        if let Some(index) = session_page_index(ui, group) {
+            ui.session_tabs.remove_page(Some(index));
+        }
     }
+    ui.session_tabs.set_visible(ui.session_tabs.n_pages() > 0);
     ui.sessions.borrow_mut().remove(session_key);
     ui.server_icons.borrow_mut().remove(session_key);
     catalog_tree::forget(ui, session_key);
@@ -2990,9 +3075,17 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
     for id in query_ids {
         close_sql_tab(ui, &id);
     }
-    if let Some(notebook) = ui.session_table_tabs.borrow_mut().remove(session_key) {
-        ui.table_tabs.remove(&notebook);
+    for group in groups
+        .into_iter()
+        .chain(std::iter::once(session_key.to_owned()))
+    {
+        if let Some(notebook) = ui.session_table_tabs.borrow_mut().remove(&group) {
+            ui.table_tabs.remove(&notebook);
+        }
+        ui.workspace_groups.borrow_mut().remove(&group);
+        ui.active_table_by_session.borrow_mut().remove(&group);
     }
+    ui.active_group_by_session.borrow_mut().remove(session_key);
     ui.restoring_drafts.set(false);
     if ui.sessions.borrow().is_empty() {
         ui.desired_database_session.borrow_mut().take();
@@ -3003,6 +3096,7 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
         ui.session_tabs.set_visible(false);
         *ui.current_profile.borrow_mut() = None;
         *ui.pool.borrow_mut() = None;
+        namespace_ui::sync(ui);
         ui.active_header.set_visible(false);
         ui.table_tabs.set_visible(false);
         ui.empty_session.set_visible(false);
@@ -3019,12 +3113,20 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
         refresh_profiles(ui);
         return;
     }
-    let next_id = ui.sessions.borrow().keys().next().cloned();
+    // Prefer a visible database group over a hidden server-navigation connection.
+    let next_id = ui
+        .session_tabs
+        .current_page()
+        .and_then(|index| ui.session_tabs.nth_page(Some(index)))
+        .and_then(|page| page.tooltip_text().map(|key| key.to_string()))
+        .filter(|key| {
+            ui.sessions
+                .borrow()
+                .contains_key(&workspace_ui::source(ui, key))
+        })
+        .or_else(|| ui.sessions.borrow().keys().next().cloned());
     if let Some(next_id) = next_id {
-        if let Some(index) = session_page_index(ui, &next_id) {
-            ui.session_tabs.set_current_page(Some(index));
-            select_session(ui, &next_id);
-        }
+        workspace_ui::select(ui, &next_id);
     }
 }
 
@@ -3052,8 +3154,7 @@ fn close_profile_sessions(ui: &Rc<Ui>, profile_id: &str) {
 }
 
 fn find_table_page(ui: &Ui, key: &str) -> Option<(gtk::Notebook, u32, gtk::Widget)> {
-    let profile = ui.table_profiles.borrow().get(key).cloned()?;
-    let session_key = profile_session_key(&profile);
+    let session_key = workspace_ui::table_group(ui, key)?;
     let notebook = ui.session_table_tabs.borrow().get(&session_key).cloned()?;
     for index in 0..notebook.n_pages() {
         let page = notebook.nth_page(Some(index))?;
@@ -3109,7 +3210,7 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
         dialog.present();
         return;
     }
-    let session_key = ui.table_profiles.borrow().get(key).map(profile_session_key);
+    let session_key = workspace_ui::table_group(ui, key);
     let page_info = find_table_page(ui, key);
     let was_active = session_key.as_ref().is_some_and(|session_key| {
         ui.active_table_by_session
@@ -3129,15 +3230,15 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
                         ui.sql_tabs
                             .borrow()
                             .get(id)
-                            .map(|tab| tab.session_key.clone())
+                            .map(|tab| tab.group_key.clone())
                     })
                     .as_deref()
                     == session_key.as_deref()
                 {
                     return Some((index, candidate_key));
                 }
-                let candidate_profile = ui.table_profiles.borrow().get(&candidate_key).cloned()?;
-                (session_key.as_deref() == Some(profile_session_key(&candidate_profile).as_str()))
+                let candidate_group = workspace_ui::table_group(ui, &candidate_key)?;
+                (session_key.as_deref() == Some(candidate_group.as_str()))
                     .then_some((index, candidate_key))
             })
             .collect::<Vec<_>>();
@@ -3168,12 +3269,7 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
                 ui.active_table_by_session
                     .borrow_mut()
                     .insert(session_key.clone(), fallback.clone());
-                if ui
-                    .current_profile
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|profile| profile_session_key(profile) == session_key)
-                {
+                if workspace_ui::is_active(ui, &session_key) {
                     if let Some((notebook, page, _)) = find_table_page(ui, &fallback) {
                         select_table_button(ui, &fallback);
                         notebook.set_current_page(Some(page));
@@ -3187,12 +3283,7 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
                 }
             } else {
                 ui.active_table_by_session.borrow_mut().remove(&session_key);
-                if ui
-                    .current_profile
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|profile| profile_session_key(profile) == session_key)
-                {
+                if workspace_ui::is_active(ui, &session_key) {
                     ui.table_tabs.set_visible(false);
                     ui.empty_session.set_visible(true);
                     ui.active_header.set_visible(false);
@@ -3215,7 +3306,8 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
         .is_none_or(|current| profile_session_key(current) != session_key);
     *ui.current_profile.borrow_mut() = Some(profile.clone());
     *ui.pool.borrow_mut() = Some(pool);
-    if let Some(index) = session_page_index(ui, session_key) {
+    let group = workspace_ui::active(ui, session_key);
+    if let Some(index) = session_page_index(ui, &group) {
         if ui.session_tabs.current_page() != Some(index) {
             ui.session_tabs.set_current_page(Some(index));
         }
@@ -3225,7 +3317,16 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
     } else {
         profile.database.as_str()
     };
-    ui.active.set_text(database);
+    let schema = ui
+        .workspace_groups
+        .borrow()
+        .get(&group)
+        .and_then(|g| g.schema.clone());
+    ui.active.set_text(
+        &schema
+            .map(|schema| format!("{database}.{schema}"))
+            .unwrap_or_else(|| database.to_owned()),
+    );
     ui.active_details.set_text(&format!(
         "{}  ·  {}:{}  ·  {}{}",
         profile.kind.label(),
@@ -3247,6 +3348,7 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
     ui.active_header.set_visible(false);
     ui.landing.set_visible(false);
     activate_session_table(ui, session_key);
+    namespace_ui::sync(ui);
     refresh_profiles(ui);
     if changed {
         ui.objects_available.set(false);
@@ -3257,6 +3359,8 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
 }
 
 fn activate_session_table(ui: &Ui, session_key: &str) {
+    let group = workspace_ui::active(ui, session_key);
+    let session_key = group.as_str();
     let notebook = ui.session_table_tabs.borrow().get(session_key).cloned();
     let Some(notebook) = notebook else {
         ui.table_tabs.set_visible(false);
@@ -4151,7 +4255,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
     test_feedback.set_xalign(0.0);
     test_feedback.set_wrap(true);
     test_feedback.add_css_class("test-feedback");
-    content.append(&test_feedback);
+    content.append(&dialogs::copyable_label(&test_feedback));
     *ui.test_feedback.borrow_mut() = Some(test_feedback);
     let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     buttons.set_halign(gtk::Align::End);
@@ -4582,7 +4686,7 @@ fn show_password_prompt(ui: &Rc<Ui>, profile: ConnectionProfile, warning: Option
         )));
         label.set_wrap(true);
         label.set_xalign(0.0);
-        content.append(&label);
+        content.append(&dialogs::copyable_label(&label));
     } else {
         content.append(&gtk::Label::new(Some("Введите пароль для подключения.")));
     }
@@ -4707,6 +4811,7 @@ fn show_table_catalog(ui: &Rc<Ui>) {
     ) else {
         return;
     };
+    namespace_ui::refresh(ui);
     ui.status.set_text("Загружаю таблицы и представления…");
     if matches!(profile.kind, DatabaseKind::PostgreSql) {
         catalog_tree::prepare(ui, &profile);
@@ -4768,6 +4873,43 @@ fn open_database_session(
     ui.runtime.spawn(async move {
         let result = pool.connect_database(&profile.database).await;
         let _ = sender.send(Event::Connected(request, profile, result));
+    });
+}
+
+fn with_database_session(
+    ui: &Rc<Ui>,
+    profile: ConnectionProfile,
+    pool: DbPool,
+    action: impl FnOnce(&Rc<Ui>, &str) + 'static,
+) {
+    let key = profile_session_key(&profile);
+    let database = profile.database.clone();
+    open_database_session(ui, profile, pool, &database);
+    let owner = Rc::downgrade(ui);
+    let mut action = Some(action);
+    gtk::glib::timeout_add_local(Duration::from_millis(40), move || {
+        let Some(ui) = owner.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if ui.desired_database_session.borrow().as_deref() != Some(&key) {
+            return gtk::glib::ControlFlow::Break;
+        }
+        if ui
+            .current_profile
+            .borrow()
+            .as_ref()
+            .is_some_and(|p| profile_session_key(p) == key)
+        {
+            if let Some(action) = action.take() {
+                action(&ui, &key);
+            }
+            return gtk::glib::ControlFlow::Break;
+        }
+        if ui.connect_requests.borrow().contains_key(&key) {
+            gtk::glib::ControlFlow::Continue
+        } else {
+            gtk::glib::ControlFlow::Break
+        }
     });
 }
 
@@ -4875,7 +5017,7 @@ fn append_schema_tree(
                     && ui
                         .active_table_by_session
                         .borrow()
-                        .get(&session_key)
+                        .get(&workspace_ui::active(ui, &session_key))
                         .is_some_and(|active| active == &table_key)
                 {
                     button.add_css_class("table-nav-item-selected");
@@ -4931,6 +5073,9 @@ fn append_schema_tree(
 
 fn handle_event(ui: &Rc<Ui>, event: Event) {
     match event {
+        Event::NamespaceChoices(key, revision, result) => {
+            namespace_ui::loaded(ui, &key, revision, result)
+        }
         Event::ServerIcon(key, icon) => {
             if ui.sessions.borrow().contains_key(&key) {
                 ui.server_icons.borrow_mut().insert(key, icon);
@@ -5011,7 +5156,9 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                             let _ = sender.send(Event::ServerIcon(detected_key, icon));
                         }
                     });
-                    ensure_session_table_tabs(ui, &session_key);
+                    if !profile.database.trim().is_empty() {
+                        ensure_session_table_tabs(ui, &session_key);
+                    }
                     add_session_tab(ui, &profile);
                     refresh_profiles(ui);
                     ui.active.set_text(&profile.name);
@@ -5061,6 +5208,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     }
                     ui.objects.set_sensitive(true);
                     ui.status.set_text(&error);
+                    namespace_ui::sync(ui);
                     show_error_dialog(ui, "Ошибка подключения", &error);
                 }
             }
@@ -5416,15 +5564,11 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 ui.sql_tabs.borrow_mut().insert(id, tab);
                 return;
             }
-            let is_active = ui
-                .current_profile
-                .borrow()
-                .as_ref()
-                .is_some_and(|profile| profile_session_key(profile) == tab.session_key)
+            let is_active = workspace_ui::is_active(ui, &tab.group_key)
                 && ui
                     .active_table_by_session
                     .borrow()
-                    .get(&tab.session_key)
+                    .get(&tab.group_key)
                     .is_some_and(|key| key == &format!("sql::{id}"));
             tab.run_button.set_sensitive(true);
             tab.stop_button.set_sensitive(false);
@@ -5596,6 +5740,42 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             }
         }
         Event::ExportProgress(count) => ui.status.set_text(&format!("Экспорт CSV: {count} строк…")),
+        Event::SqlBatchProgress(index, total) => ui
+            .status
+            .set_text(&format!("Markdown: запрос {index} из {total}…")),
+        Event::SqlBatchFinished(path, result) => {
+            finish_transfer(ui);
+            match result {
+                Ok(summary) => {
+                    let text = format!(
+                        "{}: {}\nУспешно: {}. Ошибок: {}. Не выполнено: {}.",
+                        if summary.stopped {
+                            "Частичный отчёт сохранён"
+                        } else {
+                            "Отчёт сохранён"
+                        },
+                        path.display(),
+                        summary.succeeded,
+                        summary.failed,
+                        summary.skipped
+                    );
+                    ui.status.set_text(&text);
+                    let dialog = gtk::MessageDialog::builder()
+                        .transient_for(&ui.window)
+                        .buttons(gtk::ButtonsType::Close)
+                        .text("Markdown-отчёт")
+                        .secondary_text(&text)
+                        .build();
+                    dialogs::install(&dialog);
+                    dialog.connect_response(|dialog, _| dialog.close());
+                    dialog.present();
+                }
+                Err(error) => {
+                    ui.status.set_text(&error);
+                    show_error_dialog(ui, "Отчёт не сохранён", &error);
+                }
+            }
+        }
         Event::CsvExported(rows, result) => {
             finish_transfer(ui);
             match result {
@@ -5931,17 +6111,35 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     ) else {
         return;
     };
+    if matches!(profile.kind, DatabaseKind::MySql | DatabaseKind::MariaDb)
+        && profile.database != object.schema
+        && !object.schema.trim().is_empty()
+    {
+        let mut target = profile;
+        target.database = object.schema.clone();
+        with_database_session(ui, target, pool, move |ui, _| {
+            open_table(ui, object, open_in_new_tab)
+        });
+        return;
+    }
+    if profile.database.trim().is_empty() {
+        ui.status
+            .set_text("Выберите конкретную базу данных перед открытием таблицы");
+        return;
+    }
     ui.active_header.set_visible(true);
     let name = format!("{}.{}", object.schema, object.name);
     let table_name = object.name.clone();
     let session_key = profile_session_key(&profile);
+    let group_key = workspace_ui::ensure(ui, &session_key, Some(&object.schema));
+    workspace_ui::select(ui, &group_key);
     let tab_key = format!("{}:{name}", session_key);
-    let notebook = ensure_session_table_tabs(ui, &session_key);
+    let notebook = ensure_session_table_tabs(ui, &group_key);
     if let Some((_, page, _)) = find_table_page(ui, &tab_key) {
         ui.active_table_by_session
             .borrow_mut()
-            .insert(session_key.clone(), tab_key);
-        ui.table_tabs.set_visible_child_name(&session_key);
+            .insert(group_key.clone(), tab_key);
+        ui.table_tabs.set_visible_child_name(&group_key);
         notebook.set_current_page(Some(page));
         ui.table_tabs.set_visible(true);
         ui.empty_session.set_visible(false);
@@ -5949,11 +6147,7 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     }
     let mut replace_page = None;
     if !open_in_new_tab {
-        let previous_key = ui
-            .active_table_by_session
-            .borrow()
-            .get(&session_key)
-            .cloned();
+        let previous_key = ui.active_table_by_session.borrow().get(&group_key).cloned();
         if let Some(previous_key) = previous_key
             && let Some((_, page, widget)) = find_table_page(ui, &previous_key)
         {
@@ -6142,8 +6336,8 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     };
     ui.active_table_by_session
         .borrow_mut()
-        .insert(session_key.clone(), tab_key.clone());
-    ui.table_tabs.set_visible_child_name(&session_key);
+        .insert(group_key.clone(), tab_key.clone());
+    ui.table_tabs.set_visible_child_name(&group_key);
     notebook.set_current_page(Some(tab_index));
     notebook.set_tab_reorderable(&page_content, true);
     let weak = Rc::downgrade(ui);
@@ -6637,7 +6831,7 @@ fn create_table_edit_state() -> Rc<TableEditState> {
         .set_ellipsize(gtk::pango::EllipsizeMode::End);
     table_edit_state.status.set_width_chars(1);
     table_edit_state.status.add_css_class("dim-label");
-    edit_toolbar.append(&table_edit_state.status);
+    edit_toolbar.append(&dialogs::copyable_label(&table_edit_state.status));
     edit_toolbar.append(&table_edit_state.discard_button);
     edit_toolbar.append(&table_edit_state.save_button);
     table_edit_state
@@ -7786,3 +7980,23 @@ mod export_app_tests;
 #[cfg(test)]
 #[path = "../tests/support/production_app.rs"]
 mod production_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/batch_app.rs"]
+mod batch_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/messages_app.rs"]
+mod messages_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/groups_app.rs"]
+mod groups_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/schema_app.rs"]
+mod schema_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/namespace_app.rs"]
+mod namespace_app_tests;

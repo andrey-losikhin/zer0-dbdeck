@@ -19,7 +19,7 @@ pub(super) fn until(mut ready: impl FnMut() -> bool) {
     }
 }
 
-fn js(grid: &TabulatorGrid, script: &str) -> serde_json::Value {
+pub(super) fn js(grid: &TabulatorGrid, script: &str) -> serde_json::Value {
     let result = Rc::new(RefCell::new(None));
     let callback = result.clone();
     grid.webview.evaluate_javascript(
@@ -96,6 +96,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         native_tools_dir: None,
     };
     let session_key = profile_session_key(&profile);
+    let group_key = workspace_ui::key(&profile, Some(&object.schema));
     let key = format!("{}:{}.{}", session_key, object.schema, object.name);
     ui.sessions.borrow_mut().insert(
         session_key.clone(),
@@ -362,7 +363,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK
         ));
         assert_eq!(
-            ui.session_table_tabs.borrow()[&session_key].current_page(),
+            ui.session_table_tabs.borrow()[&group_key].current_page(),
             Some(0)
         );
         assert!(shortcuts::dispatch(
@@ -371,7 +372,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             gtk::gdk::ModifierType::CONTROL_MASK
         ));
         assert_eq!(
-            ui.session_table_tabs.borrow()[&session_key].current_page(),
+            ui.session_table_tabs.borrow()[&group_key].current_page(),
             Some(1)
         );
         assert!(shortcuts::dispatch(
@@ -384,7 +385,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         runtime.block_on(pool.close());
         return;
     }
-    let notebook = ensure_session_table_tabs(&ui, &session_key);
+    let notebook = ensure_session_table_tabs(&ui, &group_key);
     let page = notebook.nth_page(Some(0)).unwrap();
     let label = notebook.tab_label(&page).unwrap().parent().unwrap();
     let action = notebook.action_widget(gtk::PackType::End).unwrap();
@@ -520,7 +521,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         gtk::gdk::ModifierType::CONTROL_MASK
     ));
     assert_eq!(
-        ui.session_table_tabs.borrow()[&session_key].current_page(),
+        ui.session_table_tabs.borrow()[&group_key].current_page(),
         Some(1)
     );
 
@@ -682,8 +683,8 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
                 }
                 child = widget.next_sibling();
             }
-            // File/result actions plus transaction mode, Commit, Rollback and session reset.
-            assert_eq!(actions, 10);
+            // Six file/result actions, four transaction/session actions and explicit write execution.
+            assert_eq!(actions, 11);
             let paintable = gtk::WidgetPaintable::new(Some(&content));
             let mut menu_node = None;
             until(|| {
@@ -988,7 +989,7 @@ fn workspace_controls_layout_and_risk() {
     ui.window.close();
 }
 
-fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
+pub(super) fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
     if root.widget_name() == name {
         return Some(root.clone());
     }
@@ -1808,6 +1809,7 @@ fn sql_result_staging_and_delete() {
             id: format!("inactive-{n}"),
             profile_id: "another-profile".into(),
             connection_key: String::new(),
+            schema: None,
             name: format!("legacy-draft-{n}"),
             sql: "SELECT 1".into(),
         })
@@ -2317,6 +2319,12 @@ fn postgres_server_browser_navigation_and_icons() {
     *ui.current_profile.borrow_mut() = Some(profile.clone());
     *ui.pool.borrow_mut() = Some(ui.sessions.borrow()[&root_key].1.clone());
     add_session_tab(&ui, &profile);
+    assert_eq!(
+        ui.session_tabs.n_pages(),
+        0,
+        "server browser is not a database group"
+    );
+    assert!(!ui.session_tabs.is_visible());
     ui.landing.set_visible(false);
     show_table_catalog(&ui);
     fn database_button(ui: &Ui, database: &str) -> Option<gtk::Button> {
@@ -2380,6 +2388,7 @@ fn postgres_server_browser_navigation_and_icons() {
             .any(|(_, o)| o.schema == "crm" && o.name == "events")
     });
     assert_eq!(ui.sessions.borrow().len(), 2);
+    assert_eq!(ui.session_tabs.n_pages(), 1);
     assert!(
         database_button(&ui, "dbdeck_test")
             .unwrap()
@@ -2411,6 +2420,7 @@ fn postgres_server_browser_navigation_and_icons() {
             })
     });
     assert_eq!(ui.sessions.borrow().len(), 3);
+    assert_eq!(ui.session_tabs.n_pages(), 2);
     let postgres = database_button(&ui, "postgres").unwrap();
     assert!(postgres.has_css_class("database-tree-row-active"));
     let test_db = database_button(&ui, "dbdeck_test").unwrap();
