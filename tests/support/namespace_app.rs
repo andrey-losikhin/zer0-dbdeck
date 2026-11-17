@@ -83,7 +83,8 @@ fn postgres_schema_dropdown() {
     let (ui, profile, _pool) = setup(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD");
     let session = profile_session_key(&profile);
     assert_eq!(ui.namespace_label.text(), "Схема");
-    assert_eq!(selected(&ui).as_deref(), Some("public"));
+    assert_eq!(selected(&ui).as_deref(), Some("Выберите схему"));
+    assert!(ui.workspace_groups.borrow().is_empty());
     assert!(choices(&ui).iter().any(|v| v == "audit"));
     choose(&ui, "audit");
     let audit = workspace_ui::key(&profile, Some("audit"));

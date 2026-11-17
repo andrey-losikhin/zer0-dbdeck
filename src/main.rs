@@ -129,6 +129,8 @@ struct Ui {
     table_list_items: RefCell<Vec<(gtk::Button, DbObject)>>,
     landing: gtk::Box,
     empty_session: gtk::Box,
+    empty_session_hint: gtk::Label,
+    empty_session_sql: gtk::Button,
     active_header: gtk::Box,
     active_details: gtk::Label,
     session_tabs: gtk::Notebook,
@@ -496,6 +498,14 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     empty_session.set_hexpand(true);
     empty_session.set_vexpand(true);
     empty_session.set_visible(false);
+    let empty_session_hint = gtk::Label::new(None);
+    empty_session_hint.add_css_class("dim-label");
+    empty_session_hint.set_justify(gtk::Justification::Center);
+    let empty_session_sql = gtk::Button::with_label("Новый SQL-запрос");
+    empty_session_sql.add_css_class("suggested-action");
+    empty_session_sql.set_halign(gtk::Align::Center);
+    empty_session.append(&empty_session_hint);
+    empty_session.append(&empty_session_sql);
     workspace.append(&empty_session);
     workspace.append(&table_tabs);
     body.set_end_child(Some(&workspace));
@@ -570,6 +580,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         table_list_items: RefCell::new(Vec::new()),
         landing,
         empty_session,
+        empty_session_hint,
+        empty_session_sql,
         active_header,
         active_details,
         session_tabs,
@@ -669,6 +681,13 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         }
     });
     namespace_ui::install(&ui);
+    let weak = Rc::downgrade(&ui);
+    ui.empty_session_sql.connect_clicked(move |_| {
+        let Some(ui) = weak.upgrade() else { return };
+        if let Some(group) = active_workspace_group(&ui) {
+            create_sql_tab_in_group(&ui, &group);
+        }
+    });
     refresh_file_location_labels(&ui);
     let weak = Rc::downgrade(&ui);
     sql_directory.connect_clicked(move |_| {
@@ -1146,7 +1165,10 @@ fn add_workspace_tab(
     let database = schema
         .map(|schema| format!("{}.{}", profile.database, schema))
         .unwrap_or_else(|| profile.database.clone());
-    let title_text = format!("{} · {database}", profile.name);
+    let title_text = match schema {
+        Some(_) => format!("{} · {}.", profile.name, profile.database),
+        None => format!("{} · {database}", profile.name),
+    };
     let title = gtk::Label::new(Some(&title_text));
     title.set_tooltip_text(Some(&format!(
         "{} · {}:{} · {}",
@@ -1160,12 +1182,21 @@ fn add_workspace_tab(
     } else {
         gtk::pango::EllipsizeMode::End
     });
-    title.set_width_chars(if schema.is_some() { 28 } else { 22 });
-    title.set_max_width_chars(if schema.is_some() { 40 } else { 32 });
+    title.set_width_chars(title_text.chars().count().min(22) as i32);
+    // Keep "db." flush against the highlighted schema name.
+    title.set_xalign(if schema.is_some() { 1.0 } else { 0.5 });
+    title.set_max_width_chars(32);
     let tab_label = gtk::Box::new(gtk::Orientation::Horizontal, 4);
     tab_label.add_css_class("compact-tab-label");
     tab_label.append(&profile_tab_icon("database", &profile.color));
-    tab_label.append(&title);
+    let names = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    names.append(&title);
+    if let Some(schema) = schema {
+        let schema_label = gtk::Label::new(Some(schema));
+        schema_label.add_css_class("tab-schema-name");
+        names.append(&schema_label);
+    }
+    tab_label.append(&names);
     let close = gtk::Button::from_icon_name("window-close-symbolic");
     set_button_icon_size(&close, 14);
     close.add_css_class("flat");
@@ -3362,6 +3393,7 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
 }
 
 fn activate_session_table(ui: &Ui, session_key: &str) {
+    refresh_empty_session(ui);
     let group = workspace_ui::active(ui, session_key);
     let session_key = group.as_str();
     let notebook = ui.session_table_tabs.borrow().get(session_key).cloned();
@@ -3415,6 +3447,48 @@ fn activate_session_table(ui: &Ui, session_key: &str) {
     ui.table_tabs.set_visible(false);
     ui.empty_session.set_visible(true);
     ui.active_header.set_visible(false);
+}
+
+/// Active group of the current session, if the user has opened one.
+fn active_workspace_group(ui: &Ui) -> Option<String> {
+    let profile = ui.current_profile.borrow().clone()?;
+    let group = workspace_ui::active(ui, &profile_session_key(&profile));
+    ui.workspace_groups
+        .borrow()
+        .contains_key(&group)
+        .then_some(group)
+}
+
+fn refresh_empty_session(ui: &Ui) {
+    let pg = ui
+        .current_profile
+        .borrow()
+        .as_ref()
+        .is_some_and(|p| matches!(p.kind, DatabaseKind::PostgreSql));
+    let opened = active_workspace_group(ui).is_some();
+    ui.empty_session_hint.set_text(match (opened, pg) {
+        (true, _) => "Откройте таблицу слева или создайте SQL-запрос",
+        (false, true) => "Выберите схему слева",
+        (false, false) => "Выберите базу данных слева",
+    });
+    ui.empty_session_sql.set_visible(opened);
+}
+
+/// Opens (or focuses) the top-level workspace tab of a schema / MySQL database.
+fn open_schema_group(ui: &Rc<Ui>, profile: &ConnectionProfile, schema: &str) {
+    let session = profile_session_key(profile);
+    if !ui.sessions.borrow().contains_key(&session) {
+        return;
+    }
+    let schema = match profile.kind {
+        DatabaseKind::PostgreSql => Some(schema),
+        _ if profile.database == schema => None,
+        _ => return,
+    };
+    let group = workspace_ui::ensure(ui, &session, schema);
+    ensure_session_table_tabs(ui, &group);
+    workspace_ui::select(ui, &group);
+    namespace_ui::sync(ui);
 }
 
 fn start_new_connection(ui: &Rc<Ui>) {
@@ -4986,8 +5060,15 @@ fn append_schema_tree(
         let weak = Rc::downgrade(ui);
         let selected_schema_button = schema_button.downgrade();
         let schema_identity = (session_key.clone(), schema.clone());
+        let profile_for_group = profile.clone();
         schema_button.connect_clicked(move |_| {
-            let expanded = !children_for_toggle.is_visible();
+            let group_active = weak.upgrade().is_some_and(|ui| {
+                let key = workspace_ui::key(&profile_for_group, Some(schema_identity.1.as_str()));
+                ui.workspace_groups.borrow().contains_key(&key)
+                    && workspace_ui::is_active(&ui, &key)
+            });
+            // First click on an inactive schema opens it; later clicks toggle.
+            let expanded = !group_active || !children_for_toggle.is_visible();
             children_for_toggle.set_visible(expanded);
             disclosure_for_toggle.set_text(if expanded { "▾" } else { "▸" });
             set_penpot_icon(
@@ -5002,6 +5083,9 @@ fn append_schema_tree(
                     .insert(schema_identity.clone(), expanded);
                 if let Some(button) = selected_schema_button.upgrade() {
                     select_schema_button(&ui, &button);
+                }
+                if !group_active {
+                    open_schema_group(&ui, &profile_for_group, &schema_identity.1);
                 }
             }
         });
@@ -5110,7 +5194,8 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 return;
             }
             ui.connect_requests.borrow_mut().remove(&session_key);
-            if ui.pending_database_opens.borrow_mut().remove(&session_key)
+            let navigated = ui.pending_database_opens.borrow_mut().remove(&session_key);
+            if navigated
                 && ui.desired_database_session.borrow().as_deref() != Some(session_key.as_str())
             {
                 return; // A later selection owns the screen; discard this unused pool.
@@ -5162,7 +5247,11 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     if !profile.database.trim().is_empty() {
                         ensure_session_table_tabs(ui, &session_key);
                     }
-                    add_session_tab(ui, &profile);
+                    // Schemas/databases open their tab only on an explicit choice.
+                    if navigated && !matches!(profile.kind, DatabaseKind::PostgreSql) {
+                        add_session_tab(ui, &profile);
+                    }
+                    refresh_empty_session(ui);
                     refresh_profiles(ui);
                     ui.active.set_text(&profile.name);
                     let database = if profile.database.is_empty() {
@@ -8003,3 +8092,7 @@ mod schema_app_tests;
 #[cfg(test)]
 #[path = "../tests/support/namespace_app.rs"]
 mod namespace_app_tests;
+
+#[cfg(test)]
+#[path = "../tests/support/schema_open_app.rs"]
+mod schema_open_app_tests;

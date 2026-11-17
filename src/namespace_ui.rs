@@ -6,8 +6,13 @@ pub(super) struct State {
     choices: HashMap<String, Vec<String>>,
     pub revision: u64,
     updating: bool,
+    /// Inside notify::selected: replacing the model there crashes GTK.
+    handling: bool,
     selection: Option<(String, String)>,
 }
+
+/// Shown while no PostgreSQL schema is open; DropDown cannot be left empty.
+const SCHEMA_PLACEHOLDER: &str = "Выберите схему";
 
 fn scope(profile: &ConnectionProfile) -> String {
     let mut profile = profile.clone();
@@ -73,6 +78,7 @@ pub(super) fn install(ui: &Rc<Ui>) {
                 .selected_item()
                 .and_downcast::<gtk::StringObject>()
                 .map(|s| s.string().to_string())
+                .filter(|value| value != SCHEMA_PLACEHOLDER)
             else {
                 return;
             };
@@ -87,6 +93,15 @@ pub(super) fn install(ui: &Rc<Ui>) {
                 return;
             }
             ui.namespace_state.borrow_mut().selection = Some(selection);
+            ui.namespace_state.borrow_mut().handling = true;
+            // Drop the schema placeholder once the handler has returned.
+            let idle_owner = owner.clone();
+            gtk::glib::idle_add_local_once(move || {
+                if let Some(ui) = idle_owner.upgrade() {
+                    ui.namespace_state.borrow_mut().handling = false;
+                    sync(&ui);
+                }
+            });
             if matches!(profile.kind, DatabaseKind::PostgreSql) {
                 if profile.database.is_empty() {
                     return;
@@ -114,6 +129,22 @@ pub(super) fn install(ui: &Rc<Ui>) {
         });
 }
 
+fn model_values(ui: &Ui) -> Vec<String> {
+    ui.namespace_selector
+        .model()
+        .map(|model| {
+            (0..model.n_items())
+                .filter_map(|i| {
+                    model
+                        .item(i)
+                        .and_downcast::<gtk::StringObject>()
+                        .map(|s| s.string().to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 pub(super) fn sync(ui: &Ui) {
     let Some(profile) = ui.current_profile.borrow().clone() else {
         ui.namespace_row.set_visible(false);
@@ -130,7 +161,7 @@ pub(super) fn sync(ui: &Ui) {
             .borrow()
             .get(&group)
             .and_then(|g| g.schema.clone())
-            .unwrap_or_else(|| "public".into())
+            .unwrap_or_default()
     } else {
         profile.database.clone()
     };
@@ -142,8 +173,19 @@ pub(super) fn sync(ui: &Ui) {
         .cloned();
     let ready = cached.is_some();
     let mut values = cached.unwrap_or_default();
+    let selected = if pg && selected.is_empty() {
+        SCHEMA_PLACEHOLDER.to_owned()
+    } else {
+        selected
+    };
     if !selected.is_empty() && !values.contains(&selected) {
         values.insert(0, selected.clone());
+    }
+    if ui.namespace_state.borrow().handling {
+        let previous = model_values(ui);
+        if previous.contains(&selected) {
+            values = previous;
+        }
     }
     let index = values
         .iter()
@@ -162,20 +204,7 @@ pub(super) fn sync(ui: &Ui) {
     } else {
         "База данных"
     });
-    let previous: Vec<_> = ui
-        .namespace_selector
-        .model()
-        .map(|model| {
-            (0..model.n_items())
-                .filter_map(|i| {
-                    model
-                        .item(i)
-                        .and_downcast::<gtk::StringObject>()
-                        .map(|s| s.string().to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let previous = model_values(ui);
     if previous != values {
         ui.namespace_selector
             .set_model(Some(&gtk::StringList::new(&refs)));

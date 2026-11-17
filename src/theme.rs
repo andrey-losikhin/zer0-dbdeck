@@ -272,6 +272,10 @@ fn interface_roles(mode: ThemeMode) -> String {
     if mode == ThemeMode::System {
         css = "@define-color dbdeck_fg @window_fg_color; @define-color dbdeck_muted @window_fg_color; @define-color dbdeck_border alpha(@window_fg_color, 0.3); @define-color dbdeck_success @success_color; @define-color dbdeck_warning @warning_color; @define-color dbdeck_error @error_color; @define-color dbdeck_panel @window_bg_color;".to_owned();
     }
+    css.push_str(&format!(
+        ".tab-schema-name{{color:{};font-weight:600;}}",
+        p.accent
+    ));
     for ((_, color), class) in connection_colors()
         .iter()
         .zip(["blue", "teal", "green", "yellow", "orange", "red", "purple"])
