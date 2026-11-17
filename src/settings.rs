@@ -17,6 +17,7 @@ use zeroize::{Zeroize, Zeroizing};
 const VAULT_VERSION: u32 = 1;
 const PBKDF2_ITERATIONS: u32 = 600_000;
 const KEY_LEN: usize = 32;
+pub const MASTER_PASSWORD_MIN_LENGTH: usize = 4;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -349,15 +350,12 @@ impl SettingsStore {
             self.unlock_with_key(&key)?;
             return Ok(false);
         }
-        if master_password.chars().count() < 4 {
-            return Err("Мастер-пароль должен содержать не менее 4 символов".to_owned());
+        if master_password.chars().count() < MASTER_PASSWORD_MIN_LENGTH {
+            return Err(format!(
+                "Мастер-пароль должен содержать не менее {MASTER_PASSWORD_MIN_LENGTH} символов"
+            ));
         }
         let exists = self.vault.path.exists();
-        if !exists && master_password.chars().count() < 12 {
-            return Err(
-                "Для нового хранилища нужен мастер-пароль не короче 12 символов".to_owned(),
-            );
-        }
         if exists {
             self.vault.unlock(master_password)?;
         } else {
@@ -1247,9 +1245,9 @@ mod tests {
         let root = test_dir();
         let source_root = root.join("source");
         let mut source = isolated(&source_root);
-        source
-            .unlock_or_create_vault("synthetic master password")
-            .unwrap();
+        assert!(source.unlock_or_create_vault("три").is_err());
+        assert!(!source.storage_path().exists());
+        assert!(source.unlock_or_create_vault("тест").unwrap());
         source
             .save_profile(profile("one"), "synthetic-db-password")
             .unwrap();
@@ -1273,9 +1271,7 @@ mod tests {
         assert!(!restored.vault_is_unlocked());
         assert!(restored.unlock_or_create_vault("wrong password").is_err());
         assert!(restored.profiles.is_empty());
-        restored
-            .unlock_or_create_vault("synthetic master password")
-            .unwrap();
+        assert!(!restored.unlock_or_create_vault("тест").unwrap());
         assert_eq!(restored.password("one").unwrap(), "synthetic-db-password");
         let mut auto = isolated(&copy);
         auto.unlock_with_key(&source.unlock_key().unwrap()).unwrap();

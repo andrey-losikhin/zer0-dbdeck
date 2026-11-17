@@ -3813,11 +3813,15 @@ where
         "Запомнить ключ в выбранном менеджере (настраивается в Общих)",
     );
     remember.set_active(secret_store::remember_enabled());
+    let new_password_hint = format!(
+        "Мастер-пароль (минимум {} символов)",
+        settings::MASTER_PASSWORD_MIN_LENGTH
+    );
     let master_password = gtk::PasswordEntry::builder()
         .placeholder_text(if exists {
             "Мастер-пароль"
         } else {
-            "Мастер-пароль (минимум 12 символов)"
+            &new_password_hint
         })
         .hexpand(true)
         .build();
