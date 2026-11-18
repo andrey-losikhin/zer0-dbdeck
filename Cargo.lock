@@ -2442,6 +2442,7 @@ dependencies = [
  "base64",
  "directories",
  "futures-util",
+ "libadwaita",
  "libc",
  "relm4",
  "ring",

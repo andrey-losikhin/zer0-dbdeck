@@ -46,7 +46,13 @@ pub(super) fn show(ui: &Rc<Ui>, profile: &ConnectionProfile, object: &DbObject) 
     status.set_wrap(true);
     status.set_margin_start(8);
     status.set_margin_end(8);
-    root.append(&dialogs::copyable_label(&status));
+    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.set_margin_start(8);
+    status_row.append(&spinner);
+    status_row.append(&dialogs::copyable_label(&status));
+    root.append(&status_row);
     let notebook = gtk::Notebook::new();
     notebook.set_widget_name("structure-tabs");
     notebook.set_vexpand(true);
@@ -168,7 +174,9 @@ pub(super) fn show(ui: &Rc<Ui>, profile: &ConnectionProfile, object: &DbObject) 
     });
     let (sender, receiver) = mpsc::channel();
     let object = object.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let _ = sender.send(pool.inspect_object(&object).await);
     });
     let weak = window.downgrade();
@@ -179,7 +187,11 @@ pub(super) fn show(ui: &Rc<Ui>, profile: &ConnectionProfile, object: &DbObject) 
         if !window.is_visible() {
             return gtk::glib::ControlFlow::Break;
         }
-        match receiver.try_recv() {
+        let received = receiver.try_recv();
+        if !matches!(received, Err(mpsc::TryRecvError::Empty)) {
+            spinner.set_visible(false);
+        }
+        match received {
             Ok(Ok(structure)) => {
                 for (grid, data) in grids.iter().zip([
                     &structure.columns,

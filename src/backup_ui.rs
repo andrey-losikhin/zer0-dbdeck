@@ -178,7 +178,9 @@ fn choose_unlocked(ui: &Rc<Ui>, profile: &ConnectionProfile, mode: DumpMode) {
         let sender = ui.sender.clone();
         let runtime = ui.runtime.clone();
         let task_runtime = runtime.clone();
+        let guard = ui.activity.start();
         runtime.spawn_blocking(move || {
+            let _guard = guard;
             let result = task_runtime.block_on(async {
                 let secret = resolve_profile_password(&profile, password).await?;
                 if cancel.is_cancelled() {
@@ -319,7 +321,9 @@ fn start_import(ui: &Rc<Ui>, profile: ConnectionProfile, path: PathBuf) {
     let path = path.clone();
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn_blocking(move || {
+        let _guard = guard;
         let result = runtime.block_on(async {
             let password = resolve_profile_password(&profile, password).await?;
             native_backup::restore(&profile, &password, &path, &cancel)

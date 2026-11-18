@@ -131,7 +131,12 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
     status.set_widget_name("csv-import-status");
     status.set_wrap(true);
     status.set_xalign(0.0);
-    root.append(&dialogs::copyable_label(&status));
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(16, 16);
+    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    status_row.append(&spinner);
+    status_row.append(&dialogs::copyable_label(&status));
+    root.append(&status_row);
     let mapping_title = gtk::Label::new(Some("Столбец CSV → Столбец таблицы"));
     mapping_title.set_xalign(0.0);
     mapping_title.add_css_class("heading");
@@ -188,7 +193,9 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
     let objects = Rc::new(RefCell::new(Vec::<DbObject>::new()));
     let (sender, receiver) = mpsc::channel();
     let task_profile = profile.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let result = async {
             let secret = resolve_profile_password(&task_profile, secret).await?;
             let pool = DbPool::connect(&task_profile, &secret).await?;
@@ -216,6 +223,7 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
     let tables_loaded = tables.clone();
     let preview_loaded = preview.clone();
     let status_loaded = status.clone();
+    let spinner_loaded = spinner.clone();
     gtk::glib::timeout_add_local(Duration::from_millis(40), move || {
         let Some(window) = weak.upgrade() else {
             return gtk::glib::ControlFlow::Break;
@@ -223,7 +231,11 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
         if !window.is_visible() {
             return gtk::glib::ControlFlow::Break;
         }
-        match receiver.try_recv() {
+        let received = receiver.try_recv();
+        if !matches!(received, Err(mpsc::TryRecvError::Empty)) {
+            spinner_loaded.set_visible(false);
+        }
+        match received {
             Ok(Ok((pool, items, truncated))) => {
                 let names = items
                     .iter()
@@ -258,6 +270,7 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
     let objects_preview = objects.clone();
     let preview_status = status.clone();
     let preview_execute = execute.clone();
+    let preview_spinner = spinner.clone();
     let path_preview = path.clone();
     preview.connect_clicked(move |button| {
         let (Some(ui), Some(pool), Some(object)) = (
@@ -280,12 +293,16 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
         };
         button.set_sensitive(false);
         preview_status.set_text("Читаю предпросмотр и столбцы…");
+        let spinner = preview_spinner.clone();
+        spinner.set_visible(true);
         let (sender, receiver) = mpsc::channel();
         let runtime = ui.runtime.clone();
         let path = path_preview.clone();
         let selected = object.clone();
         let opts = options.clone();
+        let guard = ui.activity.start();
         ui.runtime.spawn_blocking(move || {
+            let _guard = guard;
             let result = runtime.block_on(async {
                 let columns = pool.csv_import_columns(&selected).await?;
                 let data = csv_input::preview(&path, &opts)?;
@@ -308,7 +325,11 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
             if !window.is_visible() {
                 return gtk::glib::ControlFlow::Break;
             }
-            match receiver.try_recv() {
+            let received = receiver.try_recv();
+            if !matches!(received, Err(mpsc::TryRecvError::Empty)) {
+                spinner.set_visible(false);
+            }
+            match received {
                 Ok(result) => {
                     if let Some(button) = button.upgrade() {
                         button.set_sensitive(true);
@@ -414,7 +435,9 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
                 if generation.get()!=ready.generation { show_error_dialog(&ui,"Параметры изменились","Обновите предпросмотр перед импортом."); return; }
                 let Some(cancel)=start_transfer(&ui) else {return;}; window.close();
                 let sender=ui.sender.clone(); let runtime=ui.runtime.clone(); let profile=profile.clone(); let path=path.clone(); let object=ready.object.clone(); let options=ready.options.clone(); let mapping=mapping.clone(); let pool=pool.clone(); ui.status.set_text("Импорт CSV…");
+                let guard=ui.activity.start();
                 ui.runtime.spawn_blocking(move || {
+                    let _guard=guard;
                     let progress=sender.clone();
                     let result=runtime.block_on(pool.import_csv(&profile,&object,&path,&options,&mapping,&cancel,move |rows| {let _=progress.send(Event::CsvImportProgress(rows));}));
                     let _=sender.send(Event::CsvImported(profile,object,result));

@@ -255,7 +255,9 @@ fn import_dialog(ui: &Rc<Ui>) {
         button.set_sensitive(false);
         ui.status.set_text("Читаю параметры подключения из gopass…");
         let sender = ui.sender.clone();
+        let guard = ui.activity.start();
         ui.runtime.spawn_blocking(move || {
+            let _guard = guard;
             let result = secret_store::Cli::default().import_connection(&path);
             let _ = sender.send(Event::GopassImported(result));
         });

@@ -1,3 +1,4 @@
+mod activity;
 mod app_instance;
 mod catalog_tree;
 mod csv;
@@ -9,8 +10,10 @@ mod connection_tls_ui;
 mod database;
 mod database_structure;
 mod database_target_ui;
+mod db_error;
 mod dialogs;
 mod icons;
+mod loading_bar;
 mod markdown_export;
 mod namespace_ui;
 mod native_backup;
@@ -66,6 +69,11 @@ enum Event {
     Tested(u64, u64, Result<(), String>),
     Connected(String, ConnectionProfile, Result<DbPool, String>),
     ServerIcon(String, &'static str),
+    /// A DB call proved the connection of this session key is gone. Always sent
+    /// before the regular result event of the same call.
+    ConnectionLost(String),
+    /// Fresh pools for every session key of a profile; applied all at once or not at all.
+    Reconnected(String, Result<Vec<(String, DbPool)>, String>),
     TablesLoaded(u64, u64, Result<TableCatalog, String>),
     DatabasesLoaded(u64, u64, Result<Vec<String>, String>),
     NamespaceChoices(String, u64, Result<Vec<String>, String>),
@@ -98,15 +106,67 @@ enum ProfileStatus {
     Connecting,
     Verified,
     Connected,
+    /// The main pool of the profile lost its connection; tabs stay open.
+    Broken,
     Error(String),
 }
 
+/// A read interrupted by a lost connection that can be offered again after reconnect.
+#[derive(Clone, Debug)]
+enum RetryAction {
+    Sql {
+        tab_id: String,
+        needed_approval: bool,
+        in_transaction: bool,
+    },
+    LoadTable(String),
+    ExpandNode(ConnectionProfile),
+}
+
+impl RetryAction {
+    fn id(&self) -> String {
+        match self {
+            Self::Sql { tab_id, .. } => format!("sql:{tab_id}"),
+            Self::LoadTable(key) => format!("table:{key}"),
+            Self::ExpandNode(profile) => format!("node:{}", profile_session_key(profile)),
+        }
+    }
+}
+
+/// Only reads are retried: never a statement that needed write approval or ran
+/// inside an open transaction (its COMMIT/ROLLBACK state is unknown).
+fn retry_allowed(action: &RetryAction) -> bool {
+    match action {
+        RetryAction::Sql {
+            needed_approval,
+            in_transaction,
+            ..
+        } => !needed_approval && !in_transaction,
+        RetryAction::LoadTable(_) | RetryAction::ExpandNode(_) => true,
+    }
+}
+
+const IDLE_CHECK_AFTER: Duration = Duration::from_secs(60);
+const BROKEN_ICON_NAME: &str = "connection-broken-icon";
+
+fn idle_check_due(last: std::time::Instant, now: std::time::Instant) -> bool {
+    now.saturating_duration_since(last) > IDLE_CHECK_AFTER
+}
+
 struct Ui {
+    connection_banner: adw::Banner,
+    broken_sessions: RefCell<HashSet<String>>,
+    reconnecting: RefCell<HashSet<String>>,
+    banner_profile: RefCell<Option<String>>,
+    pending_retry: RefCell<HashMap<String, Vec<RetryAction>>>,
+    last_active: RefCell<HashMap<String, std::time::Instant>>,
+    recovered_at: RefCell<HashMap<String, std::time::Instant>>,
     remember_unlock_button: gtk::Button,
     unlock_provider: gtk::ComboBoxText,
     storage_path_label: gtk::Label,
     transfer_cancel: RefCell<Option<Arc<transfer::Cancellation>>>,
     transfer_cancel_button: gtk::Button,
+    transfer_spinner: adw::Spinner,
     sql_directory_label: gtk::Label,
     csv_directory_label: gtk::Label,
     unlock_busy: Cell<bool>,
@@ -125,6 +185,7 @@ struct Ui {
     namespace_row: gtk::Box,
     namespace_label: gtk::Label,
     namespace_selector: gtk::DropDown,
+    namespace_spinner: adw::Spinner,
     namespace_state: RefCell<namespace_ui::State>,
     table_list_items: RefCell<Vec<(gtk::Button, DbObject)>>,
     landing: gtk::Box,
@@ -163,6 +224,7 @@ struct Ui {
     table_more_loading: RefCell<HashSet<String>>,
     table_data: RefCell<HashMap<String, Arc<TableData>>>,
     table_edit_states: RefCell<HashMap<String, Rc<TableEditState>>>,
+    table_spinners: RefCell<HashMap<String, adw::Spinner>>,
     sql_tabs: RefCell<HashMap<String, SqlTab>>,
     sql_draft_timers: RefCell<HashMap<String, gtk::glib::SourceId>>,
     restoring_drafts: Cell<bool>,
@@ -176,6 +238,7 @@ struct Ui {
     connection_generation: Cell<u64>,
     view_generation: Cell<u64>,
     test_generation: Cell<u64>,
+    activity: activity::ActivityCounter,
 }
 
 struct SqlTab {
@@ -215,6 +278,11 @@ struct SqlTab {
     saved_path: Option<PathBuf>,
     risk_indicator: gtk::Label,
     error_message: gtk::Label,
+    spinner: adw::Spinner,
+    started: Option<std::time::Instant>,
+    elapsed_timer: Option<gtk::glib::SourceId>,
+    /// Whether the last sent statement needed write approval (such SQL is never retried).
+    sent_needing_approval: bool,
 }
 
 #[derive(Clone, Default)]
@@ -359,6 +427,13 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     shortcuts::button(&preferences, &import_backup, "<Control>o");
     dialogs::install(&preferences);
     root.append(&header);
+    let activity_bar = loading_bar::new();
+    root.append(&activity_bar);
+    let connection_banner = adw::Banner::new("Соединение потеряно");
+    connection_banner.set_use_markup(false);
+    connection_banner.set_button_label(Some("Переподключиться"));
+    connection_banner.set_revealed(false);
+    root.append(&connection_banner);
 
     let body = gtk::Paned::new(gtk::Orientation::Horizontal);
     body.set_vexpand(true);
@@ -407,7 +482,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     sidebar.append(&profile_scroll);
     let objects_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
     objects_page.add_css_class("sidebar-panel");
-    let (namespace_row, namespace_label, namespace_selector) = namespace_ui::widgets();
+    let (namespace_row, namespace_label, namespace_selector, namespace_spinner) =
+        namespace_ui::widgets();
     objects_page.append(&namespace_row);
     let table_filter = gtk::SearchEntry::new();
     table_filter.set_placeholder_text(Some("Фильтр таблиц"));
@@ -520,6 +596,10 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     status.set_width_chars(1);
     footer.append(&dialogs::copyable_label(&status));
+    let transfer_spinner = adw::Spinner::new();
+    transfer_spinner.set_size_request(16, 16);
+    transfer_spinner.set_visible(false);
+    footer.append(&transfer_spinner);
     let transfer_cancel_button = gtk::Button::with_label("Отменить операцию");
     transfer_cancel_button.set_visible(false);
     footer.append(&transfer_cancel_button);
@@ -558,6 +638,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         storage_path_label: storage_path,
         transfer_cancel: RefCell::new(None),
         transfer_cancel_button,
+        transfer_spinner,
         sql_directory_label,
         csv_directory_label,
         unlock_busy: Cell::new(false),
@@ -576,6 +657,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         namespace_row,
         namespace_label,
         namespace_selector,
+        namespace_spinner,
         namespace_state: RefCell::new(namespace_ui::State::default()),
         table_list_items: RefCell::new(Vec::new()),
         landing,
@@ -614,6 +696,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         table_more_loading: RefCell::new(HashSet::new()),
         table_data: RefCell::new(HashMap::new()),
         table_edit_states: RefCell::new(HashMap::new()),
+        table_spinners: RefCell::new(HashMap::new()),
         sql_tabs: RefCell::new(HashMap::new()),
         sql_draft_timers: RefCell::new(HashMap::new()),
         restoring_drafts: Cell::new(false),
@@ -627,6 +710,26 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         connection_generation: Cell::new(0),
         view_generation: Cell::new(0),
         test_generation: Cell::new(0),
+        activity: activity::ActivityCounter::default(),
+        connection_banner,
+        broken_sessions: RefCell::new(HashSet::new()),
+        reconnecting: RefCell::new(HashSet::new()),
+        banner_profile: RefCell::new(None),
+        pending_retry: RefCell::new(HashMap::new()),
+        last_active: RefCell::new(HashMap::new()),
+        recovered_at: RefCell::new(HashMap::new()),
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.connection_banner.connect_button_clicked(move |_| {
+        let Some(ui) = weak.upgrade() else { return };
+        let Some(profile_id) = ui.banner_profile.borrow().clone() else {
+            return;
+        };
+        if profile_has_broken_session(&ui, &profile_id) {
+            reconnect_profile(&ui, &profile_id);
+        } else {
+            run_pending_retries(&ui, &profile_id);
+        }
     });
     let weak = Rc::downgrade(&ui);
     body.connect_position_notify(move |_| {
@@ -686,6 +789,9 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         let Some(ui) = weak.upgrade() else { return };
         if let Some(group) = active_workspace_group(&ui) {
             create_sql_tab_in_group(&ui, &group);
+        } else if let Some(profile) = ui.current_profile.borrow().clone() {
+            // No workspace yet: open one for the selected database right away.
+            create_sql_tab(&ui, &profile_session_key(&profile));
         }
     });
     refresh_file_location_labels(&ui);
@@ -771,7 +877,11 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     // Keep UI state alive while the GTK application is running. Signal handlers
     // intentionally capture Weak<Ui>, so this event source owns the strong ref.
     let ui_for_events = ui.clone();
+    let mut activity_visibility = activity::DelayedVisibility::default();
     gtk::glib::timeout_add_local(Duration::from_millis(80), move || {
+        let show_bar =
+            activity_visibility.update(ui_for_events.activity.active(), std::time::Instant::now());
+        activity_bar.set_visible(show_bar);
         loop {
             let event = ui_for_events.events.lock().expect("event lock").try_recv();
             match event {
@@ -939,6 +1049,14 @@ fn refresh_profiles(ui: &Rc<Ui>) {
             active.add_css_class("tag-active");
             top.append(&active);
         }
+        if matches!(
+            ui.profile_status.borrow().get(&profile.id),
+            Some(ProfileStatus::Broken)
+        ) {
+            let broken = gtk::Image::from_icon_name("network-offline-symbolic");
+            broken.set_tooltip_text(Some("Соединение потеряно"));
+            top.append(&broken);
+        }
         if is_profile_connected(ui, &profile.id) {
             top.add_css_class("profile-card-navigable");
             install_profile_card_navigation(ui, &top, &profile);
@@ -974,6 +1092,7 @@ fn refresh_profiles(ui: &Rc<Ui>) {
                         ("Проверка подключения успешна".to_owned(), "status-success")
                     }
                     ProfileStatus::Connected => unreachable!(),
+                    ProfileStatus::Broken => ("Соединение потеряно".to_owned(), "status-error"),
                     ProfileStatus::Error(error) => (format!("Ошибка: {error}"), "status-error"),
                 };
                 let status = gtk::Label::new(Some(&text));
@@ -991,7 +1110,10 @@ fn refresh_profiles(ui: &Rc<Ui>) {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
         actions.set_homogeneous(false);
         actions.set_margin_top(6);
-        let is_connected = matches!(profile_state.as_ref(), Some(ProfileStatus::Connected));
+        let is_connected = matches!(
+            profile_state.as_ref(),
+            Some(ProfileStatus::Connected | ProfileStatus::Broken)
+        );
         let is_connecting = matches!(profile_state.as_ref(), Some(ProfileStatus::Connecting));
         if is_connected {
             let connected_icon = penpot_icon_image("status-connected");
@@ -1024,8 +1146,11 @@ fn refresh_profiles(ui: &Rc<Ui>) {
             connect.add_css_class("flat");
             connect.add_css_class("connection-action");
             if is_connecting {
-                connect.set_tooltip_text(Some("Устанавливается подключение"));
+                connect.set_tooltip_text(Some("Подключение..."));
                 connect.set_sensitive(false);
+                let spinner = adw::Spinner::new();
+                spinner.set_size_request(22, 22);
+                connect.set_child(Some(&spinner));
             } else {
                 connect.set_tooltip_text(Some("Подключить"));
             }
@@ -1240,6 +1365,7 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
             return;
         };
         let session = workspace_ui::source(&ui, &name);
+        note_tab_switch(&ui, &name, &key, &session);
         ui.active_group_by_session
             .borrow_mut()
             .insert(session.clone(), name.clone());
@@ -1818,6 +1944,10 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     title.set_width_chars(8);
     title.set_max_width_chars(20);
     tab_label.append(&title);
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(14, 14);
+    spinner.set_visible(false);
+    tab_label.append(&spinner);
     let close_button = gtk::Button::from_icon_name("window-close-symbolic");
     set_button_icon_size(&close_button, 14);
     close_button.add_css_class("flat");
@@ -1873,6 +2003,10 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
             saved_path: None,
             risk_indicator: risk_indicator.clone(),
             error_message: error_message.clone(),
+            spinner,
+            started: None,
+            elapsed_timer: None,
+            sent_needing_approval: false,
         },
     );
     let tab_index = notebook.append_page(&page, Some(&tab_label));
@@ -2129,6 +2263,22 @@ fn run_sql_tab_policy(
         || (force_write
             && matches!(profile.environment, EnvironmentTag::Prod)
             && !profile.read_only);
+    if block_if_broken(
+        ui,
+        &session_key,
+        Some(RetryAction::Sql {
+            tab_id: id.to_owned(),
+            needed_approval: needs_approval,
+            in_transaction: state.pending,
+        }),
+    ) {
+        if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) {
+            tab.executed_sql = Some(sql.clone());
+            tab.status
+                .set_text("Соединение потеряно. Переподключитесь и повторите запрос.");
+        }
+        return;
+    }
     if needs_approval && !approved {
         let owner = Rc::downgrade(ui);
         let id = id.to_owned();
@@ -2162,10 +2312,15 @@ fn run_sql_tab_policy(
         return;
     }
     let session = tab.session.clone();
+    let session_key = tab.session_key.clone();
     let timeout = tab.timeout.value_as_int() as u64;
     tab.editor.completion().hide();
     tab.executed_sql = Some(sql.clone());
     tab.request_id = request_id.clone();
+    tab.sent_needing_approval = needs_approval;
+    ui.last_active
+        .borrow_mut()
+        .insert(format!("sql::{id}"), std::time::Instant::now());
     tab.status.set_text("Выполняю запрос…");
     tab.run_button.set_sensitive(false);
     tab.stop_button.set_sensitive(true);
@@ -2184,19 +2339,23 @@ fn run_sql_tab_policy(
     while let Some(child) = tab.grid.first_child() {
         tab.grid.remove(&child);
     }
+    start_sql_timer(ui, id, tab);
     drop(tabs);
     ui.status.set_text("Выполняю SQL-запрос…");
 
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
     let tab_id = id.to_owned();
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let started = std::time::Instant::now();
         let result = if approved {
             session.execute_authorized(&sql, timeout, true).await
         } else {
             session.execute_with_timeout(&sql, timeout).await
         };
+        let result = report_lost(session.pool(), &sender, &session_key, result).await;
         let state = session.state().await;
         let _ = sender.send(Event::SqlQueryFinished(
             tab_id,
@@ -2216,6 +2375,42 @@ fn stop_sql_tab(ui: &Rc<Ui>, id: &str) {
             tab.session.request_cancel();
         }
     }
+}
+
+fn start_sql_timer(ui: &Rc<Ui>, id: &str, tab: &mut SqlTab) {
+    stop_sql_timer(tab);
+    tab.started = Some(std::time::Instant::now());
+    tab.spinner.set_visible(true);
+    let weak = Rc::downgrade(ui);
+    let id = id.to_owned();
+    tab.elapsed_timer = Some(gtk::glib::timeout_add_seconds_local(1, move || {
+        let Some(ui) = weak.upgrade() else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        let Ok(tabs) = ui.sql_tabs.try_borrow() else {
+            return gtk::glib::ControlFlow::Continue;
+        };
+        // Missing tab was dropped together with its SourceId, so Break is safe.
+        let Some(tab) = tabs.get(&id) else {
+            return gtk::glib::ControlFlow::Break;
+        };
+        if let Some(started) = tab.started
+            && tab.stop_button.is_sensitive()
+        {
+            tab.status
+                .set_text(&format!("Выполняется... {} с", started.elapsed().as_secs()));
+        }
+        gtk::glib::ControlFlow::Continue
+    }));
+}
+
+/// Removes the running-query timer exactly once; safe to call repeatedly.
+fn stop_sql_timer(tab: &mut SqlTab) {
+    if let Some(source) = tab.elapsed_timer.take() {
+        source.remove();
+    }
+    tab.started = None;
+    tab.spinner.set_visible(false);
 }
 
 fn reset_sql_session(ui: &Rc<Ui>, id: &str) {
@@ -2345,10 +2540,14 @@ fn change_sql_transaction_authorized(
     }
     tab.tabulator.set_locked(true);
     let session = tab.session.clone();
+    let session_key = tab.session_key.clone();
     let id = id.to_owned();
     let sender = ui.sender.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let result = session.transaction_with_approval(action, approved).await;
+        let result = report_lost(session.pool(), &sender, &session_key, result).await;
         let _ = sender.send(Event::SqlTransactionFinished(id, result));
     });
 }
@@ -2566,11 +2765,13 @@ fn start_transfer(ui: &Rc<Ui>) -> Option<Arc<transfer::Cancellation>> {
     *ui.transfer_cancel.borrow_mut() = Some(cancel.clone());
     ui.transfer_cancel_button.set_sensitive(true);
     ui.transfer_cancel_button.set_visible(true);
+    ui.transfer_spinner.set_visible(true);
     Some(cancel)
 }
 fn finish_transfer(ui: &Ui) {
     ui.transfer_cancel.borrow_mut().take();
     ui.transfer_cancel_button.set_visible(false);
+    ui.transfer_spinner.set_visible(false);
 }
 
 fn refresh_file_location_labels(ui: &Ui) {
@@ -2920,7 +3121,9 @@ fn choose_sql_csv_export(ui: &Rc<Ui>, id: &str) {
                     dialog.destroy();
                     return;
                 };
+                let guard = ui.activity.start();
                 runtime.spawn_blocking(move || {
+                    let _guard = guard;
                     let rows = data.rows.len();
                     let result = if cancel.is_cancelled() {
                         Err("Экспорт отменён".into())
@@ -3076,6 +3279,7 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
     }
     ui.session_tabs.set_visible(ui.session_tabs.n_pages() > 0);
     ui.sessions.borrow_mut().remove(session_key);
+    ui.broken_sessions.borrow_mut().remove(session_key);
     ui.server_icons.borrow_mut().remove(session_key);
     catalog_tree::forget(ui, session_key);
     if let Some(profile_id) = profile_id
@@ -3086,6 +3290,10 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
             .any(|(profile, _)| profile.id == profile_id)
     {
         ui.profile_status.borrow_mut().remove(&profile_id);
+        ui.pending_retry.borrow_mut().remove(&profile_id);
+        if ui.banner_profile.borrow().as_deref() == Some(profile_id.as_str()) {
+            ui.connection_banner.set_revealed(false);
+        }
     }
     ui.connect_requests.borrow_mut().remove(session_key);
     ui.pending_database_opens.borrow_mut().remove(session_key);
@@ -3295,6 +3503,7 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
         ui.table_requests.borrow_mut().remove(key);
         ui.table_data.borrow_mut().remove(key);
         ui.table_edit_states.borrow_mut().remove(key);
+        ui.table_spinners.borrow_mut().remove(key);
         drop(widget);
     }
     if let Some(session_key) = session_key {
@@ -3468,10 +3677,11 @@ fn refresh_empty_session(ui: &Ui) {
     let opened = active_workspace_group(ui).is_some();
     ui.empty_session_hint.set_text(match (opened, pg) {
         (true, _) => "Откройте таблицу слева или создайте SQL-запрос",
-        (false, true) => "Выберите схему слева",
-        (false, false) => "Выберите базу данных слева",
+        (false, true) => "Выберите схему слева или создайте SQL-запрос",
+        (false, false) => "Выберите базу данных слева или создайте SQL-запрос",
     });
-    ui.empty_session_sql.set_visible(opened);
+    ui.empty_session_sql
+        .set_visible(opened || ui.current_profile.borrow().is_some());
 }
 
 /// Opens (or focuses) the top-level workspace tab of a schema / MySQL database.
@@ -3483,12 +3693,84 @@ fn open_schema_group(ui: &Rc<Ui>, profile: &ConnectionProfile, schema: &str) {
     let schema = match profile.kind {
         DatabaseKind::PostgreSql => Some(schema),
         _ if profile.database == schema => None,
-        _ => return,
+        _ => {
+            with_mysql_database(ui, profile, schema, |_, _| {});
+            return;
+        }
     };
     let group = workspace_ui::ensure(ui, &session, schema);
     ensure_session_table_tabs(ui, &group);
     workspace_ui::select(ui, &group);
     namespace_ui::sync(ui);
+}
+
+/// MySQL/MariaDB keep one session per database: connect `database` on demand,
+/// open its workspace group and run `action` with the new session key.
+fn with_mysql_database(
+    ui: &Rc<Ui>,
+    profile: &ConnectionProfile,
+    database: &str,
+    action: impl FnOnce(&Rc<Ui>, &str) + 'static,
+) {
+    let pool = ui
+        .sessions
+        .borrow()
+        .get(&profile_session_key(profile))
+        .map(|(_, pool)| pool.clone());
+    let Some(pool) = pool else {
+        ui.status.set_text("База отключена. Раскройте её заново.");
+        return;
+    };
+    let mut target = profile.clone();
+    target.database = database.to_owned();
+    with_database_session(ui, target, pool, move |ui, key| {
+        let profile = ui.sessions.borrow().get(key).map(|(p, _)| p.clone());
+        let Some(profile) = profile else { return };
+        open_schema_group(ui, &profile, &profile.database);
+        action(ui, key);
+    });
+}
+
+/// Opens a new SQL tab bound to the chosen schema / MySQL database.
+fn open_sql_in_schema(ui: &Rc<Ui>, profile: &ConnectionProfile, schema: &str) {
+    match profile.kind {
+        DatabaseKind::PostgreSql => {
+            open_schema_group(ui, profile, schema);
+            let group = workspace_ui::key(profile, Some(schema));
+            if ui.workspace_groups.borrow().contains_key(&group) {
+                create_sql_tab_in_group(ui, &group);
+            }
+        }
+        _ if profile.database == schema => {
+            open_schema_group(ui, profile, schema);
+            create_sql_tab(ui, &profile_session_key(profile));
+        }
+        _ => with_mysql_database(ui, profile, schema, create_sql_tab),
+    }
+}
+
+fn tree_sql_button(target: &str) -> gtk::Button {
+    let icon = penpot_icon_image("sql-query");
+    icon.remove_css_class("penpot-icon");
+    icon.set_pixel_size(16);
+    icon.set_size_request(16, 16);
+    let button = gtk::Button::new();
+    button.set_child(Some(&icon));
+    button.set_valign(gtk::Align::Center);
+    button.add_css_class("flat");
+    button.add_css_class("tree-row-action");
+    button.set_tooltip_text(Some(&format!("Новый SQL-запрос: {target}")));
+    button
+}
+
+/// Tree row with a hover action; the action is a sibling, not nested in the row button.
+fn tree_line(row: &gtk::Button, action: &gtk::Button) -> gtk::Box {
+    let line = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    line.add_css_class("tree-row-line");
+    row.set_hexpand(true);
+    line.append(row);
+    line.append(action);
+    line
 }
 
 fn start_new_connection(ui: &Rc<Ui>) {
@@ -3971,7 +4253,9 @@ fn choose_table_csv_export(ui: &Rc<Ui>, table_key: &str, table_name: &str) {
                 };
                 let sender = ui.sender.clone();
                 let data = data.clone();
+                let guard = ui.activity.start();
                 ui.runtime.spawn_blocking(move || {
+                    let _guard = guard;
                     let rows = data.rows.len();
                     let result = if cancel.is_cancelled() {
                         Err("Экспорт отменён".into())
@@ -4031,7 +4315,9 @@ fn choose_full_table_csv_export(
                     return;
                 };
                 let task_runtime = runtime.clone();
+                let guard = ui.activity.start();
                 runtime.spawn_blocking(move || {
+                    let _guard = guard;
                     let progress = sender.clone();
                     let result = task_runtime.block_on(write_full_table_csv(
                         &path,
@@ -4479,10 +4765,12 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
         let connection_generation = ui.connection_generation.get();
         let sender = ui.sender.clone();
         let runtime = ui.runtime.clone();
+        let guard = ui.activity.start();
         runtime.spawn(async move {
+            let _guard = guard;
             let result = match resolve_profile_password(&profile, password_text).await {
                 Ok(secret) => match DbPool::connect(&profile, &secret).await {
-                    Ok(pool) => pool.check().await,
+                    Ok(pool) => pool.check().await.map_err(String::from),
                     Err(error) => Err(error),
                 },
                 Err(error) => Err(error),
@@ -4866,7 +5154,9 @@ fn connect_profile_with_password(ui: &Rc<Ui>, profile: ConnectionProfile, passwo
         .insert(session_key, request_id.clone());
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let result = match resolve_profile_password(&profile, password).await {
             Ok(secret) => DbPool::connect(&profile, &secret).await,
             Err(error) => Err(error),
@@ -4899,6 +5189,7 @@ fn show_table_catalog(ui: &Rc<Ui>) {
     } else {
         ui.objects.set_sensitive(false);
         clear_box(&ui.objects);
+        ui.objects.append(&loading_row("Загружаю таблицы…"));
         ui.table_list_items.borrow_mut().clear();
         ui.selected_table_button.borrow_mut().take();
     }
@@ -4907,16 +5198,37 @@ fn show_table_catalog(ui: &Rc<Ui>) {
     ui.view_generation.set(view_generation);
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
+    let session_key = profile_session_key(&profile);
+    // A MySQL database opened from the server tree keeps listing the saved scope.
+    let mut catalog_scope = profile.clone();
+    if !matches!(profile.kind, DatabaseKind::PostgreSql) {
+        if let Some(saved) = ui
+            .store
+            .borrow()
+            .as_ref()
+            .and_then(|store| store.profiles.iter().find(|p| p.id == profile.id))
+        {
+            catalog_scope.database = saved.database.clone();
+        }
+    }
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let event = if matches!(profile.kind, DatabaseKind::PostgreSql)
             && profile.database.trim().is_empty()
         {
-            Event::DatabasesLoaded(generation, view_generation, pool.postgres_databases().await)
+            let result = pool.postgres_databases().await;
+            Event::DatabasesLoaded(
+                generation,
+                view_generation,
+                report_lost(&pool, &sender, &session_key, result).await,
+            )
         } else {
+            let result = pool.list_tables(&catalog_scope).await;
             Event::TablesLoaded(
                 generation,
                 view_generation,
-                pool.list_tables(&profile).await,
+                report_lost(&pool, &sender, &session_key, result).await,
             )
         };
         let _ = sender.send(event);
@@ -4943,6 +5255,14 @@ fn open_database_session(
         ui.status.set_text("Достигнут лимит 16 открытых/открываемых подключений. Закройте ненужную вкладку подключения.");
         return;
     }
+    if matches!(
+        ui.profile_status.borrow().get(&profile.id),
+        Some(ProfileStatus::Broken)
+    ) {
+        queue_retry(ui, &profile.id, RetryAction::ExpandNode(profile.clone()));
+        show_connection_banner(ui, &profile.id);
+        return;
+    }
     *ui.desired_database_session.borrow_mut() = Some(key.clone());
     ui.pending_database_opens.borrow_mut().insert(key.clone());
     let request = Uuid::new_v4().to_string();
@@ -4951,7 +5271,9 @@ fn open_database_session(
         .insert(key, request.clone());
     ui.status.set_text(&format!("Открываю базу {database}…"));
     let sender = ui.sender.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let result = pool.connect_database(&profile.database).await;
         let _ = sender.send(Event::Connected(request, profile, result));
     });
@@ -5017,6 +5339,7 @@ fn append_schema_tree(
             grouped
         },
     );
+    let database_group = !matches!(profile.kind, DatabaseKind::PostgreSql);
     for schema in schemas {
         let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
         children.set_margin_start(24);
@@ -5026,11 +5349,18 @@ fn append_schema_tree(
             .schema_expanded
             .get(&(session_key.clone(), schema.clone()))
             .copied()
-            .unwrap_or(schema == "public" || preferred_schema.as_deref() == Some(schema.as_str()));
+            .unwrap_or(if database_group {
+                if profile.database.is_empty() {
+                    preferred_schema.as_deref() == Some(schema.as_str())
+                } else {
+                    schema == profile.database
+                }
+            } else {
+                schema == "public" || preferred_schema.as_deref() == Some(schema.as_str())
+            });
         children.set_visible(expanded);
         let disclosure = gtk::Label::new(Some(if expanded { "▾" } else { "▸" }));
         disclosure.set_width_chars(2);
-        let database_group = !matches!(profile.kind, DatabaseKind::PostgreSql);
         let open_icon = if database_group {
             "database-open"
         } else {
@@ -5057,7 +5387,15 @@ fn append_schema_tree(
         schema_button.set_halign(gtk::Align::Fill);
         schema_button.add_css_class("flat");
         schema_button.add_css_class("schema-tree-row");
-        schema_button.set_tooltip_text(Some(&format!("{}: {}", profile.database, schema)));
+        schema_button.set_hexpand(true);
+        if database_group {
+            schema_button.set_tooltip_text(Some(&format!("Открыть базу {schema}")));
+            if schema == profile.database {
+                schema_button.add_css_class("schema-tree-row-active");
+            }
+        } else {
+            schema_button.set_tooltip_text(Some(&format!("{}: {}", profile.database, schema)));
+        }
         let children_for_toggle = children.clone();
         let disclosure_for_toggle = disclosure.clone();
         let folder_for_toggle = folder.clone();
@@ -5065,14 +5403,25 @@ fn append_schema_tree(
         let selected_schema_button = schema_button.downgrade();
         let schema_identity = (session_key.clone(), schema.clone());
         let profile_for_group = profile.clone();
+        // A MySQL/MariaDB database is its own session, so its group belongs to that database.
+        let group_profile = if database_group {
+            let mut group_profile = profile.clone();
+            group_profile.database = schema.clone();
+            group_profile
+        } else {
+            profile.clone()
+        };
+        let open_requested = Rc::new(Cell::new(false));
         schema_button.connect_clicked(move |_| {
             let group_active = weak.upgrade().is_some_and(|ui| {
-                let key = workspace_ui::key(&profile_for_group, Some(schema_identity.1.as_str()));
+                let key = workspace_ui::key(&group_profile, Some(schema_identity.1.as_str()));
                 ui.workspace_groups.borrow().contains_key(&key)
                     && workspace_ui::is_active(&ui, &key)
             });
-            // First click on an inactive schema opens it; later clicks toggle.
-            let expanded = !group_active || !children_for_toggle.is_visible();
+            // First click on an inactive schema opens it; later clicks toggle,
+            // even when opening the group did not succeed.
+            let expanded = (!group_active && !open_requested.replace(true))
+                || !children_for_toggle.is_visible();
             children_for_toggle.set_visible(expanded);
             disclosure_for_toggle.set_text(if expanded { "▾" } else { "▸" });
             set_penpot_icon(
@@ -5093,7 +5442,20 @@ fn append_schema_tree(
                 }
             }
         });
-        parent.append(&schema_button);
+        let sql_button = tree_sql_button(&if database_group {
+            schema.clone()
+        } else {
+            format!("{}.{}", profile.database, schema)
+        });
+        let weak = Rc::downgrade(ui);
+        let profile_for_sql = profile.clone();
+        let schema_for_sql = schema.clone();
+        sql_button.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                open_sql_in_schema(&ui, &profile_for_sql, &schema_for_sql);
+            }
+        });
+        parent.append(&tree_line(&schema_button, &sql_button));
         if let Some(objects) = objects_by_schema.remove(&schema) {
             for object in objects {
                 let button = table_object_button(&object);
@@ -5162,8 +5524,533 @@ fn append_schema_tree(
     }
 }
 
+fn session_profile_id(ui: &Ui, session_key: &str) -> Option<String> {
+    ui.sessions
+        .borrow()
+        .get(session_key)
+        .map(|(profile, _)| profile.id.clone())
+}
+
+fn profile_session_keys(ui: &Ui, profile_id: &str) -> Vec<String> {
+    ui.sessions
+        .borrow()
+        .iter()
+        .filter(|(_, (profile, _))| profile.id == profile_id)
+        .map(|(key, _)| key.clone())
+        .collect()
+}
+
+/// The session of the profile as saved (its default database), not a database opened later.
+fn main_session_key(ui: &Ui, profile_id: &str) -> Option<String> {
+    let store = ui.store.borrow();
+    let store = store.as_ref()?;
+    let profile = store.profiles.iter().find(|p| p.id == profile_id)?;
+    Some(profile_session_key(profile))
+}
+
+fn profile_has_broken_session(ui: &Ui, profile_id: &str) -> bool {
+    let broken = ui.broken_sessions.borrow();
+    profile_session_keys(ui, profile_id)
+        .iter()
+        .any(|key| broken.contains(key))
+}
+
+/// Marks the lost database session (and its tabs); the whole profile when its main pool fell.
+fn mark_connection_lost(ui: &Rc<Ui>, session_key: &str) {
+    let Some(profile_id) = session_profile_id(ui, session_key) else {
+        return;
+    };
+    // Late errors of the replaced pool must not break the fresh one.
+    if ui.reconnecting.borrow().contains(&profile_id)
+        || ui
+            .recovered_at
+            .borrow()
+            .get(&profile_id)
+            .is_some_and(|at| at.elapsed() < Duration::from_secs(3))
+    {
+        return;
+    }
+    let main_lost = main_session_key(ui, &profile_id).as_deref() == Some(session_key);
+    let keys = if main_lost {
+        profile_session_keys(ui, &profile_id)
+    } else {
+        vec![session_key.to_owned()]
+    };
+    ui.broken_sessions.borrow_mut().extend(keys);
+    if main_lost {
+        ui.profile_status
+            .borrow_mut()
+            .insert(profile_id.clone(), ProfileStatus::Broken);
+        refresh_profiles(ui);
+    }
+    sync_broken_tab_icons(ui);
+    refresh_tree_if_visible(ui);
+    show_connection_banner(ui, &profile_id);
+}
+
+fn refresh_tree_if_visible(ui: &Rc<Ui>) {
+    if ui.sidebar_stack.visible_child_name().as_deref() == Some("tables") {
+        catalog_tree::render(ui);
+    }
+}
+
+fn show_connection_banner(ui: &Rc<Ui>, profile_id: &str) {
+    let banner = &ui.connection_banner;
+    let same = banner.is_revealed()
+        && banner.button_label().as_deref() == Some("Переподключиться")
+        && ui.banner_profile.borrow().as_deref() == Some(profile_id);
+    *ui.banner_profile.borrow_mut() = Some(profile_id.to_owned());
+    if ui.reconnecting.borrow().contains(profile_id) {
+        return;
+    }
+    if !same {
+        banner.set_title("Соединение потеряно");
+        banner.set_button_label(Some("Переподключиться"));
+    }
+    banner.set_revealed(true);
+}
+
+/// Blocks an action on a broken session: shows the banner instead of using the dead pool.
+fn block_if_broken(ui: &Rc<Ui>, session_key: &str, retry: Option<RetryAction>) -> bool {
+    if !ui.broken_sessions.borrow().contains(session_key) {
+        return false;
+    }
+    if let Some(profile_id) = session_profile_id(ui, session_key) {
+        if let Some(action) = retry {
+            queue_retry(ui, &profile_id, action);
+        }
+        show_connection_banner(ui, &profile_id);
+    }
+    true
+}
+
+fn queue_retry(ui: &Ui, profile_id: &str, action: RetryAction) {
+    if !retry_allowed(&action) {
+        return;
+    }
+    let mut pending = ui.pending_retry.borrow_mut();
+    let actions = pending.entry(profile_id.to_owned()).or_default();
+    actions.retain(|existing| existing.id() != action.id());
+    actions.push(action);
+}
+
+/// Remembers a read that failed because the session is broken.
+fn queue_retry_if_lost(ui: &Ui, session_key: &str, action: RetryAction) {
+    if !ui.broken_sessions.borrow().contains(session_key) {
+        return;
+    }
+    if let Some(profile_id) = session_profile_id(ui, session_key) {
+        queue_retry(ui, &profile_id, action);
+    }
+}
+
+/// Adds or removes the "connection lost" icon on every table and SQL tab label.
+fn sync_broken_tab_icons(ui: &Ui) {
+    let broken = ui.broken_sessions.borrow().clone();
+    let mut tabs: Vec<(String, bool)> = ui
+        .table_profiles
+        .borrow()
+        .iter()
+        .map(|(key, profile)| (key.clone(), broken.contains(&profile_session_key(profile))))
+        .collect();
+    tabs.extend(
+        ui.sql_tabs
+            .borrow()
+            .iter()
+            .map(|(id, tab)| (format!("sql::{id}"), broken.contains(&tab.session_key))),
+    );
+    for (key, is_broken) in tabs {
+        set_tab_broken_icon(ui, &key, is_broken);
+    }
+}
+
+fn set_tab_broken_icon(ui: &Ui, key: &str, broken: bool) {
+    let Some((notebook, _, page)) = find_table_page(ui, key) else {
+        return;
+    };
+    let Some(label) = notebook
+        .tab_label(&page)
+        .and_then(|label| label.downcast::<gtk::Box>().ok())
+    else {
+        return;
+    };
+    let mut existing = None;
+    let mut child = label.first_child();
+    while let Some(widget) = child {
+        if widget.widget_name().as_str() == BROKEN_ICON_NAME {
+            existing = Some(widget);
+            break;
+        }
+        child = widget.next_sibling();
+    }
+    match (broken, existing) {
+        (true, None) => {
+            let icon = gtk::Image::from_icon_name("network-offline-symbolic");
+            icon.set_widget_name(BROKEN_ICON_NAME);
+            icon.set_tooltip_text(Some("Соединение потеряно"));
+            label.insert_child_after(&icon, label.first_child().as_ref());
+        }
+        (false, Some(widget)) => label.remove(&widget),
+        _ => {}
+    }
+}
+
+fn reconnect_profile(ui: &Rc<Ui>, profile_id: &str) {
+    if ui.reconnecting.borrow().contains(profile_id) {
+        return;
+    }
+    let owner = ui.clone();
+    let profile_id = profile_id.to_owned();
+    ensure_vault_unlocked(ui, move || start_reconnect(&owner, &profile_id));
+}
+
+/// Same password sources as a normal connect; never captured by a widget closure.
+fn reconnect_password(ui: &Ui, profile: &ConnectionProfile) -> Result<String, String> {
+    if profile.gopass_entry.is_some() {
+        return Ok(String::new());
+    }
+    let saved = if profile.password_saved {
+        ui.store
+            .borrow()
+            .as_ref()
+            .map(|store| store.password(&profile.id))
+            .unwrap_or_else(|| Ok(String::new()))?
+    } else {
+        String::new()
+    };
+    if saved.is_empty() {
+        return Err("Пароль не сохранён. Отключите подключение и подключитесь заново.".to_owned());
+    }
+    Ok(saved)
+}
+
+fn reconnect_failed(ui: &Rc<Ui>, profile_id: &str, error: &str) {
+    ui.reconnecting.borrow_mut().remove(profile_id);
+    *ui.banner_profile.borrow_mut() = Some(profile_id.to_owned());
+    ui.connection_banner
+        .set_title(&format!("Не удалось переподключиться: {error}"));
+    ui.connection_banner
+        .set_button_label(Some("Переподключиться"));
+    ui.connection_banner.set_revealed(true);
+    ui.status.set_text(error);
+}
+
+fn start_reconnect(ui: &Rc<Ui>, profile_id: &str) {
+    if !ui.reconnecting.borrow_mut().insert(profile_id.to_owned()) {
+        return;
+    }
+    let targets: Vec<(String, ConnectionProfile)> = ui
+        .sessions
+        .borrow()
+        .iter()
+        .filter(|(_, (profile, _))| profile.id == profile_id)
+        .map(|(key, (profile, _))| (key.clone(), profile.clone()))
+        .collect();
+    let Some(first) = targets.first().map(|(_, profile)| profile.clone()) else {
+        ui.reconnecting.borrow_mut().remove(profile_id);
+        ui.connection_banner.set_revealed(false);
+        return;
+    };
+    let password = match reconnect_password(ui, &first) {
+        Ok(password) => password,
+        Err(error) => {
+            reconnect_failed(ui, profile_id, &error);
+            return;
+        }
+    };
+    *ui.banner_profile.borrow_mut() = Some(profile_id.to_owned());
+    ui.connection_banner.set_title("Переподключаюсь…");
+    ui.connection_banner.set_button_label(None);
+    ui.connection_banner.set_revealed(true);
+    let sender = ui.sender.clone();
+    let profile_id = profile_id.to_owned();
+    let guard = ui.activity.start();
+    ui.runtime.spawn(async move {
+        let _guard = guard;
+        let result = reconnect_pools(targets, password).await;
+        let _ = sender.send(Event::Reconnected(profile_id, result));
+    });
+}
+
+/// Builds every pool first so a partial failure leaves the old state untouched.
+async fn reconnect_pools(
+    targets: Vec<(String, ConnectionProfile)>,
+    password: String,
+) -> Result<Vec<(String, DbPool)>, String> {
+    let Some((_, first)) = targets.first() else {
+        return Err("Нет открытых подключений профиля".to_owned());
+    };
+    let secret = resolve_profile_password(first, password).await?;
+    let mut pools = Vec::with_capacity(targets.len());
+    for (key, profile) in targets {
+        pools.push((key, DbPool::connect(&profile, &secret).await?));
+    }
+    Ok(pools)
+}
+
+fn reconnect_finished(
+    ui: &Rc<Ui>,
+    profile_id: &str,
+    result: Result<Vec<(String, DbPool)>, String>,
+) {
+    let pools = match result {
+        Ok(pools) => pools,
+        Err(error) => {
+            reconnect_failed(ui, profile_id, &error);
+            return;
+        }
+    };
+    ui.reconnecting.borrow_mut().remove(profile_id);
+    let replaced: Vec<String> = {
+        let mut sessions = ui.sessions.borrow_mut();
+        pools
+            .into_iter()
+            .filter_map(|(key, pool)| {
+                sessions.get_mut(&key)?.1 = pool;
+                Some(key)
+            })
+            .collect()
+    };
+    if replaced.is_empty() {
+        ui.connection_banner.set_revealed(false);
+        return;
+    }
+    let current_key = ui
+        .current_profile
+        .borrow()
+        .as_ref()
+        .map(profile_session_key);
+    if let Some(key) = current_key.filter(|key| replaced.contains(key)) {
+        let pool = ui.sessions.borrow().get(&key).map(|(_, pool)| pool.clone());
+        if pool.is_some() {
+            *ui.pool.borrow_mut() = pool;
+        }
+    }
+    let tab_ids: Vec<String> = ui
+        .sql_tabs
+        .borrow()
+        .iter()
+        .filter(|(_, tab)| replaced.contains(&tab.session_key))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in tab_ids {
+        replace_tab_session(ui, &id);
+    }
+    ui.broken_sessions
+        .borrow_mut()
+        .retain(|key| !replaced.contains(key));
+    let was_broken = matches!(
+        ui.profile_status.borrow().get(profile_id),
+        Some(ProfileStatus::Broken)
+    );
+    if was_broken {
+        ui.profile_status
+            .borrow_mut()
+            .insert(profile_id.to_owned(), ProfileStatus::Connected);
+        refresh_profiles(ui);
+    }
+    ui.recovered_at
+        .borrow_mut()
+        .insert(profile_id.to_owned(), std::time::Instant::now());
+    sync_broken_tab_icons(ui);
+    refresh_tree_if_visible(ui);
+    ui.status.set_text("Соединение восстановлено");
+    let has_retry = ui
+        .pending_retry
+        .borrow()
+        .get(profile_id)
+        .is_some_and(|actions| !actions.is_empty());
+    if has_retry {
+        ui.connection_banner.set_title("Соединение восстановлено");
+        ui.connection_banner.set_button_label(Some("Повторить"));
+        ui.connection_banner.set_revealed(true);
+    } else {
+        ui.connection_banner.set_revealed(false);
+    }
+}
+
+/// Like `reset_sql_session` but without the dialog; buffer, result and table edits stay.
+fn replace_tab_session(ui: &Rc<Ui>, id: &str) {
+    let mut tabs = ui.sql_tabs.borrow_mut();
+    let Some(tab) = tabs.get_mut(id) else { return };
+    let Some((profile, pool)) = ui.sessions.borrow().get(&tab.session_key).cloned() else {
+        return;
+    };
+    let had_transaction = tab.transaction_state.pending || tab.session.has_pending_transaction();
+    let was_running = !tab.run_button.is_sensitive();
+    let previous = std::mem::replace(
+        &mut tab.session,
+        sql_session::SqlSession::with_profile_and_schema(pool, &profile, tab.schema.clone()),
+    );
+    previous.request_cancel();
+    ui.runtime.spawn(async move {
+        previous.close().await;
+    });
+    if was_running {
+        // A new request id makes the late result of the old query be ignored.
+        tab.request_id = Uuid::new_v4().to_string();
+        stop_sql_timer(tab);
+        tab.run_button.set_sensitive(true);
+        tab.stop_button.set_sensitive(false);
+        tab.tabulator.set_locked(false);
+        if tab.executed_sql.is_some() {
+            queue_retry(
+                ui,
+                &tab.profile_id,
+                RetryAction::Sql {
+                    tab_id: id.to_owned(),
+                    needed_approval: tab.sent_needing_approval,
+                    in_transaction: had_transaction,
+                },
+            );
+        }
+    }
+    update_transaction_controls(tab, sql_session::TransactionState::default());
+    if had_transaction {
+        tab.status.set_text("Транзакция потеряна");
+    } else if was_running {
+        tab.status.set_text("Запрос прерван: соединение потеряно");
+    }
+}
+
+/// Retries interrupted reads through the normal run path, so production
+/// confirmation and the read-only checks apply again.
+fn run_pending_retries(ui: &Rc<Ui>, profile_id: &str) {
+    let actions = ui
+        .pending_retry
+        .borrow_mut()
+        .remove(profile_id)
+        .unwrap_or_default();
+    ui.connection_banner.set_revealed(false);
+    for action in actions.into_iter().filter(retry_allowed) {
+        match action {
+            RetryAction::Sql { tab_id, .. } => {
+                let sql = ui
+                    .sql_tabs
+                    .borrow()
+                    .get(&tab_id)
+                    .and_then(|tab| tab.executed_sql.clone());
+                if let Some(sql) = sql {
+                    run_sql_tab_with_text(ui, &tab_id, Some(sql));
+                }
+            }
+            RetryAction::LoadTable(key) => reload_table_view(ui, &key),
+            RetryAction::ExpandNode(profile) => {
+                let mut root = profile.clone();
+                root.database.clear();
+                let root_key = profile_session_key(&root);
+                let pool = ui
+                    .sessions
+                    .borrow()
+                    .get(&root_key)
+                    .map(|(_, pool)| pool.clone())
+                    .or_else(|| {
+                        ui.sessions
+                            .borrow()
+                            .values()
+                            .find(|(candidate, _)| candidate.id == profile.id)
+                            .map(|(_, pool)| pool.clone())
+                    });
+                if let Some(pool) = pool {
+                    let database = profile.database.clone();
+                    open_database_session(ui, profile, pool, &database);
+                }
+            }
+        }
+    }
+}
+
+/// Records tab activity and, after a long idle, checks the connection in the
+/// background. Not counted in the activity bar and silent unless it is lost.
+fn note_tab_switch(ui: &Rc<Ui>, group: &str, key: &str, session_key: &str) {
+    let now = std::time::Instant::now();
+    let previous = ui.active_table_by_session.borrow().get(group).cloned();
+    if let Some(previous) = previous.filter(|previous| previous != key) {
+        ui.last_active.borrow_mut().insert(previous, now);
+    }
+    let last = ui.last_active.borrow().get(key).copied();
+    ui.last_active.borrow_mut().insert(key.to_owned(), now);
+    if ui.broken_sessions.borrow().contains(session_key) {
+        if let Some(profile_id) = session_profile_id(ui, session_key) {
+            show_connection_banner(ui, &profile_id);
+        }
+        return;
+    }
+    if last.is_some_and(|last| idle_check_due(last, now)) {
+        spawn_idle_check(ui, key, session_key);
+    }
+}
+
+fn spawn_idle_check(ui: &Rc<Ui>, key: &str, session_key: &str) {
+    let Some((_, pool)) = ui.sessions.borrow().get(session_key).cloned() else {
+        return;
+    };
+    let session = key
+        .strip_prefix("sql::")
+        .and_then(|id| ui.sql_tabs.borrow().get(id).map(|tab| tab.session.clone()));
+    let sender = ui.sender.clone();
+    let session_key = session_key.to_owned();
+    // Deliberately no activity guard: the background check stays invisible.
+    ui.runtime.spawn(async move {
+        let result = match &session {
+            Some(session) => session.ping().await,
+            None => pool.check().await,
+        };
+        let _ = report_lost(&pool, &sender, &session_key, result).await;
+    });
+}
+
+/// Sends `Event::ConnectionLost` when `result` shows the connection is gone, then
+/// hands back the user-facing `String` error so existing events stay unchanged.
+async fn report_lost<T>(
+    pool: &DbPool,
+    sender: &mpsc::Sender<Event>,
+    session_key: &str,
+    result: Result<T, db_error::DbError>,
+) -> Result<T, String> {
+    if let Err(error) = &result
+        && pool.is_connection_lost(error).await
+    {
+        let _ = sender.send(Event::ConnectionLost(session_key.to_owned()));
+    }
+    result.map_err(String::from)
+}
+
+fn loading_row(text: &str) -> gtk::Box {
+    let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(16, 16);
+    let label = gtk::Label::new(Some(text));
+    label.set_xalign(0.0);
+    label.add_css_class("dim-label");
+    row.append(&spinner);
+    row.append(&label);
+    row
+}
+
+/// Hides every loading spinner under `widget` after a load failed.
+fn stop_loading_spinners(widget: &impl IsA<gtk::Widget>) {
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(spinner) = current.downcast_ref::<adw::Spinner>() {
+            spinner.set_visible(false);
+        } else {
+            stop_loading_spinners(&current);
+        }
+        child = current.next_sibling();
+    }
+}
+
+fn set_table_spinner(ui: &Ui, table_key: &str, visible: bool) {
+    if let Some(spinner) = ui.table_spinners.borrow().get(table_key) {
+        spinner.set_visible(visible);
+    }
+}
+
 fn handle_event(ui: &Rc<Ui>, event: Event) {
     match event {
+        Event::ConnectionLost(key) => mark_connection_lost(ui, &key),
+        Event::Reconnected(profile_id, result) => reconnect_finished(ui, &profile_id, result),
         Event::NamespaceChoices(key, revision, result) => {
             namespace_ui::loaded(ui, &key, revision, result)
         }
@@ -5230,10 +6117,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     set_tables_nav_sensitive(ui, true);
                     ui.objects_available.set(true);
                     clear_box(&ui.objects);
-                    let loading = gtk::Label::new(Some("Загружаю таблицы…"));
-                    loading.set_xalign(0.0);
-                    loading.add_css_class("dim-label");
-                    ui.objects.append(&loading);
+                    ui.objects.append(&loading_row("Загружаю таблицы…"));
                     show_sidebar(ui, "tables");
                     *ui.current_profile.borrow_mut() = Some(profile.clone());
                     *ui.pool.borrow_mut() = Some(pool.clone());
@@ -5286,10 +6170,18 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     show_table_catalog(ui);
                 }
                 Err(error) => {
+                    let was_broken = matches!(
+                        ui.profile_status.borrow().get(&profile.id),
+                        Some(ProfileStatus::Broken)
+                    );
                     ui.profile_status.borrow_mut().insert(
                         profile.id.clone(),
                         if is_profile_connected(ui, &profile.id) {
-                            ProfileStatus::Connected
+                            if was_broken {
+                                ProfileStatus::Broken
+                            } else {
+                                ProfileStatus::Connected
+                            }
                         } else {
                             ProfileStatus::Error(error.clone())
                         },
@@ -5303,6 +6195,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     } else {
                     }
                     ui.objects.set_sensitive(true);
+                    stop_loading_spinners(&ui.objects);
                     ui.status.set_text(&error);
                     namespace_ui::sync(ui);
                     show_error_dialog(ui, "Ошибка подключения", &error);
@@ -5324,6 +6217,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     catalog_tree::databases_loaded(ui, &profile, databases);
                 }
                 Err(error) => {
+                    stop_loading_spinners(&ui.objects);
                     ui.status.set_text(&error);
                     show_error_dialog(ui, "Не удалось загрузить базы данных", &error);
                 }
@@ -5388,6 +6282,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 }
                 Err(error) => {
                     ui.objects.set_sensitive(true);
+                    stop_loading_spinners(&ui.objects);
                     ui.status.set_text(&error);
                     show_error_dialog(ui, "Не удалось загрузить таблицы", &error);
                 }
@@ -5397,6 +6292,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             if ui.table_requests.borrow().get(&tab_key) != Some(&request_id) {
                 return;
             }
+            set_table_spinner(ui, &tab_key, false);
             if result.is_err() {
                 if let Some(grid) = ui.tabulator_grids.borrow().get(&tab_key) {
                     grid.set_locked(false);
@@ -5511,6 +6407,18 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     ));
                 }
                 Err(error) => {
+                    let lost_session = ui
+                        .table_profiles
+                        .borrow()
+                        .get(&tab_key)
+                        .map(profile_session_key);
+                    if let Some(session_key) = lost_session {
+                        queue_retry_if_lost(
+                            ui,
+                            &session_key,
+                            RetryAction::LoadTable(tab_key.clone()),
+                        );
+                    }
                     ui.status.set_text(&error);
                     show_error_dialog(ui, "Не удалось прочитать таблицу", &error);
                 }
@@ -5521,6 +6429,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 return;
             }
             ui.table_more_loading.borrow_mut().remove(&table_key);
+            set_table_spinner(ui, &table_key, false);
             let mut next = match result {
                 Ok(next) => next,
                 Err(error) => {
@@ -5668,6 +6577,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     .is_some_and(|key| key == &format!("sql::{id}"));
             tab.run_button.set_sensitive(true);
             tab.stop_button.set_sensitive(false);
+            stop_sql_timer(&mut tab);
             update_transaction_controls(&mut tab, state);
             sql_history_ui::record(ui, &tab, &result, elapsed_ms);
             match result {
@@ -5724,6 +6634,15 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     }
                 }
                 Err(error) => {
+                    queue_retry_if_lost(
+                        ui,
+                        &tab.session_key,
+                        RetryAction::Sql {
+                            tab_id: id.clone(),
+                            needed_approval: tab.sent_needing_approval,
+                            in_transaction: state.pending,
+                        },
+                    );
                     tab.tabulator.set_locked(false);
                     tab.status.set_text("Запрос завершился с ошибкой");
                     tab.error_message
@@ -6126,7 +7045,11 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
                 return;
             };
             let sender = ui.sender.clone();
+            let session_key = profile_session_key(&profile);
+            set_table_spinner(ui, table_key, true);
+            let guard = ui.activity.start();
             ui.runtime.spawn(async move {
+                let _guard = guard;
                 let result = pool
                     .read_table_view_with_condition(
                         &object,
@@ -6136,6 +7059,7 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
                         offset,
                     )
                     .await;
+                let result = report_lost(&pool, &sender, &session_key, result).await;
                 let _ = sender.send(Event::TablePageLoaded(key, request_id, offset, result));
             });
         }
@@ -6227,6 +7151,9 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     let name = format!("{}.{}", object.schema, object.name);
     let table_name = object.name.clone();
     let session_key = profile_session_key(&profile);
+    if block_if_broken(ui, &session_key, None) {
+        return;
+    }
     let group_key = workspace_ui::ensure(ui, &session_key, Some(&object.schema));
     workspace_ui::select(ui, &group_key);
     let tab_key = format!("{}:{name}", session_key);
@@ -6268,6 +7195,7 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
             ui.table_requests.borrow_mut().remove(&previous_key);
             ui.table_data.borrow_mut().remove(&previous_key);
             ui.table_edit_states.borrow_mut().remove(&previous_key);
+            ui.table_spinners.borrow_mut().remove(&previous_key);
             drop(widget);
             replace_page = Some(page);
         }
@@ -6424,6 +7352,12 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     close_tab.add_css_class("compact-tab-close");
     close_tab.set_tooltip_text(Some("Закрыть вкладку"));
     tab_label_box.append(&tab_title);
+    let tab_spinner = adw::Spinner::new();
+    tab_spinner.set_size_request(14, 14);
+    ui.table_spinners
+        .borrow_mut()
+        .insert(tab_key.clone(), tab_spinner.clone());
+    tab_label_box.append(&tab_spinner);
     tab_label_box.append(&close_tab);
     let tab_index = if let Some(position) = replace_page {
         notebook.insert_page(&page_content, Some(&tab_label_box), Some(position))
@@ -6465,8 +7399,11 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
     let request_id_for_event = request_id.clone();
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let result = pool.read_table(&object).await;
+        let result = report_lost(&pool, &sender, &session_key, result).await;
         let _ = sender.send(Event::TableLoaded(
             tab_key,
             request_id_for_event,
@@ -7275,7 +8212,9 @@ fn run_table_row_action_authorized(
     let action_name = action.to_owned();
     let production = matches!(profile.environment, EnvironmentTag::Prod);
     let runtime = ui.runtime.clone();
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let result = match action {
             "Добавить строку" => match pool.insert_default_table_row(&object).await {
                 Ok(count) => Ok(count),
@@ -7466,7 +8405,9 @@ fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
         let sender = ui.sender.clone();
         let table_key = table_key.to_owned();
         let runtime = ui.runtime.clone();
+        let guard = ui.activity.start();
         runtime.spawn(async move {
+            let _guard = guard;
             let result = pool
                 .update_table_column(&object, &name, value.as_deref())
                 .await;
@@ -7531,7 +8472,9 @@ fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
     let sender = ui.sender.clone();
     let table_key = table_key.to_owned();
     let runtime = ui.runtime.clone();
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let result = match sql_session {
             Some(session) => {
                 if approved {
@@ -7811,6 +8754,13 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
         return;
     };
     let session_key = profile_session_key(&profile);
+    if block_if_broken(
+        ui,
+        &session_key,
+        Some(RetryAction::LoadTable(table_key.to_owned())),
+    ) {
+        return;
+    }
     let pool = ui
         .sessions
         .borrow()
@@ -7839,7 +8789,10 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
     let runtime = ui.runtime.clone();
     let table_key = table_key.to_owned();
     let name = format!("{}.{}", object.schema, object.name);
+    set_table_spinner(ui, &table_key, true);
+    let guard = ui.activity.start();
     runtime.spawn(async move {
+        let _guard = guard;
         let result = pool
             .read_table_view_with_condition(
                 &object,
@@ -7849,6 +8802,7 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
                 0,
             )
             .await;
+        let result = report_lost(&pool, &sender, &session_key, result).await;
         let _ = sender.send(Event::TableLoaded(table_key, request_id, name, result));
     });
 }
@@ -8063,6 +9017,51 @@ fn escape_markup(text: &str) -> String {
         .replace('"', "&quot;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod reconnect_tests {
+    use super::*;
+
+    fn sql(needed_approval: bool, in_transaction: bool) -> RetryAction {
+        RetryAction::Sql {
+            tab_id: "tab".to_owned(),
+            needed_approval,
+            in_transaction,
+        }
+    }
+
+    #[test]
+    fn plain_read_sql_can_be_retried() {
+        assert!(retry_allowed(&sql(false, false)));
+    }
+
+    #[test]
+    fn sql_that_needed_write_approval_is_never_retried() {
+        assert!(!retry_allowed(&sql(true, false)));
+    }
+
+    #[test]
+    fn sql_inside_open_transaction_is_never_retried() {
+        assert!(!retry_allowed(&sql(false, true)));
+    }
+
+    #[test]
+    fn table_load_can_be_retried() {
+        assert!(retry_allowed(&RetryAction::LoadTable("t".to_owned())));
+    }
+
+    #[test]
+    fn idle_check_is_not_due_at_exactly_sixty_seconds() {
+        let last = std::time::Instant::now();
+        assert!(!idle_check_due(last, last + Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn idle_check_is_due_after_sixty_seconds() {
+        let last = std::time::Instant::now();
+        assert!(idle_check_due(last, last + Duration::from_secs(61)));
+    }
 }
 
 #[cfg(test)]

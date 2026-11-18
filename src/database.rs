@@ -11,6 +11,7 @@ use sqlx::{
     postgres::PgPoolOptions,
 };
 
+use crate::db_error::{DbError, DbErrorKind, classify};
 use crate::settings::{ConnectionProfile, DatabaseKind, TlsMode};
 
 pub const MAX_TABLE_ROWS: usize = 200;
@@ -372,7 +373,7 @@ impl DbPool {
         }.map_err(|e| format_database_error(&e.to_string()))
     }
 
-    pub async fn postgres_databases(&self) -> Result<Vec<String>, String> {
+    pub async fn postgres_databases(&self) -> Result<Vec<String>, DbError> {
         let Self::PostgreSql(pool) = self else {
             return Err("Список баз PostgreSQL доступен только для PostgreSQL".into());
         };
@@ -384,7 +385,7 @@ impl DbPool {
         )
         .fetch_all(pool)
         .await
-        .map_err(|error| format_database_error(&error.to_string()))
+        .map_err(|error| db_error(&error))
     }
 
     pub async fn server_icon(&self) -> Result<&'static str, String> {
@@ -423,36 +424,68 @@ impl DbPool {
         .map_err(|error| format_database_error(&error.to_string()))
     }
 
-    pub async fn check(&self) -> Result<(), String> {
+    pub async fn check(&self) -> Result<(), DbError> {
         match self {
             Self::PostgreSql(pool) => sqlx::query("SELECT 1")
                 .fetch_one(pool)
                 .await
                 .map(|_| ())
-                .map_err(|error| format_database_error(&error.to_string())),
+                .map_err(|error| db_error(&error)),
             Self::MySql(pool) => sqlx::query("SELECT 1")
                 .fetch_one(pool)
                 .await
                 .map(|_| ())
-                .map_err(|error| format_database_error(&error.to_string())),
+                .map_err(|error| db_error(&error)),
+        }
+    }
+
+    /// Whether `error` means the connection is gone. A pool timeout is ambiguous
+    /// (busy pool vs dead server), so it is confirmed over a fresh connection that
+    /// does not share the possibly exhausted pool.
+    pub async fn is_connection_lost(&self, error: &DbError) -> bool {
+        match error.kind {
+            DbErrorKind::Disconnected => true,
+            DbErrorKind::PoolTimedOut => {
+                matches!(self.probe().await, Err(e) if e.kind == DbErrorKind::Disconnected)
+            }
+            DbErrorKind::Other => false,
+        }
+    }
+
+    async fn probe(&self) -> Result<(), DbError> {
+        let attempt = async {
+            match self {
+                Self::PostgreSql(pool) => {
+                    let options = pool.connect_options();
+                    let mut connection = sqlx::PgConnection::connect_with(&options).await?;
+                    sqlx::query("SELECT 1").execute(&mut connection).await?;
+                }
+                Self::MySql(pool) => {
+                    let options = pool.connect_options();
+                    let mut connection = sqlx::MySqlConnection::connect_with(&options).await?;
+                    sqlx::query("SELECT 1").execute(&mut connection).await?;
+                }
+            }
+            Ok::<(), sqlx::Error>(())
+        };
+        match tokio::time::timeout(Duration::from_secs(3), attempt).await {
+            Ok(result) => result.map_err(|error| db_error(&error)),
+            Err(_) => Err(DbError {
+                kind: DbErrorKind::Disconnected,
+                message: "Проверка соединения: сервер не ответил за 3 с".to_owned(),
+            }),
         }
     }
 
     #[cfg(test)]
-    pub async fn execute_sql(&self, sql: &str) -> Result<QueryResult, String> {
+    pub async fn execute_sql(&self, sql: &str) -> Result<QueryResult, DbError> {
         match self {
             Self::PostgreSql(pool) => {
-                let mut connection = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| format_database_error(&e.to_string()))?;
+                let mut connection = pool.acquire().await.map_err(|e| db_error(&e))?;
                 execute_on_connection(QueryConnection::PostgreSql(&mut connection), sql).await
             }
             Self::MySql(pool) => {
-                let mut connection = pool
-                    .acquire()
-                    .await
-                    .map_err(|e| format_database_error(&e.to_string()))?;
+                let mut connection = pool.acquire().await.map_err(|e| db_error(&e))?;
                 execute_on_connection(QueryConnection::MySql(&mut connection), sql).await
             }
         }
@@ -625,7 +658,7 @@ impl DbPool {
         Ok(words)
     }
 
-    pub async fn list_tables(&self, profile: &ConnectionProfile) -> Result<TableCatalog, String> {
+    pub async fn list_tables(&self, profile: &ConnectionProfile) -> Result<TableCatalog, DbError> {
         match self {
             Self::PostgreSql(pool) => {
                 let schemas = sqlx::query_scalar::<_, String>(
@@ -638,7 +671,7 @@ impl DbPool {
                 )
                 .fetch_all(pool)
                 .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
                 let rows = sqlx::query(&format!(
                     "SELECT table_schema AS table_schema, table_name AS table_name, table_type AS object_type \
                      FROM information_schema.tables \
@@ -652,7 +685,7 @@ impl DbPool {
                 ))
                 .fetch_all(pool)
                 .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
 
                 table_catalog(
                     schemas,
@@ -688,7 +721,7 @@ impl DbPool {
                 .bind(profile.database.trim())
                 .fetch_all(pool)
                 .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
                 let rows = sqlx::query(&format!(
                     "SELECT CAST(table_schema AS CHAR) AS table_schema, \
                             CAST(table_name AS CHAR) AS table_name, \
@@ -704,7 +737,7 @@ impl DbPool {
                 .bind(profile.database.trim())
                 .fetch_all(pool)
                 .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
 
                 table_catalog(
                     schemas,
@@ -732,7 +765,7 @@ impl DbPool {
         }
     }
 
-    pub async fn read_table(&self, object: &DbObject) -> Result<TableData, String> {
+    pub async fn read_table(&self, object: &DbObject) -> Result<TableData, DbError> {
         self.read_table_view(object, &[], None, 0).await
     }
 
@@ -742,7 +775,7 @@ impl DbPool {
         filters: &[TableFilter],
         sort: Option<&TableSort>,
         offset: usize,
-    ) -> Result<TableData, String> {
+    ) -> Result<TableData, DbError> {
         self.read_table_view_with_condition(object, filters, None, sort, offset)
             .await
     }
@@ -754,7 +787,7 @@ impl DbPool {
         raw_condition: Option<&str>,
         sort: Option<&TableSort>,
         offset: usize,
-    ) -> Result<TableData, String> {
+    ) -> Result<TableData, DbError> {
         let condition = raw_condition.map(validate_raw_condition).transpose()?;
         match self {
             Self::PostgreSql(pool) => {
@@ -819,15 +852,15 @@ impl DbPool {
                     let mut transaction = pool
                         .begin_with("START TRANSACTION READ ONLY")
                         .await
-                        .map_err(|error| format_database_error(&error.to_string()))?;
+                        .map_err(|error| db_error(&error))?;
                     let result = query.fetch_all(&mut *transaction).await;
                     transaction
                         .rollback()
                         .await
-                        .map_err(|error| format_database_error(&error.to_string()))?;
+                        .map_err(|error| db_error(&error))?;
                     result
                 }
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
                 Ok(to_table_data(
                     columns,
                     rows,
@@ -902,15 +935,15 @@ impl DbPool {
                     let mut transaction = pool
                         .begin_with("START TRANSACTION READ ONLY")
                         .await
-                        .map_err(|error| format_database_error(&error.to_string()))?;
+                        .map_err(|error| db_error(&error))?;
                     let result = query.fetch_all(&mut *transaction).await;
                     transaction
                         .rollback()
                         .await
-                        .map_err(|error| format_database_error(&error.to_string()))?;
+                        .map_err(|error| db_error(&error))?;
                     result
                 }
-                .map_err(|error| format_database_error(&error.to_string()))?;
+                .map_err(|error| db_error(&error))?;
                 Ok(to_table_data(
                     columns,
                     rows,
@@ -1425,7 +1458,7 @@ fn looks_like_row_query(sql: &str) -> bool {
 async fn table_columns_pg<'e, E: Executor<'e, Database = sqlx::Postgres>>(
     pool: E,
     object: &DbObject,
-) -> Result<Vec<DbColumn>, String> {
+) -> Result<Vec<DbColumn>, DbError> {
     sqlx::query(
         "SELECT c.column_name AS column_name, c.data_type AS data_type, \
                 c.udt_schema AS udt_schema, c.udt_name AS udt_name, \
@@ -1449,7 +1482,7 @@ async fn table_columns_pg<'e, E: Executor<'e, Database = sqlx::Postgres>>(
     .bind(&object.name)
     .fetch_all(pool)
     .await
-    .map_err(|error| format_database_error(&error.to_string()))?
+    .map_err(|error| db_error(&error))?
     .into_iter()
     .map(|row| {
         let name = row
@@ -1502,7 +1535,7 @@ async fn mysql_is_base_table(
 async fn table_columns_mysql<'e, E: Executor<'e, Database = sqlx::MySql>>(
     pool: E,
     object: &DbObject,
-) -> Result<Vec<DbColumn>, String> {
+) -> Result<Vec<DbColumn>, DbError> {
     sqlx::query(
         "SELECT CAST(column_name AS CHAR) AS column_name, \
                 CAST(data_type AS CHAR) AS data_type, \
@@ -1517,7 +1550,7 @@ async fn table_columns_mysql<'e, E: Executor<'e, Database = sqlx::MySql>>(
     .bind(&object.name)
     .fetch_all(pool)
     .await
-    .map_err(|error| format_database_error(&error.to_string()))?
+    .map_err(|error| db_error(&error))?
     .into_iter()
     .map(|row| {
         let name = row
@@ -1604,7 +1637,7 @@ fn is_mysql_binary_type(data_type: &str, character_set: Option<&str>) -> bool {
 fn table_catalog(
     schemas: Vec<String>,
     mut objects: impl Iterator<Item = Result<DbObject, String>>,
-) -> Result<TableCatalog, String> {
+) -> Result<TableCatalog, DbError> {
     let mut collected = Vec::new();
     for object in objects.by_ref().take(MAX_CATALOG_OBJECTS + 1) {
         collected.push(object?);
@@ -1955,6 +1988,14 @@ fn pg_comparison_cast(data_type: &str) -> Option<&'static str> {
     }
 }
 
+/// Classifies the original error first, then applies the same user text as before.
+pub(crate) fn db_error(error: &sqlx::Error) -> DbError {
+    DbError {
+        kind: classify(error),
+        message: format_database_error(&error.to_string()),
+    }
+}
+
 fn format_database_error(error: &str) -> String {
     let lower = error.to_ascii_lowercase();
     if lower.contains("unknown message type") {
@@ -2140,7 +2181,7 @@ mod tests {
 pub(crate) fn execute_on_connection<'a>(
     connection: QueryConnection<'a>,
     sql: &'a str,
-) -> futures_util::future::BoxFuture<'a, Result<QueryResult, String>> {
+) -> futures_util::future::BoxFuture<'a, Result<QueryResult, DbError>> {
     execute_on_connection_controlled(connection, sql, None, None)
 }
 
@@ -2149,7 +2190,7 @@ pub(crate) fn execute_on_connection_controlled<'a>(
     sql: &'a str,
     cancelled: Option<&'a std::sync::atomic::AtomicBool>,
     execution_started: Option<&'a std::sync::atomic::AtomicBool>,
-) -> futures_util::future::BoxFuture<'a, Result<QueryResult, String>> {
+) -> futures_util::future::BoxFuture<'a, Result<QueryResult, DbError>> {
     execute_on_connection_mode(connection, sql, cancelled, execution_started, false)
 }
 
@@ -2158,7 +2199,7 @@ pub(crate) fn execute_read_only_on_connection<'a>(
     sql: &'a str,
     cancelled: Option<&'a std::sync::atomic::AtomicBool>,
     execution_started: Option<&'a std::sync::atomic::AtomicBool>,
-) -> futures_util::future::BoxFuture<'a, Result<QueryResult, String>> {
+) -> futures_util::future::BoxFuture<'a, Result<QueryResult, DbError>> {
     execute_on_connection_mode(connection, sql, cancelled, execution_started, true)
 }
 fn execute_on_connection_mode<'a>(
@@ -2167,7 +2208,7 @@ fn execute_on_connection_mode<'a>(
     cancelled: Option<&'a std::sync::atomic::AtomicBool>,
     execution_started: Option<&'a std::sync::atomic::AtomicBool>,
     prepared: bool,
-) -> futures_util::future::BoxFuture<'a, Result<QueryResult, String>> {
+) -> futures_util::future::BoxFuture<'a, Result<QueryResult, DbError>> {
     Box::pin(async move {
         let mut columns = Vec::new();
         let mut rows = Vec::new();
@@ -2189,14 +2230,10 @@ fn execute_on_connection_mode<'a>(
                     ($pool)
                         .prepare(sql)
                         .await
-                        .map_err(|error| format_database_error(&error.to_string()))?;
+                        .map_err(|error| db_error(&error))?;
                 }
                 let mut stream = sqlx::raw_sql(sql).fetch_many($pool).boxed();
-                while let Some(step) = stream
-                    .try_next()
-                    .await
-                    .map_err(|error| format_database_error(&error.to_string()))?
-                {
+                while let Some(step) = stream.try_next().await.map_err(|error| db_error(&error))? {
                     match step {
                         sqlx::Either::Left(result) => {
                             rows_affected = rows_affected.saturating_add(result.rows_affected());

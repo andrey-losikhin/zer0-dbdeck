@@ -22,13 +22,19 @@ fn scope(profile: &ConnectionProfile) -> String {
     profile_session_key(&profile)
 }
 
-pub(super) fn widgets() -> (gtk::Box, gtk::Label, gtk::DropDown) {
+pub(super) fn widgets() -> (gtk::Box, gtk::Label, gtk::DropDown, adw::Spinner) {
     let row = gtk::Box::new(gtk::Orientation::Vertical, 4);
     row.set_widget_name("namespace-picker");
     row.set_visible(false);
     let label = gtk::Label::new(None);
     label.set_xalign(0.0);
     label.add_css_class("dim-label");
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(14, 14);
+    spinner.set_visible(false);
+    heading.append(&label);
+    heading.append(&spinner);
     let selector = gtk::DropDown::from_strings(&[]);
     selector.set_widget_name("namespace-selector");
     selector.set_enable_search(true);
@@ -59,9 +65,9 @@ pub(super) fn widgets() -> (gtk::Box, gtk::Label, gtk::DropDown) {
         label.set_tooltip_text(Some(&value.string()));
     });
     selector.set_factory(Some(&factory));
-    row.append(&label);
+    row.append(&heading);
     row.append(&selector);
-    (row, label, selector)
+    (row, label, selector, spinner)
 }
 
 pub(super) fn install(ui: &Rc<Ui>) {
@@ -241,7 +247,10 @@ pub(super) fn refresh(ui: &Rc<Ui>) {
     }
     let key = scope(&profile);
     let sender = ui.sender.clone();
+    ui.namespace_spinner.set_visible(true);
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let result = pool
             .database_targets(&profile.database)
             .await
@@ -259,6 +268,9 @@ pub(super) fn schemas_loaded(ui: &Ui, profile: &ConnectionProfile, choices: Vec<
 }
 
 pub(super) fn loaded(ui: &Rc<Ui>, key: &str, revision: u64, result: Result<Vec<String>, String>) {
+    if revision == ui.namespace_state.borrow().revision {
+        ui.namespace_spinner.set_visible(false);
+    }
     if revision != ui.namespace_state.borrow().revision
         || ui
             .current_profile

@@ -136,6 +136,11 @@ pub(super) fn render(ui: &Rc<Ui>) {
         label.set_xalign(0.0);
         label.set_hexpand(true);
         row.append(&label);
+        if ui.broken_sessions.borrow().contains(&key) {
+            let broken = gtk::Image::from_icon_name("network-offline-symbolic");
+            broken.set_tooltip_text(Some("Соединение потеряно"));
+            row.append(&broken);
+        }
         let button = gtk::Button::new();
         button.set_child(Some(&row));
         button.add_css_class("flat");
@@ -151,8 +156,9 @@ pub(super) fn render(ui: &Rc<Ui>) {
         if let Some(catalog) = catalog {
             append_schema_tree(ui, &children, &selected, catalog);
         } else {
-            children.append(&gtk::Label::new(Some("Загрузка схем…")));
+            children.append(&loading_row("Загрузка схем…"));
         }
+        let sql_target = selected.clone();
         let weak = Rc::downgrade(ui);
         let source = source_pool.clone();
         let children_toggle = children.clone();
@@ -179,7 +185,21 @@ pub(super) fn render(ui: &Rc<Ui>) {
                 open_database_session(&ui, selected.clone(), pool, &selected.database);
             }
         });
-        ui.objects.append(&button);
+        let sql_button = tree_sql_button(&sql_target.database);
+        let weak = Rc::downgrade(ui);
+        let source = source_pool.clone();
+        let target = sql_target;
+        sql_button.connect_clicked(move |_| {
+            let (Some(ui), Some(pool)) = (weak.upgrade(), source.clone()) else {
+                return;
+            };
+            ui.catalog_tree
+                .borrow_mut()
+                .expanded
+                .insert(profile_session_key(&target), true);
+            with_database_session(&ui, target.clone(), pool, create_sql_tab);
+        });
+        ui.objects.append(&tree_line(&button, &sql_button));
         ui.objects.append(&children);
     }
     apply_table_list_filter(ui);

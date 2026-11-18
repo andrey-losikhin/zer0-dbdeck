@@ -203,6 +203,7 @@ async fn write_report(
                 query.await
             }
         };
+        let result = result.map_err(String::from);
         if result.is_ok() {
             summary.succeeded += 1;
         } else {

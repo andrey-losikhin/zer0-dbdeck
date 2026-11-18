@@ -629,6 +629,7 @@ fn production_confirmation_snapshot_and_readonly_ui() {
                 true
             ))
             .unwrap_err()
+            .message
             .contains("Только чтение")
     );
     ui.window.close();

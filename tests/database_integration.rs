@@ -14,6 +14,8 @@ use csv::{write_csv_header, write_csv_row};
 mod database;
 #[path = "../src/database_structure.rs"]
 mod database_structure;
+#[path = "../src/db_error.rs"]
+mod db_error;
 #[path = "../src/settings.rs"]
 mod settings;
 #[path = "../src/sql_risk.rs"]

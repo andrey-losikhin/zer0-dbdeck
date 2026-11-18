@@ -68,7 +68,13 @@ fn show(
     root.append(&search);
     let status = gtk::Label::new(Some("Загрузка списка баз…"));
     status.set_wrap(true);
-    root.append(&dialogs::copyable_label(&status));
+    let status_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    let spinner = adw::Spinner::new();
+    spinner.set_size_request(16, 16);
+    spinner.set_margin_start(8);
+    status_row.append(&spinner);
+    status_row.append(&dialogs::copyable_label(&status));
+    root.append(&status_row);
     let list = gtk::ListBox::new();
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.set_activate_on_single_click(false);
@@ -142,7 +148,9 @@ fn show(
     });
     let (sender, receiver) = mpsc::channel();
     let navigate_profile = profile.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let result = async {
             let secret = resolve_profile_password(&profile, secret).await?;
             // A restricted account may connect only to its configured database.
@@ -160,7 +168,11 @@ fn show(
         if !window.is_visible() {
             return gtk::glib::ControlFlow::Break;
         }
-        match receiver.try_recv() {
+        let received = receiver.try_recv();
+        if !matches!(received, Err(mpsc::TryRecvError::Empty)) {
+            spinner.set_visible(false);
+        }
+        match received {
             Ok(Ok(mut databases)) => {
                 if auto_single && databases.len() == 1 {
                     let mut target = navigate_profile.clone();

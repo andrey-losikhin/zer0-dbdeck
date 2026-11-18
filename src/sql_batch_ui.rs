@@ -123,7 +123,9 @@ pub(super) fn start_report(
     };
     ui.status.set_text("Готовлю Markdown-отчёт…");
     let sender = ui.sender.clone();
+    let guard = ui.activity.start();
     ui.runtime.spawn(async move {
+        let _guard = guard;
         let progress = sender.clone();
         let result = sql_batch::run_with_schema(
             pool,

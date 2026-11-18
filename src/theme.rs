@@ -754,6 +754,10 @@ const CATALOG_TREE_CSS: &str = r#"
     color: @accent_color;
 }
 .database-tree-row-active label, .database-tree-row-active image { color: @accent_color; }
+.tree-row-line { border-radius: 4px; }
+.tree-row-action { min-width: 24px; min-height: 22px; padding: 0 4px; margin-left: 2px; border-radius: 4px; opacity: 0.45; transition: opacity 120ms ease-out; }
+.tree-row-line:hover .tree-row-action, .tree-row-action:focus-visible { opacity: 0.85; }
+.tree-row-action:hover { opacity: 1; background: alpha(@accent_bg_color, 0.16); }
 .active-connection-header {
     background: alpha(@accent_bg_color, 0.10);
     border: 1px solid alpha(@accent_bg_color, 0.55);

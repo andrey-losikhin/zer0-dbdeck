@@ -1,5 +1,6 @@
 //! An SQL tab owns its connection. Session state is never returned to a shared pool.
 use crate::database::{DbPool, QueryConnection, QueryResult, execute_on_connection_controlled};
+use crate::db_error::{DbError, DbErrorKind, classify};
 use sqlparser::{
     dialect::{MySqlDialect, PostgreSqlDialect},
     tokenizer::{Token, Tokenizer},
@@ -27,6 +28,14 @@ pub struct TransactionState {
     pub read_only: bool,
 }
 
+/// Session-level errors keep the raw sqlx text (unlike pool-level ones).
+fn raw_error(error: &sqlx::Error) -> DbError {
+    DbError {
+        kind: classify(error),
+        message: error.to_string(),
+    }
+}
+
 enum Connection {
     PostgreSql(sqlx::PgConnection),
     MySql(sqlx::MySqlConnection),
@@ -41,13 +50,13 @@ impl Connection {
     fn command<'a>(
         &'a mut self,
         sql: &'a str,
-    ) -> futures_util::future::BoxFuture<'a, Result<(), String>> {
+    ) -> futures_util::future::BoxFuture<'a, Result<(), DbError>> {
         Box::pin(async move {
             let result = match self {
                 Self::PostgreSql(c) => sqlx::Executor::execute(&mut *c, sql).await.map(|_| ()),
                 Self::MySql(c) => sqlx::Executor::execute(&mut *c, sql).await.map(|_| ()),
             };
-            result.map_err(|e| e.to_string())
+            result.map_err(|e| raw_error(&e))
         })
     }
 }
@@ -120,6 +129,9 @@ impl SqlSession {
             ) != crate::sql_risk::SqlRisk::ReadOnly
                 || (state.pending && !state.read_only))
     }
+    pub fn pool(&self) -> &DbPool {
+        &self.pool
+    }
     pub fn revision(&self) -> u64 {
         self.revision.load(Ordering::Acquire)
     }
@@ -135,26 +147,26 @@ impl SqlSession {
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
-    async fn connect(&self, inner: &mut Inner) -> Result<(), String> {
+    async fn connect(&self, inner: &mut Inner) -> Result<(), DbError> {
         if self.closed.load(Ordering::Acquire) {
             return Err("SQL-сессия закрыта".into());
         }
         if inner.connection.is_none() {
             inner.connection = Some(match &self.pool {
                 DbPool::PostgreSql(pool) => {
-                    let mut connection = pool.acquire().await.map_err(|e| e.to_string())?.detach();
+                    let mut connection = pool.acquire().await.map_err(|e| raw_error(&e))?.detach();
                     if let Some(schema) = &self.schema {
                         let path = format!("\"{}\"", schema.replace('"', "\"\""));
                         sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
                             .bind(path)
                             .execute(&mut connection)
                             .await
-                            .map_err(|e| e.to_string())?;
+                            .map_err(|e| raw_error(&e))?;
                     }
                     Connection::PostgreSql(connection)
                 }
                 DbPool::MySql(pool) => {
-                    Connection::MySql(pool.acquire().await.map_err(|e| e.to_string())?.detach())
+                    Connection::MySql(pool.acquire().await.map_err(|e| raw_error(&e))?.detach())
                 }
             });
         }
@@ -172,7 +184,7 @@ impl SqlSession {
                         .await
                 }
             }
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| raw_error(&e))?;
             self.backend_id.store(id, Ordering::Release);
         }
         Ok(())
@@ -214,7 +226,28 @@ impl SqlSession {
     pub async fn state(&self) -> TransactionState {
         self.inner.lock().await.state
     }
-    async fn control_command(&self, inner: &mut Inner, sql: &str) -> Result<(), String> {
+    /// Checks this session's own detached connection (`DbPool::check` cannot see it).
+    /// A busy or absent connection is skipped; an error inside an aborted transaction
+    /// (25P02) stays `Other` because the connection is alive.
+    pub async fn ping(&self) -> Result<(), DbError> {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return Ok(());
+        };
+        if self.closed.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let Some(connection) = inner.connection.as_mut() else {
+            return Ok(());
+        };
+        match tokio::time::timeout(Duration::from_secs(5), connection.command("SELECT 1")).await {
+            Ok(result) => result,
+            Err(_) => Err(DbError {
+                kind: DbErrorKind::Disconnected,
+                message: "Проверка соединения: сервер не ответил за 5 с".to_owned(),
+            }),
+        }
+    }
+    async fn control_command(&self, inner: &mut Inner, sql: &str) -> Result<(), DbError> {
         let result = tokio::time::timeout(
             Duration::from_secs(10),
             inner.connection.as_mut().unwrap().command(sql),
@@ -229,25 +262,28 @@ impl SqlSession {
                 inner.state = TransactionState::default();
                 self.pending.store(false, Ordering::Release);
                 self.closed.store(true, Ordering::Release);
-                Err(format!(
-                    "SQL-сессия закрыта: ответ на {sql} не подтверждён ({}). Сбросьте сессию; перед повторной записью проверьте данные на сервере.",
-                    match error {
-                        Ok(Err(e)) => e,
-                        _ => "таймаут 10 с".into(),
-                    }
-                ))
+                let (kind, cause) = match error {
+                    Ok(Err(e)) => (e.kind, e.message),
+                    _ => (DbErrorKind::Other, "таймаут 10 с".to_owned()),
+                };
+                Err(DbError {
+                    kind,
+                    message: format!(
+                        "SQL-сессия закрыта: ответ на {sql} не подтверждён ({cause}). Сбросьте сессию; перед повторной записью проверьте данные на сервере."
+                    ),
+                })
             }
         }
     }
     #[cfg(test)]
-    pub async fn execute(&self, sql: &str) -> Result<QueryResult, String> {
+    pub async fn execute(&self, sql: &str) -> Result<QueryResult, DbError> {
         self.execute_with_timeout(sql, 60).await
     }
     pub async fn execute_with_timeout(
         &self,
         sql: &str,
         timeout_seconds: u64,
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, DbError> {
         self.execute_authorized(sql, timeout_seconds, false).await
     }
     pub async fn execute_authorized(
@@ -255,7 +291,7 @@ impl SqlSession {
         sql: &str,
         timeout_seconds: u64,
         write_approved: bool,
-    ) -> Result<QueryResult, String> {
+    ) -> Result<QueryResult, DbError> {
         let mysql = matches!(self.pool, DbPool::MySql(_));
         let mut inner = self.inner.lock().await;
         let policy = statement_policy(sql, mysql)?;
@@ -373,15 +409,20 @@ impl SqlSession {
                             match result {
                                 Ok(_) => Err(format!(
                                     "{reason}. Запрос успел завершиться; проверьте результат изменений{detail}"
-                                )),
-                                Err(error) => Err(format!("{reason}: {error}{detail}")),
+                                )
+                                .into()),
+                                Err(error) => Err(DbError {
+                                    kind: error.kind,
+                                    message: format!("{reason}: {error}{detail}"),
+                                }),
                             }
                         }
                         Err(_) => {
                             connection_lost = true;
                             Err(format!(
                                 "{reason}. Ответ сервера не получен, SQL-сессия закрыта. Незавершённая транзакция откатится при закрытии соединения. Сбросьте SQL-сессию через меню; результат уже выполненных команд Auto Commit проверьте отдельно."
-                            ))
+                            )
+                            .into())
                         }
                     }
                 }
@@ -389,7 +430,10 @@ impl SqlSession {
         };
         if auto_read && !connection_lost {
             if let Err(error) = self.control_command(&mut inner, "ROLLBACK").await {
-                result = Err(format!("Не удалось завершить транзакцию чтения: {error}"));
+                result = Err(DbError {
+                    kind: error.kind,
+                    message: format!("Не удалось завершить транзакцию чтения: {error}"),
+                });
                 connection_lost = true;
             }
             inner.state.read_only = false;
@@ -440,9 +484,12 @@ impl SqlSession {
                         inner.state.pending = true;
                         inner.state.failed = true;
                         self.pending.store(true, Ordering::Release);
-                        result = Err(format!(
-                            "Не удалось подтвердить режим транзакций MySQL: {error}. Завершите транзакцию или сбросьте SQL-сессию."
-                        ));
+                        result = Err(DbError {
+                            kind: classify(&error),
+                            message: format!(
+                                "Не удалось подтвердить режим транзакций MySQL: {error}. Завершите транзакцию или сбросьте SQL-сессию."
+                            ),
+                        });
                     }
                 }
             }
@@ -511,14 +558,17 @@ impl SqlSession {
         }
     }
     #[cfg(test)]
-    pub async fn transaction(&self, action: TransactionAction) -> Result<TransactionState, String> {
+    pub async fn transaction(
+        &self,
+        action: TransactionAction,
+    ) -> Result<TransactionState, DbError> {
         self.transaction_with_approval(action, None).await
     }
     pub async fn transaction_with_approval(
         &self,
         action: TransactionAction,
         approved_revision: Option<u64>,
-    ) -> Result<TransactionState, String> {
+    ) -> Result<TransactionState, DbError> {
         let mut inner = self.inner.lock().await;
         if self.production
             && action == TransactionAction::Commit
@@ -544,11 +594,11 @@ impl SqlSession {
                 if let Some(Connection::MySql(connection)) = inner.connection.as_mut() {
                     sqlx::Executor::execute(&mut *connection, "SET SESSION autocommit=1")
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| raw_error(&e))?;
                     let auto: i64 = sqlx::query_scalar("SELECT @@session.autocommit")
                         .fetch_one(connection)
                         .await
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| raw_error(&e))?;
                     if auto != 1 {
                         return Err("MySQL не подтвердил Auto Commit".into());
                     }
@@ -743,7 +793,7 @@ mod integration_tests {
                 assert_eq!(values.data.rows[0],vec![CellValue::Text("1".into()),CellValue::Text("original".into()),CellValue::Text("123.45".into()),CellValue::Text("2025-01-02".into())]);
                 assert_eq!(readonly.execute("SELECT value FROM dbdeck_policy_test").await.unwrap().data.rows[0][0],CellValue::Text("original".into()));
                 for sql in ["UPDATE dbdeck_policy_test SET value='bad'", "WITH changed AS (DELETE FROM dbdeck_policy_test RETURNING *) SELECT * FROM changed", "COMMIT", "SET autocommit=0", "SELECT 1; SELECT 2"] {
-                    assert!(readonly.execute_authorized(sql,5,true).await.unwrap_err().contains("Только чтение"),"{kind:?}: {sql}");
+                    assert!(readonly.execute_authorized(sql,5,true).await.unwrap_err().message.contains("Только чтение"),"{kind:?}: {sql}");
                 }
                 if matches!(kind,DatabaseKind::PostgreSql){
                     assert_eq!(readonly.execute("SELECT current_setting('transaction_read_only')").await.unwrap().data.rows[0][0],CellValue::Text("on".into()));
@@ -755,15 +805,15 @@ mod integration_tests {
                 assert!(readonly.update_cells_authorized(&crate::database::DbObject{schema:"unused".into(),name:"unused".into(),kind:crate::database::DbObjectKind::Table},&[],true).await.is_err());
                 profile.read_only=false;profile.environment=EnvironmentTag::Prod;
                 let prod=SqlSession::with_profile(pool.clone(),&profile);prod.inner.lock().await.connection=readonly.inner.lock().await.connection.take();
-                assert!(prod.execute("UPDATE dbdeck_policy_test SET value='bad'").await.unwrap_err().contains("PROD"));
+                assert!(prod.execute("UPDATE dbdeck_policy_test SET value='bad'").await.unwrap_err().message.contains("PROD"));
                 prod.execute_authorized("UPDATE dbdeck_policy_test SET value='approved'",5,true).await.unwrap();
                 assert_eq!(prod.execute("SELECT value FROM dbdeck_policy_test").await.unwrap().data.rows[0][0],CellValue::Text("approved".into()));
                 prod.transaction(TransactionAction::Manual).await.unwrap();prod.execute("SELECT 1").await.unwrap();assert!(prod.state().await.read_only);
-                assert!(prod.execute_authorized("UPDATE dbdeck_policy_test SET value='bad'",5,true).await.unwrap_err().contains("транзакция"));
+                assert!(prod.execute_authorized("UPDATE dbdeck_policy_test SET value='bad'",5,true).await.unwrap_err().message.contains("транзакция"));
                 prod.transaction(TransactionAction::Rollback).await.unwrap();
                 prod.execute_authorized("UPDATE dbdeck_policy_test SET value='pending'",5,true).await.unwrap();
                 assert!(!prod.state().await.read_only);
-                assert!(prod.execute("SELECT 1").await.unwrap_err().contains("PROD"));
+                assert!(prod.execute("SELECT 1").await.unwrap_err().message.contains("PROD"));
                 prod.transaction(TransactionAction::Rollback).await.unwrap();prod.transaction(TransactionAction::AutoCommit).await.unwrap();
                 assert_eq!(prod.execute("SELECT value FROM dbdeck_policy_test").await.unwrap().data.rows[0][0],CellValue::Text("approved".into()));
                 for sql in ["SELECT GET_LOCK('dbdeck-policy',0)", "SELECT pg_try_advisory_lock(123)","SELECT set_config('work_mem','1GB',false)"] {
@@ -875,12 +925,12 @@ mod integration_tests {
                 let sleep = if matches!(kind, DatabaseKind::PostgreSql) { "SELECT pg_sleep(20)" } else { "SELECT SLEEP(20)" };
                 let started = std::time::Instant::now();
                 let error = first.execute_with_timeout(sleep, 1).await.unwrap_err();
-                assert!(error.contains("Превышено время"), "{error}");
+                assert!(error.message.contains("Превышено время"), "{error}");
                 assert!(started.elapsed() < Duration::from_secs(10));
                 assert!(first.execute("SELECT value FROM dbdeck_session_test").await.is_ok(), "cancel preserves session/TEMP state");
                 first.transaction(TransactionAction::Manual).await.unwrap();
                 let error = first.execute_with_timeout(sleep, 1).await.unwrap_err();
-                assert!(error.contains("Превышено время"));
+                assert!(error.message.contains("Превышено время"));
                 assert!(first.state().await.pending && first.state().await.failed);
                 assert!(first.transaction(TransactionAction::Commit).await.is_err());
                 first.transaction(TransactionAction::Rollback).await.unwrap();
@@ -890,7 +940,7 @@ mod integration_tests {
                 let cancel_started = std::time::Instant::now();
                 let error = first.execute_with_timeout(sleep, 0).await.unwrap_err();
                 stopper.await.unwrap();
-                assert!(error.contains("пользователем"), "{error}");
+                assert!(error.message.contains("пользователем"), "{error}");
                 assert!(cancel_started.elapsed() < Duration::from_secs(5));
                 assert!(!first.state().await.pending && !first.state().await.failed);
                 if matches!(kind, DatabaseKind::MySql) {
