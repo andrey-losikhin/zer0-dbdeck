@@ -157,7 +157,8 @@ pub(super) fn sync(ui: &Ui) {
         return;
     };
     let pg = matches!(profile.kind, DatabaseKind::PostgreSql);
-    if pg && profile.database.trim().is_empty() {
+    // PostgreSQL schemas are chosen in the catalog tree.
+    if pg {
         ui.namespace_row.set_visible(false);
         return;
     }
@@ -247,6 +248,8 @@ pub(super) fn refresh(ui: &Rc<Ui>) {
     }
     let key = scope(&profile);
     let sender = ui.sender.clone();
+    let include_system = show_system_schemas(ui);
+    let kind = profile.kind;
     ui.namespace_spinner.set_visible(true);
     let guard = ui.activity.start();
     ui.runtime.spawn(async move {
@@ -254,7 +257,13 @@ pub(super) fn refresh(ui: &Rc<Ui>) {
         let result = pool
             .database_targets(&profile.database)
             .await
-            .map(|choices| choices.into_iter().map(|(name, _)| name).collect());
+            .map(|choices| {
+                choices
+                    .into_iter()
+                    .map(|(name, _)| name)
+                    .filter(|name| include_system || !database::is_system_schema(kind, name))
+                    .collect()
+            });
         let _ = sender.send(Event::NamespaceChoices(key, revision, result));
     });
 }

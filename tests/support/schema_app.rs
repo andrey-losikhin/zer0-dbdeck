@@ -87,12 +87,8 @@ fn postgres_schema_groups_sql_and_drafts() {
     assert_eq!(ui.session_table_tabs.borrow()[&audit].n_pages(), 1);
     assert!(find_table_page(&ui, &format!("{session}:public.sample_records")).is_some());
     assert!(find_table_page(&ui, &format!("{session}:audit.events")).is_some());
-    let add = ui.session_table_tabs.borrow()[&audit]
-        .action_widget(gtk::PackType::End)
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap();
-    add.emit_clicked();
+    workspace_ui::select(&ui, &audit);
+    ui.tab_strip.add_button.emit_clicked();
     let audit_id = sql_id(&ui, &audit);
     assert_eq!(
         ui.sql_tabs.borrow()[&audit_id].schema.as_deref(),
@@ -140,6 +136,108 @@ fn postgres_schema_groups_sql_and_drafts() {
         .filter_map(|w| w.downcast::<gtk::Window>().ok())
         .find(|w| w.widget_name() == "object-structure")
         .unwrap();
+    let comparison_profile = ConnectionProfile {
+        id: "schema-ui-comparison".into(),
+        name: "comparison target".into(),
+        environment: EnvironmentTag::Stage,
+        ..profile.clone()
+    };
+    let comparison_key = profile_session_key(&comparison_profile);
+    let comparison_pool = runtime
+        .block_on(DbPool::connect(&comparison_profile, &password))
+        .unwrap();
+    ui.sessions.borrow_mut().insert(
+        comparison_key.clone(),
+        (comparison_profile, comparison_pool),
+    );
+    let compare = grid_app_tests::named_widget(inspector.upcast_ref(), "structure-compare")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    until(|| compare.is_sensitive());
+    compare.emit_clicked();
+    let comparison = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+        .find(|window| window.widget_name() == "structure-comparison")
+        .unwrap();
+    let named = |name| grid_app_tests::named_widget(comparison.upcast_ref(), name).unwrap();
+    let connections = named("structure-comparison-connection")
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    let tables = named("structure-comparison-table")
+        .downcast::<gtk::DropDown>()
+        .unwrap();
+    let run = named("structure-comparison-run")
+        .downcast::<gtk::Button>()
+        .unwrap();
+    let copy = named("structure-comparison-copy-markdown")
+        .downcast::<gtk::Button>()
+        .unwrap();
+    let status = named("structure-comparison-status")
+        .downcast::<gtk::Label>()
+        .unwrap();
+    let select = |dropdown: &gtk::DropDown, predicate: &dyn Fn(&str) -> bool| {
+        let items = dropdown
+            .model()
+            .unwrap()
+            .downcast::<gtk::StringList>()
+            .unwrap();
+        let index = (0..items.n_items())
+            .find(|&index| items.string(index).is_some_and(|value| predicate(&value)))
+            .unwrap();
+        dropdown.set_selected(index);
+    };
+    let copy_report = || {
+        assert!(copy.is_sensitive());
+        copy.emit_clicked();
+        let result = Rc::new(RefCell::new(None));
+        let output = result.clone();
+        copy.clipboard()
+            .read_text_async(None::<&gtk::gio::Cancellable>, move |text| {
+                output.replace(Some(text.unwrap().unwrap().to_string()));
+            });
+        until(|| result.borrow().is_some());
+        result.take().unwrap()
+    };
+    select(&connections, &|caption| {
+        caption.contains("comparison target")
+    });
+    until(|| tables.is_sensitive());
+    assert!(!run.is_sensitive());
+    assert!(!copy.is_sensitive());
+    select(&tables, &|caption| caption == "crm.events");
+    run.emit_clicked();
+    until(|| status.text() == "Различий в доступных метаданных не найдено");
+    let equal_report = copy_report();
+    assert!(equal_report.starts_with("# Сравнение структуры таблиц\n"));
+    assert!(equal_report.contains("\"audit\".\"events\" · \"server · "));
+    assert!(equal_report.contains("\"crm\".\"events\" · \"comparison target · "));
+    assert!(equal_report.contains("Различий в доступных метаданных не найдено"));
+    select(&tables, &|caption| caption == "public.sample_records");
+    assert!(!copy.is_sensitive());
+    run.emit_clicked();
+    until(|| status.text().starts_with("Различий:"));
+    let buffer = named("structure-comparison-result")
+        .downcast::<gtk::TextView>()
+        .unwrap()
+        .buffer();
+    let differences = buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    assert!(differences.contains("Удалено · Столбец \"description\""));
+    assert!(differences.contains("Добавлено · Столбец \"name\""));
+    let different_report = copy_report();
+    assert!(different_report.contains("\"public\".\"sample_records\" · "));
+    assert!(different_report.contains(differences.trim_end_matches('\n')));
+    run.emit_clicked();
+    assert!(!copy.is_sensitive());
+    until(|| copy.is_sensitive());
+    ui.sessions.borrow_mut().remove(&comparison_key);
+    run.emit_clicked();
+    assert_eq!(status.text(), "Подключение для сравнения закрыто");
+    assert!(!copy.is_sensitive());
+    assert_eq!(buffer.char_count(), 0);
+    comparison.close();
+
     let open_ddl = grid_app_tests::named_widget(inspector.upcast_ref(), "structure-open-sql")
         .unwrap()
         .downcast::<gtk::Button>()

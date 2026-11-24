@@ -31,6 +31,26 @@ fn choose(ui: &Ui, value: &str) {
     ui.namespace_selector.set_selected(index);
 }
 
+fn find_schema_button(widget: &gtk::Widget, tooltip: &str) -> Option<gtk::Button> {
+    if widget.has_css_class("schema-tree-row") && widget.tooltip_text().as_deref() == Some(tooltip)
+    {
+        return widget.clone().downcast::<gtk::Button>().ok();
+    }
+    let mut child = widget.first_child();
+    while let Some(current) = child {
+        if let Some(found) = find_schema_button(&current, tooltip) {
+            return Some(found);
+        }
+        child = current.next_sibling();
+    }
+    None
+}
+
+/// Whether the PostgreSQL tree of the `dbdeck_test` database lists `schema`.
+fn schema_listed(ui: &Ui, schema: &str) -> bool {
+    find_schema_button(ui.objects.upcast_ref(), &format!("dbdeck_test: {schema}")).is_some()
+}
+
 fn setup(kind: DatabaseKind, port: u16, password_key: &str) -> (Rc<Ui>, ConnectionProfile, DbPool) {
     gtk::init().unwrap();
     adw::init().unwrap();
@@ -71,9 +91,15 @@ fn setup(kind: DatabaseKind, port: u16, password_key: &str) -> (Rc<Ui>, Connecti
         &ui,
         Event::Connected("namespace".into(), profile.clone(), Ok(pool.clone())),
     );
-    until(|| ui.namespace_selector.is_sensitive());
-    assert!(ui.namespace_row.is_visible());
-    assert!(ui.namespace_selector.enables_search());
+    if matches!(kind, DatabaseKind::PostgreSql) {
+        // PostgreSQL schemas are chosen in the catalog tree, not in the dropdown.
+        until(|| ui.objects_available.get());
+        assert!(!ui.namespace_row.is_visible());
+    } else {
+        until(|| ui.namespace_selector.is_sensitive());
+        assert!(ui.namespace_row.is_visible());
+        assert!(ui.namespace_selector.enables_search());
+    }
     (ui, profile, pool)
 }
 
@@ -82,14 +108,14 @@ fn setup(kind: DatabaseKind, port: u16, password_key: &str) -> (Rc<Ui>, Connecti
 fn postgres_schema_dropdown() {
     let (ui, profile, _pool) = setup(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD");
     let session = profile_session_key(&profile);
-    assert_eq!(ui.namespace_label.text(), "Схема");
-    assert_eq!(selected(&ui).as_deref(), Some("Выберите схему"));
     assert!(ui.workspace_groups.borrow().is_empty());
-    assert!(choices(&ui).iter().any(|v| v == "audit"));
-    choose(&ui, "audit");
+    // The tree replaces the old schema dropdown: both schemas must be offered there.
+    until(|| schema_listed(&ui, "audit") && schema_listed(&ui, "public"));
+    find_schema_button(ui.objects.upcast_ref(), "dbdeck_test: audit")
+        .unwrap()
+        .emit_clicked();
     let audit = workspace_ui::key(&profile, Some("audit"));
     assert_eq!(workspace_ui::active(&ui, &session), audit);
-    assert_eq!(selected(&ui).as_deref(), Some("audit"));
     assert!(ui.catalog_tree.borrow().schema_expanded[&(session.clone(), "audit".into())]);
     create_sql_tab(&ui, &session);
     let audit_id = ui.active_table_by_session.borrow()[&audit]
@@ -104,7 +130,7 @@ fn postgres_schema_dropdown() {
     let data = ui.sql_tabs.borrow()[&audit_id].result.clone().unwrap();
     assert_eq!(data.rows[0][0], CellValue::Text("audit".into()));
     assert!(matches!(&data.rows[0][1], CellValue::Text(s) if s.starts_with("AUDIT:")));
-    choose(&ui, "public");
+    open_schema_group(&ui, &profile, "public");
     create_sql_tab(&ui, &session);
     let public = workspace_ui::key(&profile, Some("public"));
     let public_id = ui.active_table_by_session.borrow()[&public]
@@ -116,18 +142,89 @@ fn postgres_schema_dropdown() {
         .set_text("SELECT 'public draft'");
     ui.session_tabs
         .set_current_page(session_page_index(&ui, &audit));
-    assert_eq!(selected(&ui).as_deref(), Some("audit"));
+    assert_eq!(workspace_ui::active(&ui, &session), audit);
     assert_eq!(ui.session_tabs.n_pages(), 2);
     assert_eq!(ui.sql_tabs.borrow()[&audit_id].group_key, audit);
     assert!(ui.sql_tabs.borrow().contains_key(&public_id));
-    until(|| ui.namespace_selector.is_mapped());
     grid_app_tests::layout_snapshot(&ui.window, "target/postgres-schema-dropdown.png");
     close_session(&ui, &session);
     assert!(!ui.namespace_row.is_visible());
     ui.window.close();
     println!(
-        "PostgreSQL dropdown: public/audit choices, group/SQL context, top-tab synchronization, drafts and disconnect visibility passed"
+        "PostgreSQL schemas from the tree: group/SQL context, top-tab synchronization, drafts and hidden dropdown passed"
     );
+}
+
+#[test]
+#[ignore = "requires headless GTK and local Compose PostgreSQL; read-only"]
+fn postgres_tree_is_dropped_after_last_session_closes() {
+    let (ui, profile, _pool) = setup(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD");
+    until(|| schema_listed(&ui, "public"));
+    close_session(&ui, &profile_session_key(&profile));
+    until(|| !ui.tab_strip.add_button.is_sensitive());
+    show_sidebar(&ui, "tables");
+    assert!(ui.sessions.borrow().is_empty());
+    assert!(
+        ui.objects.first_child().is_none(),
+        "the closed connection's tree must not be shown"
+    );
+    assert!(!schema_listed(&ui, "public"));
+    assert!(ui.table_list_items.borrow().is_empty());
+    assert!(ui.selected_table_button.borrow().is_none());
+    assert!(!ui.objects_available.get());
+    assert!(ui.tables_hint.is_visible(), "the hint replaces the tree");
+    assert!(!ui.table_filter.is_visible());
+    ui.window.close();
+}
+
+#[test]
+#[ignore = "requires headless GTK and local Compose PostgreSQL; read-only"]
+fn postgres_new_sql_button_is_enabled_before_any_table_is_open() {
+    let (ui, _profile, _pool) = setup(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD");
+    until(|| ui.tab_strip.add_button.is_sensitive());
+    assert_eq!(ui.session_tabs.n_pages(), 0, "no tab is open yet");
+    assert!(ui.table_data.borrow().is_empty());
+    assert!(ui.sql_tabs.borrow().is_empty());
+    ui.window.close();
+}
+
+#[test]
+#[ignore = "requires headless GTK and local Compose PostgreSQL; read-only"]
+fn postgres_system_schemas_toggle_shows_and_hides_system_schemas() {
+    let (ui, _profile, _pool) = setup(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD");
+    until(|| schema_listed(&ui, "public"));
+    assert!(!ui.system_schemas_toggle.is_active(), "hidden by default");
+    assert!(!schema_listed(&ui, "pg_catalog"));
+    assert!(!schema_listed(&ui, "information_schema"));
+
+    ui.system_schemas_toggle.set_active(true);
+    assert!(ui.store.borrow().as_ref().unwrap().show_system_schemas());
+    until(|| schema_listed(&ui, "pg_catalog") && schema_listed(&ui, "information_schema"));
+    assert!(schema_listed(&ui, "public"));
+
+    ui.system_schemas_toggle.set_active(false);
+    assert!(!ui.store.borrow().as_ref().unwrap().show_system_schemas());
+    until(|| !schema_listed(&ui, "pg_catalog") && !schema_listed(&ui, "information_schema"));
+    assert!(schema_listed(&ui, "public"));
+
+    // The checkbox mirrors the stored value, e.g. after the vault is unlocked.
+    ui.store
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .set_show_system_schemas(true)
+        .unwrap();
+    storage_ui::sync_system_schemas(&ui);
+    assert!(ui.system_schemas_toggle.is_active());
+    ui.store
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .set_show_system_schemas(false)
+        .unwrap();
+    storage_ui::sync_system_schemas(&ui);
+    assert!(!ui.system_schemas_toggle.is_active());
+    ui.window.close();
 }
 
 #[test]
@@ -227,7 +324,14 @@ fn database_dropdown(kind: DatabaseKind, port: u16, password_key: &str) {
             .borrow_mut()
             .insert(format!("namespace-limit-{i}"));
     }
-    choose(&ui, "information_schema");
+    // Both real databases are open; system ones are hidden, so offer a fresh name.
+    let mut probe = before.clone();
+    probe.push("dbdeck_limit_probe".into());
+    handle_event(
+        &ui,
+        Event::NamespaceChoices(profile_session_key(&root), revision, Ok(probe)),
+    );
+    choose(&ui, "dbdeck_limit_probe");
     assert!(ui.status.text().contains("лимит 16"));
     assert_eq!(
         selected(&ui).as_deref(),
@@ -241,11 +345,12 @@ fn database_dropdown(kind: DatabaseKind, port: u16, password_key: &str) {
     ui.pending_database_opens
         .borrow_mut()
         .retain(|key| !key.starts_with("namespace-limit-"));
+    // The tree keeps listing the saved profile scope; the dropdown shows the active DB.
     until(|| {
         ui.table_list_items
             .borrow()
             .iter()
-            .any(|(_, object)| object.schema == "dbdeck_analytics")
+            .any(|(_, object)| object.schema == "dbdeck_test")
     });
     until(|| ui.namespace_selector.is_mapped());
     grid_app_tests::layout_snapshot(&ui.window, &format!("target/database-dropdown-{port}.png"));
@@ -253,4 +358,170 @@ fn database_dropdown(kind: DatabaseKind, port: u16, password_key: &str) {
     println!(
         "{kind:?} dropdown: both DBs remain available, real DB context, existing groups/drafts, top-tab sync and stale results passed"
     );
+}
+
+#[test]
+#[ignore = "requires headless GTK; synthetic catalogs, no database servers"]
+fn object_search_reveals_paths_and_restores_expansion() {
+    gtk::init().unwrap();
+    adw::init().unwrap();
+    let runtime = Arc::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap(),
+    );
+    let app = adw::Application::builder()
+        .application_id("io.github.dbdeck.object-search-test")
+        .build();
+    app.register(None::<&gtk::gio::Cancellable>).unwrap();
+    let ui = build_window(&app, runtime);
+    let profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+        "id":"object-search", "name":"Synthetic", "kind":"postgre_sql",
+        "host":"127.0.0.1", "port":5432, "database":"sales", "username":"test",
+        "environment":"local", "color":"#94e2d5", "read_only":true
+    }))
+    .unwrap();
+    *ui.current_profile.borrow_mut() = Some(profile.clone());
+    let catalog = |schema: &str, names: &[&str]| TableCatalog {
+        schemas: vec![schema.into()],
+        objects: names
+            .iter()
+            .map(|name| DbObject {
+                schema: schema.into(),
+                name: (*name).into(),
+                kind: database::DbObjectKind::Table,
+            })
+            .collect(),
+        truncated: false,
+    };
+    catalog_tree::prepare(&ui, &profile);
+    catalog_tree::loaded(&ui, &profile, catalog("public", &["orders", "customers"]));
+    let mut other = profile.clone();
+    other.database = "archive".into();
+    catalog_tree::loaded(&ui, &other, catalog("Аудит", &["События", "orders_old"]));
+    catalog_tree::databases_loaded(
+        &ui,
+        &profile,
+        vec!["sales".into(), "archive".into(), "unloaded".into()],
+    );
+    ui.catalog_tree
+        .borrow_mut()
+        .schema_expanded
+        .insert((profile_session_key(&other), "Аудит".into()), false);
+    catalog_tree::render(&ui);
+
+    let branch = |name: &str| {
+        let branches = ui.object_search_branches.borrow();
+        let b = branches.iter().find(|b| b.name == name).unwrap();
+        (b.line.clone(), b.children.clone(), b.disclosure.clone())
+    };
+    let visible_tables = || {
+        ui.table_list_items
+            .borrow()
+            .iter()
+            .filter(|(b, _)| b.is_visible())
+            .map(|(_, o)| o.name.clone())
+            .collect::<Vec<_>>()
+    };
+    let search = |query: &str| {
+        ui.table_filter.set_text(query);
+        // Exercise the real search signal without waiting for SearchEntry's debounce.
+        ui.table_filter.emit_by_name::<()>("search-changed", &[]);
+    };
+    assert!(!branch("archive").1.is_visible());
+    assert!(!branch("Аудит").1.is_visible());
+    search("  СОБЫТИЯ  ");
+    assert_eq!(visible_tables(), ["События"]);
+    assert!(!branch("sales").0.is_visible());
+    assert!(branch("archive").1.is_visible());
+    assert!(branch("Аудит").1.is_visible());
+    assert_eq!(branch("archive").2.text(), "▾");
+    assert!(ui.sessions.borrow().is_empty(), "search must not connect");
+    assert!(
+        ui.workspace_groups.borrow().is_empty(),
+        "search must not open tabs"
+    );
+    search("аудит");
+    assert_eq!(visible_tables(), ["События", "orders_old"]);
+    search("ARCHIVE");
+    assert_eq!(visible_tables(), ["События", "orders_old"]);
+    search("orders");
+    assert_eq!(visible_tables(), ["orders", "orders_old"]);
+    assert!(branch("sales").1.is_visible());
+    assert!(branch("archive").1.is_visible());
+    // Metadata re-render keeps the active query and the user's expansion state.
+    catalog_tree::render(&ui);
+    assert_eq!(visible_tables(), ["orders", "orders_old"]);
+    assert!(branch("archive").1.is_visible());
+    search("missing");
+    assert!(visible_tables().is_empty());
+    assert!(!branch("sales").0.is_visible());
+    assert!(!branch("archive").0.is_visible());
+    let mut child = ui.objects.first_child();
+    let mut empty_visible = false;
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.widget_name() == "object-search-empty" {
+            empty_visible = widget.is_visible();
+        }
+    }
+    assert!(empty_visible);
+    search("unloaded");
+    assert!(branch("unloaded").0.is_visible());
+    assert!(visible_tables().is_empty());
+    search("   ");
+    assert!(branch("sales").1.is_visible());
+    assert!(!branch("archive").1.is_visible());
+    assert!(!branch("Аудит").1.is_visible());
+    assert_eq!(branch("archive").2.text(), "▸");
+    assert_eq!(visible_tables(), ["orders", "customers"]);
+    assert_eq!(ui.table_list_items.borrow().len(), 4);
+    // Explicit expansion while searching survives clearing the query.
+    search("archive");
+    find_schema_button(ui.objects.upcast_ref(), "Открыть базу archive")
+        .unwrap()
+        .emit_clicked();
+    search("");
+    assert!(branch("archive").1.is_visible());
+
+    // MySQL/MariaDB use schema rows directly as database rows.
+    clear_box(&ui.objects);
+    ui.object_search_branches.borrow_mut().clear();
+    ui.table_list_items.borrow_mut().clear();
+    let mut mysql = profile.clone();
+    mysql.kind = DatabaseKind::MySql;
+    append_schema_tree(
+        &ui,
+        &ui.objects,
+        &mysql,
+        TableCatalog {
+            schemas: vec!["sales".into(), "audit_db".into()],
+            objects: vec![DbObject {
+                schema: "audit_db".into(),
+                name: "events".into(),
+                kind: database::DbObjectKind::Table,
+            }],
+            truncated: false,
+        },
+    );
+    apply_table_list_filter(&ui);
+    assert!(!branch("audit_db").1.is_visible());
+    search("events");
+    assert!(branch("audit_db").1.is_visible());
+    assert!(!branch("sales").0.is_visible());
+    search("audit_db");
+    assert_eq!(visible_tables(), ["events"]);
+    search("");
+    assert!(!branch("audit_db").1.is_visible());
+    search("events");
+    close_session(&ui, &profile_session_key(&profile));
+    assert!(ui.objects.first_child().is_none());
+    ui.table_filter.emit_by_name::<()>("search-changed", &[]);
+    assert!(
+        ui.objects.first_child().is_none(),
+        "late search must not recreate a closed tree"
+    );
+    ui.window.close();
 }

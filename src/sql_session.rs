@@ -116,6 +116,14 @@ impl SqlSession {
             ..Self::with_profile(pool, profile)
         }
     }
+    pub fn for_estimated_plan(&self) -> Self {
+        // Starting a read-only transaction must leave the editor's connection alone.
+        Self {
+            read_only: true,
+            schema: self.schema.clone(),
+            ..Self::new(self.pool.clone())
+        }
+    }
     pub fn requires_write_approval(&self, sql: &str, state: TransactionState) -> bool {
         self.production
             && !self.read_only
@@ -192,6 +200,11 @@ impl SqlSession {
     pub fn request_cancel(&self) {
         self.cancel_requested.store(true, Ordering::Release);
         self.cancel_notify.notify_one();
+    }
+    /// Called before starting a new query on an idle tab. GTK may have accepted
+    /// a Stop after the previous worker finished but before receiving its result.
+    pub fn clear_cancel_request(&self) {
+        self.cancel_requested.store(false, Ordering::Release);
     }
     async fn cancelled(&self) {
         loop {
@@ -429,7 +442,12 @@ impl SqlSession {
             }
         };
         if auto_read && !connection_lost {
-            if let Err(error) = self.control_command(&mut inner, "ROLLBACK").await {
+            let rollback = if mysql {
+                "ROLLBACK AND NO CHAIN NO RELEASE"
+            } else {
+                "ROLLBACK"
+            };
+            if let Err(error) = self.control_command(&mut inner, rollback).await {
                 result = Err(DbError {
                     kind: error.kind,
                     message: format!("Не удалось завершить транзакцию чтения: {error}"),
@@ -774,6 +792,76 @@ mod integration_tests {
         database::CellValue,
         settings::{ConnectionProfile, DatabaseKind, EnvironmentTag, TlsMode},
     };
+
+    #[test]
+    #[ignore = "requires local Compose DBs with sample_records fixture"]
+    fn estimated_plans_all_engines() {
+        use crate::sql_explain::EstimatedPlan;
+
+        async fn estimate(
+            editor: &SqlSession,
+            kind: DatabaseKind,
+            sql: &str,
+        ) -> Result<QueryResult, DbError> {
+            let plan = EstimatedPlan::new(kind, sql).unwrap();
+            let session = editor.for_estimated_plan();
+            let result = session.execute_with_timeout(plan.sql(), 5).await;
+            session.close().await;
+            result
+        }
+
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            for (kind, port, password_key) in [
+                (DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD"),
+                (DatabaseKind::MariaDb, 53306, "DBDECK_MARIADB_PASSWORD"),
+                (DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD"),
+            ] {
+                let profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+                    "id":"estimate", "name":"estimate", "kind":kind, "host":"127.0.0.1", "port":port,
+                    "database":"dbdeck_test", "username":"dbdeck_test", "environment":"local",
+                    "color":"#ffffff", "read_only":false, "tls_mode":"disabled"
+                })).unwrap();
+                let password = std::env::var(password_key).unwrap();
+                let pool = DbPool::connect(&profile, &password).await.unwrap();
+                let editor = SqlSession::with_profile_and_schema(pool, &profile, Some("public".into()));
+                let postgres = matches!(kind, DatabaseKind::PostgreSql);
+                let before = editor.execute("SELECT name FROM sample_records WHERE id=1").await.unwrap();
+                let result = estimate(&editor, kind, "SELECT name FROM sample_records WHERE id=1; -- tail")
+                    .await.unwrap_or_else(|error| panic!("{kind:?}: {error}"));
+                let expected_column = if postgres { "QUERY PLAN" } else { "select_type" };
+                assert!(result.data.columns.iter().any(|name| name == expected_column));
+                assert!(!result.data.rows.is_empty() && result.editable_object.is_none());
+                match estimate(&editor, kind, "UPDATE sample_records SET name='estimated' WHERE id=1").await {
+                    Ok(result) => assert!(!result.data.rows.is_empty()),
+                    Err(error) if !postgres => assert!(error.message.contains("25006"), "{kind:?}: {error}"),
+                    Err(error) => panic!("{kind:?}: {error}"),
+                }
+                let after = editor.execute("SELECT name FROM sample_records WHERE id=1").await.unwrap();
+                assert_eq!(before.data.rows, after.data.rows, "{kind:?}");
+
+                if postgres {
+                    editor.execute("BEGIN READ ONLY; SELECT 1").await.unwrap();
+                    assert!(estimate(&editor, kind, "SELECT dbdeck_missing_column").await.is_err());
+                    assert!(editor.execute("SELECT 2").await.is_ok());
+                    assert!(estimate(&editor, kind, "((SELECT 1) UNION ALL (SELECT 2))").await.is_ok());
+                    editor.execute("ROLLBACK").await.unwrap();
+                } else {
+                    editor.execute("LOCK TABLES sample_records WRITE").await.unwrap();
+                    assert!(estimate(&editor, kind, "SELECT 1").await.is_ok());
+                    assert!(editor.execute("SELECT COUNT(*) FROM sample_records AS unlocked_alias").await.is_err());
+                    editor.execute("UNLOCK TABLES").await.unwrap();
+
+                    editor.execute("CREATE TEMPORARY TABLE dbdeck_estimate (id INT PRIMARY KEY)").await.unwrap();
+                    editor.execute("SET SESSION completion_type=1").await.unwrap();
+                    editor.execute("START TRANSACTION; COMMIT; INSERT INTO dbdeck_estimate VALUES (1)").await.unwrap();
+                    assert!(estimate(&editor, kind, "SELECT 1").await.is_ok());
+                    editor.execute("ROLLBACK AND NO CHAIN NO RELEASE").await.unwrap();
+                    assert!(editor.execute("SELECT id FROM dbdeck_estimate").await.unwrap().data.rows.is_empty());
+                }
+                editor.close().await;
+            }
+        });
+    }
 
     #[test]
     #[ignore = "requires Compose DBs; connection-local TEMP objects only"]

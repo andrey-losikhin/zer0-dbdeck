@@ -2,16 +2,27 @@
 const send = message => window.webkit.messageHandlers.dbdeck.postMessage(message);
 let table = null, columnSignature = null;
 let hasMore = false, loadingMore = false, updatingData = false;
+let dataGeneration = null;
+let hiddenColumns = new Set();
 let editingCell = null, editingOriginal = "", copiedRange = null, rangeAdapter = null;
 let rowsWritable = false;
 let serverSort = false, serverSorter = null, clipboardToken = 0, locked = false;
-window.dbdeckSetLocked = value => { locked = value; clipboardToken++; };
+window.dbdeckSetLocked = value => {
+    locked = value;
+    clipboardToken++;
+    if (locked) rangeAdapter?.closeMenu(false);
+    else maybeLoadMore();
+};
+window.dbdeckPrepareViewChange = request => {
+    const ready = !!table && !locked && !updatingData && !editingCell;
+    if (ready) window.dbdeckSetLocked(true);
+    send({type: "viewChangeReady", request, ready});
+};
 
 // Tabulator menus are divs; give their actions native keyboard focus semantics.
 new MutationObserver(() => {
     document.querySelectorAll('.tabulator-menu .tabulator-menu-item:not(.tabulator-menu-item-disabled)').forEach(item => {
-        if (item.hasAttribute('tabindex')) return;
-        item.tabIndex = 0;
+        if (!item.hasAttribute('tabindex')) item.tabIndex = 0;
         item.setAttribute('role', 'menuitem');
     });
 }).observe(document.body, {childList:true, subtree:true});
@@ -43,10 +54,10 @@ function installRangeAdapter(grid) {
         manager.restoreFocus();
     };
     return {
-        closeMenu() {
+        closeMenu(restoreFocus = true) {
             // Tabulator binds outside-click dismissal after 100ms; Escape must work immediately.
             grid.modules.menu.rootPopup?.hide();
-            manager.restoreFocus();
+            if (restoreFocus) manager.restoreFocus();
         },
         clear() {
             manager.clearRanges();
@@ -58,7 +69,7 @@ function installRangeAdapter(grid) {
             if (manager.activeRange || (!event.shiftKey && event.button !== 2)) return;
             const element = event.target.closest(".tabulator-cell,.tabulator-col");
             if (!element || !grid.getDataCount()) return;
-            const field = element.getAttribute("tabulator-field") || grid.getColumns().find(column => column.getField())?.getField();
+            const field = element.getAttribute("tabulator-field") || visibleDataColumns()[0]?.getField();
             const rowElement = element.closest(".tabulator-row");
             const row = rowElement ? grid.getRows("visible").find(row => row.getElement() === rowElement) : grid.getRows("active")[0];
             const cell = row?.getCell(field);
@@ -66,11 +77,15 @@ function installRangeAdapter(grid) {
         },
     };
 }
-function selectionBounds(range = table?.getRanges()[0]) {
+function visibleDataColumns() {
+    return table.getColumns().filter(column => column.getField() && column.isVisible());
+}
+function selectionBounds(columns, range = table?.getRanges()[0]) {
     if (!range) return null;
+    const selected = range.getColumns();
     return { top: range.getTopEdge(), bottom: range.getBottomEdge(),
-        left: Number(range.getColumns()[0]?.getField().slice(1)),
-        right: Number(range.getColumns().at(-1)?.getField().slice(1)) };
+        left: columns.findIndex(column => column.getField() === selected[0]?.getField()),
+        right: columns.findIndex(column => column.getField() === selected.at(-1)?.getField()) };
 }
 function clearCopy() {
     copiedRange?.remove(); copiedRange = null;
@@ -83,6 +98,26 @@ function clearSelection() {
     window.getSelection()?.removeAllRanges();
     send({ type: "clearSelection" });
 }
+function applyColumnVisibility() {
+    if (!rangeAdapter || updatingData || editingCell) return;
+    const changes = table.getColumns().filter(column =>
+        column.getField() && column.isVisible() === hiddenColumns.has(column.getField()));
+    if (!changes.length) return;
+    rangeAdapter.closeMenu(false);
+    clearSelection();
+    table.blockRedraw();
+    try {
+        for (const column of changes) {
+            if (hiddenColumns.has(column.getField())) column.hide();
+            else column.show();
+        }
+    } finally { table.restoreRedraw(); }
+}
+window.dbdeckSetHiddenColumns = (indices, generation) => {
+    if (generation !== dataGeneration) return;
+    hiddenColumns = new Set(indices.map(index => `c${index}`));
+    applyColumnVisibility();
+};
 function syncRange(range) {
     if (!range || updatingData) return;
     clipboardToken++;
@@ -119,13 +154,14 @@ window.dbdeckCopy = () => {
 window.dbdeckRequestPaste = () => { if (!locked && !editingCell && table?.getRanges().length) send({ type: "clipboardPaste", token: ++clipboardToken }); };
 window.dbdeckPaste = (text, token = clipboardToken) => {
     if (!table || locked || editingCell || token !== clipboardToken) return;
-    const rows = table.getRows("active"), columns = table.getColumns().filter(column => column.getField());
+    const rows = table.getRows("active"), columns = visibleDataColumns();
     const source = DBDeckClipboard.parseTsv(text);
-    const bounds = selectionBounds();
+    const bounds = selectionBounds(columns);
+    if (!bounds || bounds.left < 0 || bounds.right < 0) return;
     table.blockRedraw();
     try {
         for (const target of DBDeckClipboard.pasteCells(source, bounds, rows.length, columns.length)) {
-            const cell = rows[target.row].getCell(`c${target.column}`);
+            const cell = rows[target.row].getCell(columns[target.column].getField());
             if (cell) applyValue(cell, target.value);
         }
     } finally { table.restoreRedraw(); }
@@ -146,38 +182,72 @@ window.dbdeckFinishEdit = action => {
     if (!editingCell) send({ type: "editAction", action });
 };
 function selectAll() {
-    const rows = table.getRows("active"), columns = table.getColumns().filter(column => column.getField());
+    const rows = table.getRows("active"), columns = visibleDataColumns();
     if (!rows.length || !columns.length) return;
     rangeAdapter.clear();
     table.addRange(rows[0].getCell(columns[0].getField()), rows.at(-1).getCell(columns.at(-1).getField()));
 }
 function asData(rows) {
     return rows.map(row => {
-        const data = { _row: row.index };
+        const data = { _row: row.index, _generation: dataGeneration };
         row.values.forEach((value, i) => { data[`c${i}`] = value; data[`e${i}`] = row.editable[i] ?? true; });
         return data;
     });
 }
 function maybeLoadMore() {
-    if (!hasMore || loadingMore || updatingData) return;
+    if (locked || !hasMore || loadingMore || updatingData) return;
     const last = table.getRows("visible").at(-1)?.getPosition();
     if (last >= table.getDataCount() - 40) {
-        loadingMore = true; send({ type: "loadMore" });
+        loadingMore = true; send({ type: "loadMore", generation: dataGeneration });
     }
 }
+window.dbdeckResetPageRequest = () => { loadingMore = false; };
+function deleteRowMenuItem() {
+    return {
+        label: "Удалить строку",
+        disabled: locked || !rowsWritable,
+        action: (event, row) => send({ type: "rowAction", row: row.getIndex(), action: "delete" }),
+    };
+}
+function cellContextMenu() {
+    const deleteRow = deleteRowMenuItem();
+    return [
+        { label: "Просмотреть значение…", disabled: updatingData || locked, action: (event, cell) => {
+            if (!updatingData && !locked) {
+                const row = cell.getRow();
+                send({ type: "viewCell", row: row.getIndex(), column: cell.getField(),
+                    generation: row.getData()._generation });
+            }
+        } },
+        ...(rowRelations ? [{ label: "Связанные строки…", disabled: updatingData || locked, action: (event, cell) => {
+            if (!updatingData && !locked) {
+                const row = cell.getRow();
+                send({ type: "viewRelations", row: row.getIndex(), generation: row.getData()._generation });
+            }
+        } }] : []),
+        { label: "Копировать", action: () => window.dbdeckCopy() },
+        { label: "Вставить", action: () => window.dbdeckRequestPaste() },
+        { label: "Установить NULL", action: () => selectedCells().forEach(cell => applyValue(cell, null)) },
+        { ...deleteRow, action: (event, cell) => deleteRow.action(event, cell.getRow()) },
+    ];
+}
 window.dbdeckSetData = (payload, more) => {
+    rangeAdapter?.closeMenu(false);
     rowsWritable = !!payload.row_actions;
     if (editingCell) editingCell.cancelEdit();
     hasMore = more; loadingMore = false;
     serverSort = payload.server_sort;
+    hiddenColumns = new Set((payload.hidden_columns ?? []).map(index => `c${index}`));
     const measure = document.createElement('canvas').getContext('2d');
     measure.font = getComputedStyle(document.body).font;
     const columns = payload.columns.map((column, index) => ({
-        title: column.title, field: column.field, headerSort: true, resizable: true,
+        title: column.title, field: column.field, visible: !hiddenColumns.has(column.field), headerSort: true, resizable: true,
         width: Math.ceil(Math.min(360, Math.max(80, measure.measureText(column.title).width + 42,
             ...payload.rows.map(row => measure.measureText(String(row.values[index] ?? 'NULL').split(/\r?\n/)[0]).width + 20)))),
         editor: column.editable ? "input" : false,
-        editable: cell => column.editable && cell.getRow().getData()[`e${column.field.slice(1)}`],
+        editable: cell => !locked && !updatingData && column.editable
+            && cell.getRow().getData()[`e${column.field.slice(1)}`],
+        contextMenu: cellPreview ? cellContextMenu : undefined,
         headerTooltip: column.title,
         formatter: cell => {
             const text = cell.getValue() === null ? "NULL" : String(cell.getValue());
@@ -186,6 +256,7 @@ window.dbdeckSetData = (payload, more) => {
         },
     }));
     const signature = JSON.stringify(payload.columns);
+    dataGeneration = payload.generation;
     const data = asData(payload.rows);
     updatingData = true;
     if (table) {
@@ -201,7 +272,8 @@ window.dbdeckSetData = (payload, more) => {
             if (serverSort) table.clearSort();
             return table.setData(data);
         }).then(() => {
-            rangeAdapter.clear(); updatingData = false; renderServerSort(); send({type:"dataReady"}); maybeLoadMore();
+            rangeAdapter.clear(); updatingData = false; applyColumnVisibility();
+            renderServerSort(); send({type:"dataReady"}); maybeLoadMore();
         });
     }
     columnSignature = signature;
@@ -214,21 +286,16 @@ window.dbdeckSetData = (payload, more) => {
         selectableRangeAutoFocus: false, selectableRangeColumns: true, selectableRangeRows: true,
         selectableRangeClearCells: false, clipboard: false, editTriggerEvent: "dblclick",
         rowHeight: 28, renderVertical: "virtual", renderHorizontal: "virtual", columnHeaderVertAlign: "middle",
-        rowContextMenu: () => [
-            { label: "Удалить строку", disabled: locked || !rowsWritable, action: (e, row) => send({ type: "rowAction", row: row.getData()._row, action: "delete" }) },
-        ],
-        cellContextMenu: [
-            { label: "Копировать", action: () => window.dbdeckCopy() },
-            { label: "Вставить", action: () => window.dbdeckRequestPaste() },
-            { label: "Установить NULL", action: () => selectedCells().forEach(cell => applyValue(cell, null)) },
-        ],
+        // Tabulator publishes both row and cell events for a data cell.
+        rowContextMenu: event => cellPreview && event?.target?.closest?.(".tabulator-cell:not(.tabulator-row-header)")
+            ? [] : [deleteRowMenuItem()],
     });
     table.on("tableBuilt", () => {
         rangeAdapter = installRangeAdapter(table);
         // Programmatic row navigation can update Tabulator's cached scroll offset
         // before its public scrollVertical event; also observe the native viewport.
         document.querySelector('.tabulator-tableholder').addEventListener('scroll', maybeLoadMore);
-        clearSelection(); updatingData = false;
+        clearSelection(); updatingData = false; applyColumnVisibility();
         renderServerSort(); send({ type: "ready" }); send({type:"dataReady"}); maybeLoadMore();
     });
     table.on("cellEditing", cell => {
@@ -236,12 +303,17 @@ window.dbdeckSetData = (payload, more) => {
         editingOriginal = String(cell.getValue() ?? "");
         send({type:"editing",active:true,dirty:false});
     });
-    table.on("cellEditCancelled", () => { editingCell = null; send({type:"editing",active:false}); });
+    table.on("cellEditCancelled", () => {
+        editingCell = null;
+        send({type:"editing",active:false});
+        queueMicrotask(applyColumnVisibility);
+    });
     table.on("cellEdited", cell => {
         editingCell = null;
         send({type:"editing",active:false});
         cell.getElement().classList.toggle("dbdeck-edited", cell.getValue() !== cell.getInitialValue());
         send({ type: "edit", row: cell.getRow().getData()._row, column: cell.getField(), value: cell.getValue() });
+        queueMicrotask(applyColumnVisibility);
     });
     table.on("rangeAdded", syncRange);
     table.on("rangeChanged", syncRange);
@@ -256,6 +328,7 @@ window.dbdeckSetData = (payload, more) => {
     document.querySelector("#grid").addEventListener("click", event => {
         if (!serverSort || !event.target.closest(".tabulator-col-sorter")) return;
         event.preventDefault(); event.stopImmediatePropagation();
+        if (locked || updatingData) return;
         const header = event.target.closest(".tabulator-col"), field = header.getAttribute("tabulator-field");
         const direction = serverSorter?.field === field && serverSorter.dir === "asc" ? "desc" : "asc";
         send({ type: "sort", column: field, direction });
@@ -332,7 +405,7 @@ window.dbdeckSetData = (payload, more) => {
         } else if (!table.getRanges().length && ["ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "Enter", "Tab", "Home", "End"].includes(event.key)) {
             // Start keyboard navigation safely after Escape or first focus.
             event.preventDefault(); event.stopImmediatePropagation();
-            const first = table.getRows("active")[0]?.getCell(table.getColumns().find(column => column.getField())?.getField());
+            const first = table.getRows("active")[0]?.getCell(visibleDataColumns()[0]?.getField());
             if (first) table.addRange(first, first);
         } else if (["Delete", "Backspace"].includes(event.key)) {
             event.preventDefault(); event.stopImmediatePropagation();
@@ -350,6 +423,7 @@ window.dbdeckAppendData = (rows, more) => {
     return table.addData(asData(rows), false).then(() => {
         rangeAdapter.clear(); updatingData = false; loadingMore = false;
         if (start && end) table.addRange(start, end);
+        applyColumnVisibility();
         maybeLoadMore();
     });
 };

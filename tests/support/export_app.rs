@@ -184,6 +184,7 @@ fn snapshot_csv_cancellation_does_not_publish_and_output_is_private() {
         columns: vec!["value".into()],
         rows: vec![vec![CellValue::Text("x".repeat(128))]; 2048],
         primary_key: vec![],
+        cell_detail_key_columns: Vec::new(),
         truncated: false,
         truncated_columns: false,
     };
@@ -324,15 +325,21 @@ fn sql_save_csv_and_backup_ui_handlers() {
     assert!(ui.sql_queries_directory.borrow().is_none());
     let root = std::env::temp_dir().join(format!("dbdeck-export-ui-{}", Uuid::new_v4()));
     fs::create_dir(&root).unwrap();
-    fn accept(title: &str, folder: &std::path::Path, name: &str) {
+    fn chooser(title: &str) -> gtk::FileChooserDialog {
         use grid_app_tests::until;
         let chooser = gtk::Window::list_toplevels()
             .into_iter()
             .filter_map(|w| w.downcast::<gtk::FileChooserDialog>().ok())
             .find(|w| w.title().as_deref() == Some(title) && w.is_visible())
             .unwrap();
-        println!("UI chooser: {title} -> {name}");
         until(|| chooser.is_mapped());
+        chooser
+    }
+
+    fn accept(title: &str, folder: &std::path::Path, name: &str) {
+        use grid_app_tests::until;
+        let chooser = chooser(title);
+        println!("UI chooser: {title} -> {name}");
         chooser
             .set_current_folder(Some(&gtk::gio::File::for_path(folder)))
             .unwrap();
@@ -389,19 +396,33 @@ fn sql_save_csv_and_backup_ui_handlers() {
         columns: vec!["value".into()],
         rows: vec![vec![CellValue::Text("shown".into())]],
         primary_key: vec![],
+        cell_detail_key_columns: Vec::new(),
         truncated: false,
         truncated_columns: false,
     }));
     choose_sql_csv_export(&ui, &id);
     accept("Экспорт результата SQL в CSV", &root, "shown.csv");
-    assert!(ui.transfer_cancel_button.is_visible());
     until(|| ui.transfer_cancel.borrow().is_none());
     assert!(root.join("shown.csv").exists());
-    assert!(!ui.transfer_cancel_button.is_visible());
+    assert!(!ui.background_tasks.can_cancel(TRANSFER));
     assert_eq!(
         ui.store.borrow().as_ref().unwrap().csv_export_directory(),
         Some(root.clone())
     );
+    let preview = ui.sql_tabs.borrow()[&id].result.clone().unwrap();
+    ui.table_data
+        .borrow_mut()
+        .insert("csv-preview".into(), preview);
+    choose_table_csv_export(&ui, "csv-preview", "отчёт/2026");
+    let shown_title = "Экспорт показанных строк в CSV";
+    let shown_name = "отчёт_2026-shown.csv";
+    assert_eq!(
+        chooser(shown_title).current_name().as_deref(),
+        Some(shown_name)
+    );
+    accept(shown_title, &root, shown_name);
+    until(|| ui.transfer_cancel.borrow().is_none());
+    assert!(root.join(shown_name).exists(), "{}", ui.status.text());
     let DbPool::PostgreSql(pg) = &pool else {
         unreachable!()
     };
@@ -451,12 +472,18 @@ fn sql_save_csv_and_backup_ui_handlers() {
             observed.set(true);
         }
     });
-    choose_full_table_csv_export(&ui, &profile, &temp_object, "ui-export");
-    accept("Экспорт всей таблицы в CSV", &root, "full.csv");
+    choose_full_table_csv_export(&ui, &profile, &temp_object, &temp_object.name);
+    let full_title = "Экспорт всей таблицы в CSV";
+    let full_name = "dbdeck_ui_export-all.csv";
+    assert_eq!(
+        chooser(full_title).current_name().as_deref(),
+        Some(full_name)
+    );
+    accept(full_title, &root, full_name);
     until(|| ui.transfer_cancel.borrow().is_none());
-    assert!(root.join("full.csv").exists(), "{}", ui.status.text());
+    assert!(root.join(full_name).exists(), "{}", ui.status.text());
     assert!(saw_progress.get());
-    assert!(!ui.transfer_cancel_button.is_visible());
+    assert!(!ui.background_tasks.can_cancel(TRANSFER));
     ui.status.disconnect(signal);
     ui.sessions
         .borrow_mut()
@@ -467,16 +494,20 @@ fn sql_save_csv_and_backup_ui_handlers() {
     accept("Структура БД без данных", &root, "schema.sql");
     until(|| ui.transfer_cancel.borrow().is_none());
     assert!(root.join("schema.sql").exists(), "{}", ui.status.text());
-    assert!(!ui.transfer_cancel_button.is_visible());
+    assert!(!ui.background_tasks.can_cancel(TRANSFER));
     let existing = root.join("cancelled.sql");
     fs::write(&existing, "previous").unwrap();
     backup_ui::choose(&ui, &profile, native_backup::DumpMode::Schema);
     select_target_database("dbdeck_test");
     accept("Структура БД без данных", &root, "cancelled.sql");
-    ui.transfer_cancel_button.emit_clicked();
+    assert!(shortcuts::dispatch(
+        &ui,
+        gtk::gdk::Key::x,
+        gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+    ));
     until(|| ui.transfer_cancel.borrow().is_none());
     assert_eq!(fs::read_to_string(&existing).unwrap(), "previous");
-    assert!(!ui.transfer_cancel_button.is_visible());
+    assert!(!ui.background_tasks.can_cancel(TRANSFER));
     // Import UI: explicit target and file, then Cancel must leave the DB untouched.
     let mut writable = profile.clone();
     writable.read_only = false;

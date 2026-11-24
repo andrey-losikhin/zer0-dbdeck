@@ -1,6 +1,19 @@
 //! The report uses a snapshot of the whole editor and a separate read-only session.
 use super::*;
 
+fn report_filename(profile: &ConnectionProfile, now: &gtk::glib::DateTime) -> String {
+    let database = if profile.database.trim().is_empty() {
+        &profile.name
+    } else {
+        &profile.database
+    };
+    let database = safe_query_file_component(database);
+    let timestamp = now
+        .format("%Y-%m-%d_%H-%M-%S")
+        .expect("fixed timestamp format");
+    format!("{database}_{timestamp}.md")
+}
+
 pub(super) fn choose_report(ui: &Rc<Ui>, id: &str) {
     if ui.transfer_cancel.borrow().is_some() {
         show_error_dialog(
@@ -38,7 +51,9 @@ pub(super) fn choose_report(ui: &Rc<Ui>, id: &str) {
         Some("Выполнить и сохранить"),
         Some("Отмена"),
     );
-    chooser.set_current_name("sql-investigation.md");
+    if let Ok(now) = gtk::glib::DateTime::now_local().or_else(|_| gtk::glib::DateTime::now_utc()) {
+        chooser.set_current_name(&report_filename(&profile, &now));
+    }
     if let Ok(directory) = query_directory_for_tab(ui, id) {
         let _ = chooser.set_current_folder(Some(&gtk::gio::File::for_path(directory)));
     }
@@ -109,6 +124,31 @@ pub(super) fn choose_report(ui: &Rc<Ui>, id: &str) {
     chooser.show();
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn markdown_filename_uses_database_and_local_timestamp_to_the_second() {
+        let mut profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+            "id":"test", "name":"test connection", "kind":"postgre_sql", "host":"localhost",
+            "port":5432, "username":"tester", "database":"отчёты/продажи",
+            "environment":"local", "color":"#ffffff", "read_only":true
+        }))
+        .unwrap();
+        let now = gtk::glib::DateTime::from_iso8601("2026-11-23T16:05:09+03:00", None).unwrap();
+        assert_eq!(
+            report_filename(&profile, &now),
+            "отчёты_продажи_2026-11-23_16-05-09.md"
+        );
+        profile.database.clear();
+        assert_eq!(
+            report_filename(&profile, &now),
+            "test connection_2026-11-23_16-05-09.md"
+        );
+    }
+}
+
 pub(super) fn start_report(
     ui: &Rc<Ui>,
     pool: DbPool,
@@ -118,7 +158,7 @@ pub(super) fn start_report(
     timeout: u64,
     schema: Option<String>,
 ) {
-    let Some(cancel) = start_transfer(ui) else {
+    let Some(cancel) = start_transfer(ui, "SQL-отчёт Markdown", &path) else {
         return;
     };
     ui.status.set_text("Готовлю Markdown-отчёт…");

@@ -22,3 +22,15 @@ CREATE TABLE IF NOT EXISTS dbdeck_analytics.reports (
 INSERT INTO dbdeck_analytics.reports (id, title)
 SELECT 1, 'Сводный отчёт'
 WHERE NOT EXISTS (SELECT 1 FROM dbdeck_analytics.reports WHERE id = 1);
+
+CREATE TABLE IF NOT EXISTS dbdeck_test.comparison_case (
+    id INTEGER PRIMARY KEY,
+    CONSTRAINT comparison_positive CHECK (id > 0)
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS dbdeck_test.Comparison_case (
+    other INTEGER PRIMARY KEY
+) ENGINE=InnoDB;
+CREATE TABLE IF NOT EXISTS dbdeck_analytics.comparison_case (
+    id INTEGER PRIMARY KEY,
+    CONSTRAINT comparison_positive CHECK (id > 1)
+) ENGINE=InnoDB;

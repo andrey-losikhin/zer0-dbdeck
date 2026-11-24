@@ -1,7 +1,92 @@
-use std::{fs, path::PathBuf};
+use std::{borrow::Cow, fs, path::PathBuf};
 
 use relm4::{adw, gtk};
 use serde::{Deserialize, Serialize};
+
+use crate::noctalia::{Rgb, Skin, Theme};
+
+/// Палитры Gruvbox, Nord и Rose Pine; CSS, схема SQL, превью и `Palette` строятся из них.
+/// Тинты и hover взяты из прежних готовых CSS, чтобы цвета не изменились.
+const GRUVBOX_DARK: Skin = Skin {
+    theme: Theme {
+        bg: Rgb::hex(0x282828),
+        fg: Rgb::hex(0xebdbb2),
+        panel: Rgb::hex(0x32302f),
+        alternate: Rgb::hex(0x1d2021),
+        border: Rgb::hex(0x665c54),
+        muted: Rgb::hex(0xa89984),
+        accent: Rgb::hex(0x83a598),
+        success: Rgb::hex(0xb8bb26),
+        warning: Rgb::hex(0xfabd2f),
+        error: Rgb::hex(0xfb4934),
+        selection: Rgb::hex(0x504945),
+        hover: Rgb::hex(0x3c3836),
+        secondary: Rgb::hex(0xfb4934),
+        tertiary: Rgb::hex(0xb8bb26),
+    },
+    number: Rgb::hex(0xd3869b),
+    function: Rgb::hex(0x8ec07c),
+    type_color: Rgb::hex(0xfabd2f),
+    highlight: Rgb::hex(0x8ec07c),
+    strong_hover: Rgb::hex(0x504945),
+    warning_tint: Rgb::hex(0x453d29),
+    success_tint: Rgb::hex(0x3c3d28),
+    error_tint: Rgb::hex(0x452d2a),
+};
+
+const NORD: Skin = Skin {
+    theme: Theme {
+        bg: Rgb::hex(0x2e3440),
+        fg: Rgb::hex(0xd8dee9),
+        panel: Rgb::hex(0x3b4252),
+        alternate: Rgb::hex(0x2e3440),
+        border: Rgb::hex(0x4c566a),
+        muted: Rgb::hex(0xb4bccd),
+        accent: Rgb::hex(0x88c0d0),
+        success: Rgb::hex(0xa3be8c),
+        warning: Rgb::hex(0xebcb8b),
+        error: Rgb::hex(0xbf616a),
+        selection: Rgb::hex(0x434c5e),
+        hover: Rgb::hex(0x434c5e),
+        secondary: Rgb::hex(0x81a1c1),
+        tertiary: Rgb::hex(0xa3be8c),
+    },
+    number: Rgb::hex(0xb48ead),
+    function: Rgb::hex(0x88c0d0),
+    type_color: Rgb::hex(0x8fbcbb),
+    highlight: Rgb::hex(0x8fbcbb),
+    strong_hover: Rgb::hex(0x4c566a),
+    warning_tint: Rgb::hex(0x48494b),
+    success_tint: Rgb::hex(0x3e474b),
+    error_tint: Rgb::hex(0x423a46),
+};
+
+const ROSE_PINE: Skin = Skin {
+    theme: Theme {
+        bg: Rgb::hex(0x191724),
+        fg: Rgb::hex(0xe0def4),
+        panel: Rgb::hex(0x1f1d2e),
+        alternate: Rgb::hex(0x191724),
+        border: Rgb::hex(0x524f67),
+        muted: Rgb::hex(0x908caa),
+        accent: Rgb::hex(0xc4a7e7),
+        success: Rgb::hex(0x9ccfd8),
+        warning: Rgb::hex(0xf6c177),
+        error: Rgb::hex(0xeb6f92),
+        selection: Rgb::hex(0x403d52),
+        hover: Rgb::hex(0x26233a),
+        secondary: Rgb::hex(0xc4a7e7),
+        tertiary: Rgb::hex(0xf6c177),
+    },
+    number: Rgb::hex(0xebbcba),
+    function: Rgb::hex(0x9ccfd8),
+    type_color: Rgb::hex(0xeb6f92),
+    highlight: Rgb::hex(0xebbcba),
+    strong_hover: Rgb::hex(0x403d52),
+    warning_tint: Rgb::hex(0x382f30),
+    success_tint: Rgb::hex(0x2b313d),
+    error_tint: Rgb::hex(0x362333),
+};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -11,7 +96,10 @@ pub enum ThemeMode {
     #[default]
     #[serde(alias = "light")]
     CatppuccinMocha,
-    #[serde(alias = "noctalia")]
+    GruvboxDark,
+    Nord,
+    RosePine,
+    Noctalia,
     System,
 }
 
@@ -21,6 +109,10 @@ impl ThemeMode {
             Self::Dark => "dark",
             Self::TokyoNight => "tokyo_night",
             Self::CatppuccinMocha => "catppuccin_mocha",
+            Self::GruvboxDark => "gruvbox_dark",
+            Self::Nord => "nord",
+            Self::RosePine => "rose_pine",
+            Self::Noctalia => "noctalia",
             Self::System => "system",
         }
     }
@@ -29,7 +121,11 @@ impl ThemeMode {
         match id {
             Some("dark") => Self::Dark,
             Some("tokyo_night") => Self::TokyoNight,
-            Some("system" | "noctalia") => Self::System,
+            Some("gruvbox_dark") => Self::GruvboxDark,
+            Some("nord") => Self::Nord,
+            Some("rose_pine") => Self::RosePine,
+            Some("noctalia") => Self::Noctalia,
+            Some("system") => Self::System,
             _ => Self::CatppuccinMocha,
         }
     }
@@ -71,41 +167,67 @@ struct ThemePreferences {
     mode: ThemeMode,
 }
 
+fn install_sql_schemes() -> Result<PathBuf, String> {
+    let path = crate::app_instance::AppInstance::current()
+        .project_dirs()
+        .ok_or("Не удалось определить каталог схем SQL")?
+        .cache_dir()
+        .join("sql-styles");
+    fs::create_dir_all(&path).map_err(|e| e.to_string())?;
+    let noctalia_xml = crate::noctalia::current().scheme_xml();
+    let preset_xml = [
+        ("gruvbox-dark", GRUVBOX_DARK),
+        ("nord", NORD),
+        ("rose-pine", ROSE_PINE),
+    ]
+    .map(|(slug, skin)| {
+        (
+            format!("dbdeck-{slug}.xml"),
+            skin.scheme_xml(&format!("dbdeck-{slug}")),
+        )
+    });
+    let bundled = [
+        (
+            "dbdeck-mocha.xml",
+            include_str!("../assets/styles/dbdeck-mocha.xml"),
+        ),
+        (
+            "dbdeck-dark.xml",
+            include_str!("../assets/styles/dbdeck-dark.xml"),
+        ),
+        (
+            "dbdeck-tokyo-night.xml",
+            include_str!("../assets/styles/dbdeck-tokyo-night.xml"),
+        ),
+        ("dbdeck-noctalia.xml", noctalia_xml.as_str()),
+    ];
+    let generated = preset_xml
+        .iter()
+        .map(|(name, xml)| (name.as_str(), xml.as_str()));
+    for (name, xml) in bundled.into_iter().chain(generated) {
+        let file = path.join(name);
+        if fs::read_to_string(&file).ok().as_deref() != Some(xml) {
+            fs::write(file, xml).map_err(|e| e.to_string())?;
+        }
+    }
+    Ok(path)
+}
+
 pub fn sql_style_schemes() -> sourceview5::StyleSchemeManager {
     let manager = sourceview5::StyleSchemeManager::new();
-    let install = || -> Result<PathBuf, String> {
-        let path = crate::app_instance::AppInstance::current()
-            .project_dirs()
-            .ok_or("Не удалось определить каталог схем SQL")?
-            .cache_dir()
-            .join("sql-styles");
-        fs::create_dir_all(&path).map_err(|e| e.to_string())?;
-        for (name, xml) in [
-            (
-                "dbdeck-mocha.xml",
-                include_str!("../assets/styles/dbdeck-mocha.xml"),
-            ),
-            (
-                "dbdeck-dark.xml",
-                include_str!("../assets/styles/dbdeck-dark.xml"),
-            ),
-            (
-                "dbdeck-tokyo-night.xml",
-                include_str!("../assets/styles/dbdeck-tokyo-night.xml"),
-            ),
-        ] {
-            let file = path.join(name);
-            if fs::read_to_string(&file).ok().as_deref() != Some(xml) {
-                fs::write(file, xml).map_err(|e| e.to_string())?;
-            }
-        }
-        Ok(path)
-    };
-    match install() {
+    match install_sql_schemes() {
         Ok(path) => manager.prepend_search_path(&path.to_string_lossy()),
         Err(error) => eprintln!("Не удалось загрузить палитры SQL: {error}"),
     }
     manager
+}
+
+/// Записывает свежую схему Noctalia в кеш и заставляет менеджер перечитать каталог.
+pub fn refresh_sql_schemes(manager: &sourceview5::StyleSchemeManager) {
+    match install_sql_schemes() {
+        Ok(_) => manager.force_rescan(),
+        Err(error) => eprintln!("Не удалось обновить палитры SQL: {error}"),
+    }
 }
 
 pub fn sql_scheme_id(mode: ThemeMode, dark: bool) -> &'static str {
@@ -113,6 +235,10 @@ pub fn sql_scheme_id(mode: ThemeMode, dark: bool) -> &'static str {
         ThemeMode::CatppuccinMocha => "dbdeck-mocha",
         ThemeMode::Dark => "dbdeck-dark",
         ThemeMode::TokyoNight => "dbdeck-tokyo-night",
+        ThemeMode::GruvboxDark => "dbdeck-gruvbox-dark",
+        ThemeMode::Nord => "dbdeck-nord",
+        ThemeMode::RosePine => "dbdeck-rose-pine",
+        ThemeMode::Noctalia => "dbdeck-noctalia",
         ThemeMode::System if dark => "Adwaita-dark",
         ThemeMode::System => "Adwaita",
     }
@@ -148,6 +274,10 @@ pub fn palette(mode: ThemeMode) -> Palette {
             "#111923", "#d7e1eb", "#1b2632", "#151f2b", "#3a4a5a", "#b9c5d1", "#42b8b0", "#3fb950",
             "#e3b341", "#ff7b72", "#20383c",
         ],
+        ThemeMode::GruvboxDark => return GRUVBOX_DARK.theme.palette(),
+        ThemeMode::Nord => return NORD.theme.palette(),
+        ThemeMode::RosePine => return ROSE_PINE.theme.palette(),
+        ThemeMode::Noctalia => return crate::noctalia::current().palette(),
         ThemeMode::System if system_dark => [
             "#1e1e1e", "#ffffff", "#303030", "#242424", "#555555", "#bdbdbd", "#3584e4", "#2ec27e",
             "#f5c211", "#f66151", "#3d3d3d",
@@ -219,6 +349,10 @@ pub fn preview_colors(mode: ThemeMode) -> [String; 6] {
             "#d7e1eb", "#c3a6f5", "#8cceac", "#eab683", "#80b8ed", "#42b8b0",
         ]
         .map(str::to_owned),
+        ThemeMode::GruvboxDark => GRUVBOX_DARK.preview_colors(),
+        ThemeMode::Nord => NORD.preview_colors(),
+        ThemeMode::RosePine => ROSE_PINE.preview_colors(),
+        ThemeMode::Noctalia => crate::noctalia::current().skin().preview_colors(),
         ThemeMode::System => {
             let p = palette(mode);
             [
@@ -266,12 +400,27 @@ pub fn grid_css(mode: ThemeMode) -> String {
 fn interface_roles(mode: ThemeMode) -> String {
     let p = palette(mode);
     let mut css = format!(
-        "@define-color dbdeck_fg {}; @define-color dbdeck_muted {}; @define-color dbdeck_border {}; @define-color dbdeck_success {}; @define-color dbdeck_warning {}; @define-color dbdeck_error {}; @define-color dbdeck_panel {};",
-        p.fg, p.muted, p.border, p.success, p.warning, p.error, p.panel
+        "@define-color dbdeck_fg {}; @define-color dbdeck_muted {}; @define-color dbdeck_border {}; @define-color dbdeck_success {}; @define-color dbdeck_warning {}; @define-color dbdeck_error {}; @define-color dbdeck_panel {}; @define-color dbdeck_accent {}; @define-color dbdeck_bg {}; @define-color dbdeck_selection {}; @define-color dbdeck_alt {};",
+        p.fg,
+        p.muted,
+        p.border,
+        p.success,
+        p.warning,
+        p.error,
+        p.panel,
+        p.accent,
+        p.bg,
+        p.selection,
+        p.alternate
     );
     if mode == ThemeMode::System {
-        css = "@define-color dbdeck_fg @window_fg_color; @define-color dbdeck_muted @window_fg_color; @define-color dbdeck_border alpha(@window_fg_color, 0.3); @define-color dbdeck_success @success_color; @define-color dbdeck_warning @warning_color; @define-color dbdeck_error @error_color; @define-color dbdeck_panel @window_bg_color;".to_owned();
+        css = "@define-color dbdeck_fg @window_fg_color; @define-color dbdeck_muted @window_fg_color; @define-color dbdeck_border alpha(@window_fg_color, 0.3); @define-color dbdeck_success @success_color; @define-color dbdeck_warning @warning_color; @define-color dbdeck_error @error_color; @define-color dbdeck_panel @window_bg_color; @define-color dbdeck_accent @accent_color; @define-color dbdeck_bg @view_bg_color; @define-color dbdeck_selection alpha(@accent_color, 0.25); @define-color dbdeck_alt @window_bg_color;".to_owned();
     }
+    let noctalia = crate::noctalia::current();
+    css.push_str(&format!(
+        ".dbdeck-settings .settings-preview.noctalia{{background:{};color:{};border-color:{};}}",
+        noctalia.bg, noctalia.fg, noctalia.border
+    ));
     css.push_str(&format!(
         ".tab-schema-name{{color:{};font-weight:600;}}",
         p.accent
@@ -280,7 +429,7 @@ fn interface_roles(mode: ThemeMode) -> String {
         .iter()
         .zip(["blue", "teal", "green", "yellow", "orange", "red", "purple"])
     {
-        css.push_str(&format!(".connection-card-active.connection-color-{class},.table-context-popover.connection-color-{class}>contents{{border-color:{color};}} .active-connection-header.connection-color-{class}{{border-left-color:{color};}}"));
+        css.push_str(&format!(".connection-card-active.connection-color-{class},.table-context-popover.connection-color-{class}>contents{{border-color:{color};}} .active-connection-header.connection-color-{class}{{border-left-color:{color};}} .connection-row.connection-color-{class}{{border-left-color:{color};}}"));
     }
     css
 }
@@ -289,20 +438,32 @@ pub fn apply_mode(mode: ThemeMode, provider: &gtk::CssProvider) {
     let style_manager = adw::StyleManager::default();
     style_manager.set_color_scheme(match mode {
         ThemeMode::System => adw::ColorScheme::PreferLight,
-        ThemeMode::Dark | ThemeMode::CatppuccinMocha | ThemeMode::TokyoNight => {
-            adw::ColorScheme::ForceDark
+        ThemeMode::Noctalia if !crate::noctalia::current().is_dark() => {
+            adw::ColorScheme::ForceLight
         }
+        ThemeMode::Dark
+        | ThemeMode::CatppuccinMocha
+        | ThemeMode::TokyoNight
+        | ThemeMode::GruvboxDark
+        | ThemeMode::Nord
+        | ThemeMode::RosePine
+        | ThemeMode::Noctalia => adw::ColorScheme::ForceDark,
     });
-    let colors = match mode {
-        ThemeMode::Dark => DARK_CSS,
-        ThemeMode::TokyoNight => include_str!("../assets/themes/tokyo-night.css"),
-        ThemeMode::CatppuccinMocha => CATPPUCCIN_MOCHA_CSS,
-        ThemeMode::System => SYSTEM_CSS,
+    let colors: Cow<'static, str> = match mode {
+        ThemeMode::Dark => Cow::Borrowed(DARK_CSS),
+        ThemeMode::TokyoNight => Cow::Borrowed(include_str!("../assets/themes/tokyo-night.css")),
+        ThemeMode::GruvboxDark => Cow::Owned(GRUVBOX_DARK.css("Gruvbox Dark palette")),
+        ThemeMode::Nord => Cow::Owned(NORD.css("Nord palette")),
+        ThemeMode::RosePine => Cow::Owned(ROSE_PINE.css("Rose Pine palette")),
+        ThemeMode::Noctalia => Cow::Owned(crate::noctalia::current().css()),
+        ThemeMode::CatppuccinMocha => Cow::Borrowed(CATPPUCCIN_MOCHA_CSS),
+        ThemeMode::System => Cow::Borrowed(SYSTEM_CSS),
     };
-    provider.load_from_data(colors);
+    provider.load_from_data(&colors);
     let roles = interface_roles(mode);
+    let layout = include_str!("../assets/themes/layout.css");
     provider.load_from_data(&format!(
-        "{colors}\n{roles}\n{SQL_CONTROLS_CSS}\n{SETTINGS_CSS}\n{THEMED_ICONS_CSS}\n{SELECT_CSS}\n{CATALOG_TREE_CSS}"
+        "{colors}\n{roles}\n{SQL_CONTROLS_CSS}\n{SETTINGS_CSS}\n{THEMED_ICONS_CSS}\n{SELECT_CSS}\n{CATALOG_TREE_CSS}\n{layout}"
     ));
 }
 
@@ -691,11 +852,15 @@ const SETTINGS_CSS: &str = r#"
 .dbdeck-settings .settings-preview.tokyo-night { background: #1a1b26; color: #c0caf5; border-color: #414868; }
 .dbdeck-settings .settings-preview.mocha { background: #11111b; color: #cdd6f4; }
 .dbdeck-settings .settings-preview.graphite { background: #111923; color: #d7e1eb; }
+.dbdeck-settings .settings-preview.gruvbox { background: #282828; color: #ebdbb2; border-color: #665c54; }
+.dbdeck-settings .settings-preview.nord { background: #2e3440; color: #d8dee9; border-color: #4c566a; }
+.dbdeck-settings .settings-preview.rose-pine { background: #191724; color: #e0def4; border-color: #524f67; }
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::noctalia::{Rgb, contrast};
 
     #[test]
     fn theme_ids_and_preferences_roundtrip() {
@@ -704,6 +869,10 @@ mod tests {
             ThemeMode::TokyoNight,
             ThemeMode::Dark,
             ThemeMode::CatppuccinMocha,
+            ThemeMode::GruvboxDark,
+            ThemeMode::Nord,
+            ThemeMode::RosePine,
+            ThemeMode::Noctalia,
         ] {
             assert_eq!(ThemeMode::from_id(Some(mode.id())), mode);
             let json = serde_json::to_string(&ThemePreferences { mode }).unwrap();
@@ -719,12 +888,143 @@ mod tests {
             ThemeMode::CatppuccinMocha
         );
         assert_eq!(ThemeMode::from_id(None), ThemeMode::CatppuccinMocha);
+        assert_eq!(
+            ThemeMode::from_id(Some("unknown")),
+            ThemeMode::CatppuccinMocha
+        );
+    }
+
+    #[test]
+    fn stored_ids_from_older_versions_keep_their_meaning() {
+        for (id, expected) in [
+            ("dark", ThemeMode::Dark),
+            ("tokyo_night", ThemeMode::TokyoNight),
+            ("light", ThemeMode::CatppuccinMocha),
+            ("system", ThemeMode::System),
+            ("noctalia", ThemeMode::Noctalia),
+        ] {
+            assert_eq!(ThemeMode::from_id(Some(id)), expected, "from_id {id}");
+            let json = format!(r#"{{"mode":"{id}"}}"#);
+            let prefs: ThemePreferences = serde_json::from_str(&json).unwrap();
+            assert_eq!(prefs.mode, expected, "serde {id}");
+        }
+    }
+
+    fn rgb(value: &str) -> Rgb {
+        Rgb::parse(value).unwrap_or_else(|| panic!("invalid color {value}"))
+    }
+
+    fn contrast_of(a: &str, b: &str) -> f64 {
+        contrast(rgb(a), rgb(b))
+    }
+
+    /// Текст - 4.5, элементы интерфейса - 3.0. Пары из `layout.css`: вкладки на фоне
+    /// панели, hover как `alpha(fg, 0.08)` поверх панели, активная вкладка на selection
+    /// с акцентной полосой, бейджи на панели.
+    fn assert_palette_contrast(name: &str, p: &Palette) {
+        let hover = rgb(&p.panel).mix(rgb(&p.fg), 0.08);
+        // Subtitle opacity is part of the rendered contrast, not just the palette.
+        let css = include_str!("../assets/themes/layout.css");
+        let subtitle = css
+            .split("label.tab-strip-subtitle {")
+            .nth(1)
+            .unwrap()
+            .split('}')
+            .next()
+            .unwrap();
+        let opacity: f64 = subtitle
+            .split("opacity:")
+            .nth(1)
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let rendered_subtitle = rgb(&p.panel).mix(rgb(&p.muted), opacity);
+        assert!(
+            contrast(rendered_subtitle, rgb(&p.panel)) >= 4.5,
+            "{name}: rendered tab subtitle"
+        );
+        for (pair, ratio, min) in [
+            ("fg/bg", contrast_of(&p.fg, &p.bg), 4.5),
+            ("fg/panel", contrast_of(&p.fg, &p.panel), 4.5),
+            ("fg/selection", contrast_of(&p.fg, &p.selection), 4.5),
+            ("fg/hover", contrast(rgb(&p.fg), hover), 4.5),
+            ("muted/bg", contrast_of(&p.muted, &p.bg), 4.5),
+            ("muted/panel", contrast_of(&p.muted, &p.panel), 4.5),
+            ("accent/bg", contrast_of(&p.accent, &p.bg), 3.0),
+            ("accent/panel", contrast_of(&p.accent, &p.panel), 3.0),
+            (
+                "accent/selection",
+                contrast_of(&p.accent, &p.selection),
+                3.0,
+            ),
+            ("error/bg", contrast_of(&p.error, &p.bg), 3.0),
+            ("warning/bg", contrast_of(&p.warning, &p.bg), 3.0),
+            ("success/bg", contrast_of(&p.success, &p.bg), 3.0),
+        ] {
+            assert!(ratio >= min, "{name} {pair}: {ratio:.2} < {min}");
+        }
+    }
+
+    #[test]
+    fn dark_palettes_meet_wcag_aa_contrast() {
+        for (name, mode) in [
+            ("dark", ThemeMode::Dark),
+            ("tokyo_night", ThemeMode::TokyoNight),
+            ("catppuccin_mocha", ThemeMode::CatppuccinMocha),
+            ("gruvbox_dark", ThemeMode::GruvboxDark),
+            ("nord", ThemeMode::Nord),
+            ("rose_pine", ThemeMode::RosePine),
+        ] {
+            assert_palette_contrast(name, &palette(mode));
+        }
+    }
+
+    #[test]
+    fn preset_css_and_schemes_use_only_their_own_palette() {
+        let tokyo_only = ["#1a1b26", "#7aa2f7", "#4fc4bb"];
+        for (mode, skin) in [
+            (ThemeMode::GruvboxDark, GRUVBOX_DARK),
+            (ThemeMode::Nord, NORD),
+            (ThemeMode::RosePine, ROSE_PINE),
+        ] {
+            let css = skin.css("test");
+            let xml = skin.scheme_xml("dbdeck-test");
+            let p = palette(mode);
+            assert!(css.contains(&format!("@define-color accent_color {};", p.accent)));
+            assert!(xml.contains(&format!("background=\"{}\"", p.bg)));
+            for old in tokyo_only {
+                assert!(!css.contains(old) && !xml.contains(old), "{mode:?}: {old}");
+            }
+        }
+    }
+
+    #[test]
+    fn noctalia_fallback_palette_meets_wcag_aa_contrast() {
+        assert_palette_contrast(
+            "noctalia_fallback",
+            &crate::noctalia::Theme::fallback().palette(),
+        );
+    }
+
+    #[test]
+    fn noctalia_example_palette_meets_wcag_aa_contrast() {
+        let colors = crate::noctalia::parse_colors(
+            r##"{"mPrimary":"#cba6f7","mSecondary":"#a6c8ff","mTertiary":"#f5c2e7","mError":"#f38ba8","mSurface":"#1c1b22","mOnSurface":"#e6e1ea","mSurfaceVariant":"#2a2831","mOnSurfaceVariant":"#cac4d0","mOutline":"#49454f","mHover":"#3a3745"}"##,
+        )
+        .unwrap();
+        let theme = crate::noctalia::Theme::from_colors(&colors);
+        assert_palette_contrast("noctalia_example", &theme.palette());
     }
 }
 
 const THEMED_ICONS_CSS: &str = r#"
 notebook.workspace-tabs > header.top > tabs > tab:checked { box-shadow: inset 0 0 0 1px @accent_color; }
 button:hover image { color: @accent_color; }
+button.suggested-action:hover image { color: inherit; }
 image.penpot-icon.icon-muted { color: @dbdeck_fg; }
 image.penpot-icon.icon-accent { color: @accent_color; }
 image.penpot-icon.icon-disabled { color: @dbdeck_muted; opacity: 0.45; }

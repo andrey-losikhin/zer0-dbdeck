@@ -7,10 +7,9 @@ const COMMANDS: &[(&str, &str)] = &[
     ("<Control>w", "Закрыть текущую вкладку"),
     ("<Control>Tab", "Следующая вкладка"),
     ("<Control><Shift>Tab", "Предыдущая вкладка"),
-    (
-        "<Control><Alt>Page_Down",
-        "Следующее подключение (Page Up — предыдущее)",
-    ),
+    ("<Control><Alt>Page_Down", "Следующее подключение"),
+    ("<Control><Alt>Page_Up", "Предыдущее подключение"),
+    ("<Control>b", "Свернуть / раскрыть боковую панель"),
     ("<Alt>1", "Подключения"),
     ("<Alt>2", "Таблицы"),
     ("<Control>comma", "Настройки"),
@@ -21,7 +20,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("<Control><Shift>i", "Импорт SQL / восстановление БД"),
     ("<Control><Alt>i", "Импорт CSV в таблицу"),
     ("<Alt>d", "Выбрать БД в карточке подключения"),
-    ("<Control><Shift>x", "Отменить экспорт / бэкап / импорт"),
+    ("<Control><Shift>x", "Отменить текущую файловую операцию"),
     ("<Control>1", "Фокус на SQL-редакторе / таблице"),
     ("<Control>2", "Фокус на результате SQL"),
     ("<Control>3", "Фокус на фильтрах таблицы"),
@@ -47,6 +46,8 @@ const COMMANDS: &[(&str, &str)] = &[
         "Отменить правки таблицы / результата SQL",
     ),
     ("<Control>o", "Открыть SQL-файл"),
+    ("<Control><Shift>f", "Форматировать SQL"),
+    ("<Control><Shift>g", "План запроса (EXPLAIN)"),
     ("<Control><Shift>r", "Переименовать SQL-запрос"),
     ("<Control><Shift>o", "Папка SQL-запросов"),
     ("<Control><Shift>e", "Экспорт показанных строк CSV"),
@@ -185,6 +186,7 @@ fn active_key(ui: &Ui) -> Option<String> {
 
 fn focus_filter(ui: &Ui, key: &str) {
     if let Some(panel) = ui.table_filter_panels.borrow().get(key) {
+        panel.toggle.set_active(true);
         if panel.sql_mode.is_active() {
             panel.raw.grab_focus();
         } else if let Some(row) = panel.controls.borrow().first() {
@@ -286,6 +288,161 @@ pub(super) fn help(ui: &Ui) {
     search.grab_focus();
 }
 
+// The shortcut help also lists bindings owned by individual dialogs.
+fn palette_commands(
+    ui: &Ui,
+    active: Option<&str>,
+    result_focus: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let profile = ui.current_profile.borrow();
+    let connected = profile.is_some();
+    let writable = profile.as_ref().is_some_and(|profile| !profile.read_only);
+    let tabs = ui.sql_tabs.borrow();
+    let sql = active.and_then(|key| tabs.get(key));
+    let table = active.filter(|key| sql.is_none() && ui.table_objects.borrow().contains_key(*key));
+    let panels = ui.table_filter_panels.borrow();
+    let filter = table.and_then(|key| panels.get(key));
+    let edit_key = active.map(|key| {
+        if sql.is_some() {
+            format!("sql::{key}")
+        } else {
+            key.to_owned()
+        }
+    });
+    let edits = ui.table_edit_states.borrow();
+    let edit = edit_key.as_ref().and_then(|key| edits.get(key));
+    let can_save = edit.is_some_and(|edit| edit.save_button.is_sensitive());
+    let can_discard = edit.is_some_and(|edit| edit.discard_button.is_sensitive());
+    let edits_pending = edit.is_some_and(|edit| {
+        edit.saving.get() || edit.grid_editing.get() || !edit.pending.borrow().is_empty()
+    });
+    let sql_idle = !edits_pending && sql.is_some_and(|tab| tab.run_button.is_sensitive());
+    let can_run_sql = sql_idle
+        && sql.is_some_and(|tab| {
+            let (start, end) = tab.buffer.bounds();
+            !tab.buffer.text(&start, &end, true).trim().is_empty()
+        });
+    let can_reload_table = table.is_some()
+        && !edits_pending
+        && !edit.is_some_and(|edit| edit.bulk_column.borrow().is_some());
+    let table_loaded = table.is_some_and(|key| ui.table_data.borrow().contains_key(key));
+    let grid = table.is_some_and(|key| ui.tabulator_grids.borrow().contains_key(key));
+    let transfer_idle = ui.transfer_cancel.borrow().is_none();
+    let structure = profile.as_ref().is_some_and(|profile| {
+        let session = profile_session_key(profile);
+        ui.active_table_by_session
+            .borrow()
+            .get(&workspace_ui::active(ui, &session))
+            .is_some_and(|key| ui.table_objects.borrow().contains_key(key))
+    });
+
+    COMMANDS
+        .iter()
+        .filter_map(|&(accelerator, title)| {
+            let title = match accelerator {
+                "<Control><Shift>p" | "<Alt>d" => return None,
+                "<Control>t" | "<Alt>2" | "<Control><Shift>l" if !connected => return None,
+                "<Control>w" if active.is_none() => return None,
+                "<Control>Tab" | "<Control><Shift>Tab"
+                    if notebook(ui).is_none_or(|tabs| tabs.n_pages() < 2) =>
+                {
+                    return None;
+                }
+                "<Control><Alt>Page_Down" | "<Control><Alt>Page_Up"
+                    if ui.session_tabs.n_pages() < 2 =>
+                {
+                    return None;
+                }
+                "<Control><Shift>d" if !structure => return None,
+                "<Control><Shift>b" | "<Control><Alt><Shift>b" if !connected || !transfer_idle => {
+                    return None;
+                }
+                "<Control><Shift>i" | "<Control><Alt>i" if !writable || !transfer_idle => {
+                    return None;
+                }
+                "<Control><Shift>x" if !ui.background_tasks.can_cancel(TRANSFER) => {
+                    return None;
+                }
+                "<Control>1" if sql.is_some() => "Фокус на SQL-редакторе",
+                "<Control>1" if grid => "Фокус на таблице",
+                "<Control>1" => return None,
+                "<Control>2" if sql.and_then(SqlTab::result_focus_widget).is_none() => return None,
+                "<Control>3" | "<Control>l" | "<Control><Alt>l" if filter.is_none() => return None,
+                "<Control><Shift>plus" if !filter.is_some_and(|panel| panel.add.is_sensitive()) => {
+                    return None;
+                }
+                "<Control><Shift>BackSpace"
+                    if !filter.is_some_and(|panel| panel.clear.is_sensitive()) =>
+                {
+                    return None;
+                }
+                "<Control>Return" if can_run_sql => "Выполнить SQL",
+                "<Control>Return"
+                    if can_reload_table
+                        && filter.is_some_and(|panel| panel.apply.is_sensitive()) =>
+                {
+                    "Применить фильтр"
+                }
+                "<Control>Return" => return None,
+                "<Control><Shift>Return" if !can_run_sql || !writable => return None,
+                "<Control><Shift>g" if !can_run_sql => return None,
+                // Ctrl+R repeats Ctrl+Enter in SQL tabs.
+                "<Control>r" if can_reload_table => "Обновить таблицу",
+                "<Control>r" => return None,
+                "<Control><Shift>period"
+                    if !sql.is_some_and(|tab| tab.stop_button.is_sensitive()) =>
+                {
+                    return None;
+                }
+                "<Control><Alt><Shift>r" | "<Control><Alt>t" if !sql_idle => return None,
+                "<Control><Alt>Return" | "<Control><Alt>r"
+                    if !sql_idle || !sql.is_some_and(|tab| tab.transaction_state.pending) =>
+                {
+                    return None;
+                }
+                "<Control>s" if result_focus && can_save => "Сохранить изменения результата SQL",
+                "<Control>s" if sql.is_some() && !result_focus => "Сохранить SQL",
+                "<Control>s" if table.is_some() && can_save => "Сохранить изменения таблицы",
+                "<Control>s" => return None,
+                "<Control><Alt>BackSpace" if result_focus && can_discard => {
+                    "Отменить правки результата SQL"
+                }
+                "<Control><Alt>BackSpace" if table.is_some() && can_discard => {
+                    "Отменить правки таблицы"
+                }
+                "<Control><Alt>BackSpace" => return None,
+                "<Control>o" | "<Control><Shift>f" | "<Control><Shift>r" | "<Control><Shift>o"
+                | "<Control>period"
+                    if sql.is_none() =>
+                {
+                    return None;
+                }
+                "<Control><Shift>e" if !transfer_idle => return None,
+                "<Control><Shift>e" if sql.is_some_and(|tab| tab.export_button.is_sensitive()) => {
+                    "Экспорт результата SQL в CSV"
+                }
+                "<Control><Shift>e" if !table_loaded => return None,
+                "<Control><Alt>e" if !table_loaded || !transfer_idle || filter.is_none() => {
+                    return None;
+                }
+                _ => title,
+            };
+            Some((accelerator, title))
+        })
+        .collect()
+}
+
+fn sql_result_focused(ui: &Ui, id: &str) -> bool {
+    ui.sql_tabs
+        .borrow()
+        .get(id)
+        .and_then(SqlTab::result_focus_widget)
+        .is_some_and(|result| {
+            gtk::prelude::RootExt::focus(&ui.window)
+                .is_some_and(|focus| focus == *result || focus.is_ancestor(result))
+        })
+}
+
 pub(super) fn palette(ui: &Rc<Ui>) {
     let window = adw::Window::builder()
         .title("Палитра команд")
@@ -308,12 +465,30 @@ pub(super) fn palette(ui: &Rc<Ui>) {
     list.set_widget_name("command-list");
     list.set_selection_mode(gtk::SelectionMode::Single);
     list.add_css_class("boxed-list");
-    let commands: Vec<_> = COMMANDS
-        .iter()
-        .copied()
-        .filter(|(key, _)| *key != "<Control><Shift>p")
-        .collect();
-    for (accelerator, description) in &commands {
+    let empty = gtk::Label::new(Some("Команды не найдены"));
+    empty.set_margin_top(16);
+    empty.add_css_class("dim-label");
+    list.set_placeholder(Some(&empty));
+    let target = active_key(ui);
+    let session = ui
+        .current_profile
+        .borrow()
+        .as_ref()
+        .map(profile_session_key);
+    let pool_for = |ui: &Ui, key: Option<&str>| {
+        key.and_then(|key| ui.sessions.borrow().get(key).map(|(_, pool)| pool.clone()))
+    };
+    let sql_session_for = |ui: &Ui, key: Option<&str>| {
+        key.and_then(|key| ui.sql_tabs.borrow().get(key).map(|tab| tab.session.clone()))
+    };
+    let pool = pool_for(ui, session.as_deref());
+    let sql_session = sql_session_for(ui, target.as_deref());
+    let result_focus = target
+        .as_deref()
+        .is_some_and(|id| sql_result_focused(ui, id));
+    let commands = palette_commands(ui, target.as_deref(), result_focus);
+    let mut searchable = Vec::with_capacity(commands.len());
+    for &(accelerator, description) in &commands {
         let row = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row.set_margin_top(8);
         row.set_margin_bottom(8);
@@ -321,75 +496,127 @@ pub(super) fn palette(ui: &Rc<Ui>) {
         row.set_margin_end(8);
         let label = gtk::Label::new(Some(description));
         label.set_xalign(0.0);
+        label.set_wrap(true);
         label.set_hexpand(true);
         row.append(&label);
         row.append(&gtk::ShortcutLabel::new(accelerator));
         list.append(&row);
+        let (key, modifiers) = gtk::accelerator_parse(accelerator).unwrap();
+        searchable.push(
+            format!(
+                "{description} {}",
+                gtk::accelerator_get_label(key, modifiers)
+            )
+            .to_lowercase(),
+        );
     }
     list.select_row(list.row_at_index(0).as_ref());
     let weak_ui = Rc::downgrade(ui);
     let weak_window = window.downgrade();
-    let commands = Rc::new(commands);
-    let invoke: Rc<dyn Fn(i32)> = Rc::new(move |index| {
-        let Some((accelerator, _)) = commands.get(index as usize) else {
+    let invoke = Rc::new(move |row: &gtk::ListBoxRow| {
+        let Some(&command) = commands
+            .get(row.index() as usize)
+            .filter(|_| row.is_visible())
+        else {
             return;
         };
-        if let Some(window) = weak_window.upgrade() {
-            window.close();
+        let (Some(ui), Some(window)) = (weak_ui.upgrade(), weak_window.upgrade()) else {
+            return;
+        };
+        if !window.is_visible() {
+            return;
         }
-        if let Some(ui) = weak_ui.upgrade() {
-            if let Some((key, modifiers)) = gtk::accelerator_parse(*accelerator) {
-                dispatch(&ui, key, modifiers);
-            }
+        let current_session = ui
+            .current_profile
+            .borrow()
+            .as_ref()
+            .map(profile_session_key);
+        let current_target = active_key(&ui);
+        let same_pool = match (&pool, pool_for(&ui, current_session.as_deref())) {
+            (Some(previous), Some(current)) => previous.same_pool(&current),
+            (None, None) => true,
+            _ => false,
+        };
+        let current_sql = sql_session_for(&ui, current_target.as_deref());
+        if current_session != session
+            || current_target != target
+            || !same_pool
+            || sql_session.as_ref().map(sql_session::SqlSession::identity)
+                != current_sql.as_ref().map(sql_session::SqlSession::identity)
+            || !palette_commands(&ui, target.as_deref(), result_focus).contains(&command)
+        {
+            window.close();
+            ui.status
+                .set_text("Команда больше недоступна. Откройте палитру снова.");
+            return;
+        }
+        window.close();
+        if let Some((key, modifiers)) = gtk::accelerator_parse(command.0) {
+            dispatch_with_focus(&ui, key, modifiers, Some(result_focus));
         }
     });
     let selected = invoke.clone();
-    list.connect_row_activated(move |_, row| selected(row.index()));
+    list.connect_row_activated(move |_, row| selected(row));
     let selected_list = list.clone();
     search.connect_activate(move |_| {
         if let Some(row) = selected_list.selected_row() {
-            if row.is_visible() {
-                invoke(row.index());
-            }
+            invoke(&row);
         }
     });
-    let filtered = list.clone();
-    search.connect_search_changed(move |search| {
-        let query = search.text().to_lowercase();
-        let mut first = None;
-        let mut index = 0;
-        while let Some(row) = filtered.row_at_index(index) {
-            let title = row
-                .child()
-                .and_then(|w| w.first_child())
-                .and_then(|w| w.downcast::<gtk::Label>().ok())
-                .map(|l| l.text().to_lowercase())
-                .unwrap_or_default();
-            row.set_visible(title.contains(&query));
-            if row.is_visible() && first.is_none() {
-                first = Some(row);
-            }
-            index += 1;
-        }
-        filtered.select_row(first.as_ref());
-    });
-    let keys = gtk::EventControllerKey::new();
-    let focused_list = list.clone();
-    keys.connect_key_pressed(move |_, key, _, modifiers| {
-        if key == gtk::gdk::Key::Down && modifiers.is_empty() {
-            if let Some(row) = focused_list.selected_row() {
-                row.grab_focus();
-            }
-            return gtk::glib::Propagation::Stop;
-        }
-        gtk::glib::Propagation::Proceed
-    });
-    search.add_controller(keys);
-    content.append(&search);
     let scroll = gtk::ScrolledWindow::builder()
+        .hscrollbar_policy(gtk::PolicyType::Never)
         .vexpand(true)
         .child(&list)
         .build();
+    let adjustment = scroll.vadjustment();
+    let filtered = list.clone();
+    let position = adjustment.clone();
+    search.connect_changed(move |search| {
+        let query = search.text().to_lowercase();
+        let mut first = None;
+        for (index, command) in searchable.iter().enumerate() {
+            let row = filtered.row_at_index(index as i32).unwrap();
+            let visible = query.split_whitespace().all(|word| command.contains(word));
+            row.set_visible(visible);
+            if visible && first.is_none() {
+                first = Some(row);
+            }
+        }
+        filtered.select_row(first.as_ref());
+        position.set_value(position.lower());
+    });
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    let focused_list = list.clone();
+    keys.connect_key_pressed(move |_, key, _, modifiers| {
+        let step = match key {
+            gtk::gdk::Key::Down => 1,
+            gtk::gdk::Key::Up => -1,
+            _ => return gtk::glib::Propagation::Proceed,
+        };
+        if !modifiers
+            .difference(gtk::gdk::ModifierType::LOCK_MASK)
+            .is_empty()
+        {
+            return gtk::glib::Propagation::Proceed;
+        }
+        let mut index = focused_list.selected_row().map_or(-1, |row| row.index()) + step;
+        while let Some(row) = focused_list.row_at_index(index) {
+            if row.is_visible() {
+                focused_list.select_row(Some(&row));
+                let bounds = row.allocation();
+                adjustment.clamp_page(
+                    f64::from(bounds.y()),
+                    f64::from(bounds.y() + bounds.height()),
+                );
+                break;
+            }
+            index += step;
+        }
+        gtk::glib::Propagation::Stop
+    });
+    search.add_controller(keys);
+    content.append(&search);
     content.append(&scroll);
     window.set_content(Some(&content));
     window.present();
@@ -435,9 +662,18 @@ pub(super) fn install(ui: &Rc<Ui>) {
 }
 
 pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::ModifierType) -> bool {
+    dispatch_with_focus(ui, key, state, None)
+}
+
+fn dispatch_with_focus(
+    ui: &Rc<Ui>,
+    key: gtk::gdk::Key,
+    state: gtk::gdk::ModifierType,
+    result_focus: Option<bool>,
+) -> bool {
     if matches("<Control><Shift>Return", key, state) {
         if let Some(id) = active_key(ui).filter(|id| ui.sql_tabs.borrow().contains_key(id)) {
-            run_sql_tab_policy(ui, &id, None, false, true);
+            run_sql_tab_policy(ui, &id, None, false, SqlRunMode::Write);
         }
         return true;
     }
@@ -454,9 +690,7 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         return true;
     }
     if matches("<Control><Shift>x", key, state) {
-        if ui.transfer_cancel_button.is_visible() {
-            ui.transfer_cancel_button.emit_clicked();
-        }
+        cancel_transfer(ui);
         return true;
     }
     if matches("<Control><Shift>b", key, state) || matches("<Control><Alt><Shift>b", key, state) {
@@ -475,6 +709,10 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
     }
 
     let is = |accelerator| matches(accelerator, key, state);
+    if is("<Control>b") {
+        ui.sidebar_toggle.set_active(!ui.sidebar_toggle.is_active());
+        return true;
+    }
     if is("<Alt>m") {
         ui.application_menu.popup();
         return true;
@@ -567,8 +805,8 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         } else if let Some(tab) = ui.sql_tabs.borrow().get(&active) {
             if is("<Control>1") {
                 tab.editor.grab_focus();
-            } else {
-                tab.tabulator.webview.grab_focus();
+            } else if let Some(result) = tab.result_focus_widget() {
+                result.grab_focus();
             }
         } else if let Some(grid) = ui.tabulator_grids.borrow().get(&active) {
             grid.webview.grab_focus();
@@ -576,8 +814,12 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         return true;
     }
     if sql {
+        if is("<Control><Shift>g") {
+            explain_sql_tab(ui, &active);
+            return true;
+        }
         if is("<Control><Shift>period") {
-            stop_sql_tab(ui, &active);
+            stop_sql_tab(ui, &active, None);
             return true;
         }
         if is("<Control><Alt><Shift>r") {
@@ -623,15 +865,9 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         }
         return true;
     }
-    let result_focus = sql
-        && ui.sql_tabs.borrow().get(&active).is_some_and(|tab| {
-            gtk::prelude::RootExt::focus(&ui.window).is_some_and(|focus| {
-                focus == tab.tabulator.webview.clone().upcast::<gtk::Widget>()
-                    || focus.is_ancestor(&tab.tabulator.webview)
-            })
-        });
+    let result_focus = || sql && result_focus.unwrap_or_else(|| sql_result_focused(ui, &active));
     if is("<Control>s") {
-        if result_focus {
+        if result_focus() {
             if let Some(tab) = ui.sql_tabs.borrow().get(&active) {
                 tab.tabulator.finish_edit(false);
             }
@@ -642,8 +878,10 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         }
         return true;
     }
-    if is("<Control><Alt>BackSpace") && (!sql || result_focus) {
-        if let Some(grid) = ui.tabulator_grids.borrow().get(&active).cloned() {
+    if is("<Control><Alt>BackSpace") && (!sql || result_focus()) {
+        if let Some(tab) = ui.sql_tabs.borrow().get(&active) {
+            tab.tabulator.finish_edit(true);
+        } else if let Some(grid) = ui.tabulator_grids.borrow().get(&active).cloned() {
             grid.finish_edit(true);
         }
         return true;
@@ -672,6 +910,11 @@ pub(super) fn dispatch(ui: &Rc<Ui>, key: gtk::gdk::Key, state: gtk::gdk::Modifie
         return true;
     }
     if sql {
+        if is("<Control><Shift>f") {
+            let button = ui.sql_tabs.borrow()[&active].format_button.clone();
+            button.emit_clicked();
+            return true;
+        }
         if is("<Control>o") {
             choose_sql_open(ui, &active);
             return true;

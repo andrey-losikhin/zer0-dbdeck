@@ -9,7 +9,7 @@ pub(super) fn install(
 ) {
     let button = gtk::MenuButton::new();
     button.set_icon_name("view-more-symbolic");
-    button.set_tooltip_text(Some("Структура и резервная копия БД (Menu)"));
+    button.set_tooltip_text(Some("Действия с подключением (Menu)"));
     button.add_css_class("flat");
     let popover = gtk::Popover::new();
     popover.set_autohide(true);
@@ -68,6 +68,42 @@ pub(super) fn install(
         }
     });
     shortcuts::button(card, &csv, "<Alt><Shift>i");
+    content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
+    let duplicate = sql_menu_action(
+        &content,
+        &popover,
+        "Дублировать подключение",
+        "edit-copy-symbolic",
+    );
+    let owner = Rc::downgrade(ui);
+    let source = profile.clone();
+    duplicate.connect_clicked(move |_| {
+        if let Some(ui) = owner.upgrade() {
+            let after_unlock = ui.clone();
+            let source = source.clone();
+            ensure_vault_unlocked(&ui, move || duplicate_profile(&after_unlock, &source));
+        }
+    });
+    let delete = sql_menu_action(
+        &content,
+        &popover,
+        "Удалить подключение…",
+        "user-trash-symbolic",
+    );
+    let owner = Rc::downgrade(ui);
+    let profile_id = profile.id.clone();
+    let profile_name = profile.name.clone();
+    delete.connect_clicked(move |_| {
+        if let Some(ui) = owner.upgrade() {
+            let after_unlock = ui.clone();
+            let profile_id = profile_id.clone();
+            let profile_name = profile_name.clone();
+            ensure_vault_unlocked(&ui, move || {
+                show_delete_profile_dialog(&after_unlock, &profile_id, &profile_name)
+            });
+        }
+    });
+    shortcuts::button(card, &delete, "<Alt>Delete");
     popover.set_child(Some(&content));
     button.set_popover(Some(&popover));
     actions.append(&button);
@@ -169,7 +205,7 @@ fn choose_unlocked(ui: &Rc<Ui>, profile: &ConnectionProfile, mode: DumpMode) {
                 return;
             }
         };
-        let Some(cancel) = start_transfer(&ui) else {
+        let Some(cancel) = start_transfer(&ui, mode.title(), &path) else {
             return;
         };
         ui.status
@@ -309,7 +345,7 @@ fn start_import(ui: &Rc<Ui>, profile: ConnectionProfile, path: PathBuf) {
             return;
         }
     };
-    let Some(cancel) = start_transfer(&ui) else {
+    let Some(cancel) = start_transfer(ui, "Восстановление БД", &path) else {
         return;
     };
     ui.status.set_text(&format!(

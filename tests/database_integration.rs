@@ -162,12 +162,14 @@ fn run_case(id: &str, kind: DatabaseKind, port: u16, password_key: &str) {
         assert_eq!(page.rows, filtered.rows[2..]);
         assert!(pool.read_table_view_with_condition(&raw_object, &[], Some("id ="), None, 0).await.is_err());
         pool.read_table(&raw_object).await.expect("connection usable after SQL error/rollback");
+        check_browse_continuation(&pool, &raw_object).await;
+        let typed_object = DbObject {
+            schema: expected_schema.to_owned(),
+            name: "typed_values".to_owned(),
+            kind: DbObjectKind::Table,
+        };
         let typed = pool
-            .read_table(&DbObject {
-                schema: expected_schema.to_owned(),
-                name: "typed_values".to_owned(),
-                kind: DbObjectKind::Table,
-            })
+            .read_table(&typed_object)
             .await
             .unwrap_or_else(|error| panic!("{id} read typed fixture failed: {error}"));
         assert!(
@@ -198,7 +200,233 @@ fn run_case(id: &str, kind: DatabaseKind, port: u16, password_key: &str) {
         assert!(typed.rows.iter().any(|row| {
             matches!(&row[8], CellValue::Truncated(value) if value.len() >= 1024)
         }));
+        let row = typed.rows.iter().find(|row| row[0] == CellValue::Text("4".to_owned())).unwrap();
+        let key = typed.cell_detail_key(row).unwrap();
+        assert_eq!(
+            pool.read_table_cell(&typed_object, "optional_text", &key)
+                .await
+                .unwrap(),
+            CellValue::Text("длинный-текст-".repeat(120))
+        );
+        let binary = pool.read_table_cell(&typed_object, "payload", &key).await.unwrap();
+        assert!(matches!(binary, CellValue::Text(value) if value.eq_ignore_ascii_case("0xdeadbeef")));
+        let mut missing = key.clone();
+        missing[0].1 = "0".to_owned();
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &missing).await.is_err());
+        let mut stale_key = key.clone();
+        stale_key[0].0.name = "label".to_owned();
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_key).await.is_err());
+        let mut stale_type = key;
+        stale_type[0].0.key_type = "old type".to_owned();
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_type).await.is_err());
+
+        if let DbPool::PostgreSql(pool) = &pool {
+            check_cell_detail_bounds(pool.connect_options().as_ref().clone()).await;
+        }
     });
+}
+
+async fn check_browse_continuation(pool: &DbPool, object: &DbObject) {
+    use database::{FilterLogic, FilterOperator, TableFilter, TableSort, TableViewState};
+
+    for (column, descending) in [("id", false), ("id", true), ("name", false)] {
+        let view = TableViewState {
+            filters: [
+                (FilterLogic::And, FilterOperator::Less, "5"),
+                (FilterLogic::Or, FilterOperator::Greater, "8"),
+            ]
+            .into_iter()
+            .map(|(logic, operator, value)| TableFilter {
+                column: "id".to_owned(),
+                logic,
+                operator,
+                value: value.to_owned(),
+            })
+            .collect(),
+            sort: Some(TableSort {
+                column: column.to_owned(),
+                descending,
+            }),
+            ..Default::default()
+        };
+        let reference = pool
+            .read_table_view(object, &view.filters, view.sort.as_ref(), 0)
+            .await
+            .unwrap();
+        assert!(reference.rows.len() > 5);
+        let mut current = reference.clone();
+        current.rows.truncate(5);
+        if column == "id" {
+            // Removing rows from the client snapshot must not move the continuation.
+            current.rows.drain(..2);
+        }
+        let page = pool
+            .read_next_table_page(object, &view, &current)
+            .await
+            .unwrap();
+        assert_eq!(
+            page.rows,
+            reference.rows[5..],
+            "sort {column} DESC={descending}"
+        );
+        assert!(!page.truncated);
+
+        current.cell_detail_key_columns[0]
+            .key_type
+            .push_str(" old type");
+        assert!(
+            pool.read_next_table_page(object, &view, &current)
+                .await
+                .is_err()
+        );
+    }
+}
+
+async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        r#"CREATE TEMP TABLE cell_detail ("part""a" text, part_b bytea, body text, bytes bytea, PRIMARY KEY ("part""a", part_b));
+           INSERT INTO cell_detail VALUES ('x', decode('1a', 'hex'), NULL, NULL),
+               ('x', decode('1b', 'hex'), repeat('🦉', 16385), decode(repeat('ab', 8192), 'hex'));"#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let schema = sqlx::query_scalar("SELECT pg_my_temp_schema()::regnamespace::text")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let object = DbObject {
+        schema,
+        name: "cell_detail".to_owned(),
+        kind: DbObjectKind::Table,
+    };
+    let database = DbPool::PostgreSql(pool.clone());
+    let data = database.read_table(&object).await.unwrap();
+    let row = data
+        .rows
+        .iter()
+        .find(|row| row[1] == CellValue::Text("0x1b".to_owned()))
+        .unwrap();
+    let mut key = data.cell_detail_key(row).unwrap();
+    assert_eq!(
+        database
+            .read_table_cell(&object, "body", &key)
+            .await
+            .unwrap(),
+        CellValue::Truncated("🦉".repeat(database::MAX_CELL_DETAIL_CHARS)),
+    );
+    assert_eq!(
+        database
+            .read_table_cell(&object, "bytes", &key)
+            .await
+            .unwrap(),
+        CellValue::Truncated(format!(
+            "0x{}",
+            "ab".repeat((database::MAX_CELL_DETAIL_CHARS - 2) / 2)
+        )),
+    );
+    key[1].1 = "0x1a".to_owned();
+    assert_eq!(
+        database
+            .read_table_cell(&object, "body", &key)
+            .await
+            .unwrap(),
+        CellValue::Null
+    );
+    sqlx::query("CREATE TEMP TABLE cell_detail_child () INHERITS (cell_detail)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        database
+            .read_table_cell(&object, "body", &key)
+            .await
+            .is_err()
+    );
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE cell_detail_partitioned (id int PRIMARY KEY, body text) PARTITION BY RANGE (id);
+         CREATE TEMP TABLE cell_detail_partition PARTITION OF cell_detail_partitioned FOR VALUES FROM (0) TO (10);
+         INSERT INTO cell_detail_partitioned VALUES (1, 'partition value');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    check_postgres_page_keys(&pool, &object.schema).await;
+    let partitioned = DbObject {
+        name: "cell_detail_partitioned".to_owned(),
+        ..object
+    };
+    let data = database.read_table(&partitioned).await.unwrap();
+    let key = data.cell_detail_key(&data.rows[0]).unwrap();
+    assert_eq!(
+        database
+            .read_table_cell(&partitioned, "body", &key)
+            .await
+            .unwrap(),
+        CellValue::Text("partition value".to_owned()),
+    );
+}
+
+async fn check_postgres_page_keys(pool: &sqlx::PgPool, schema: &str) {
+    sqlx::raw_sql(
+        "CREATE TEMP TABLE inherited_page (id int PRIMARY KEY);
+         CREATE TEMP TABLE child_page () INHERITS (inherited_page);
+         INSERT INTO inherited_page VALUES (1);
+         INSERT INTO child_page SELECT 1 FROM generate_series(1, 200);
+         INSERT INTO child_page VALUES (2);
+         CREATE TEMP TABLE uuid_page (id uuid PRIMARY KEY) PARTITION BY RANGE (id);
+         CREATE TEMP TABLE uuid_page_first PARTITION OF uuid_page
+             FOR VALUES FROM (MINVALUE) TO ('00000000-0000-0000-0000-0000000000c9');
+         CREATE TEMP TABLE uuid_page_rest PARTITION OF uuid_page
+             FOR VALUES FROM ('00000000-0000-0000-0000-0000000000c9') TO (MAXVALUE);
+         INSERT INTO uuid_page SELECT lpad(to_hex(n), 32, '0')::uuid
+             FROM generate_series(1, 260) AS n;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    let database = DbPool::PostgreSql(pool.clone());
+    let mut object = DbObject {
+        schema: schema.to_owned(),
+        name: "inherited_page".to_owned(),
+        kind: DbObjectKind::Table,
+    };
+    let view = database::TableViewState::default();
+    let first = database.read_table(&object).await.unwrap();
+    assert!(first.truncated);
+    let next = database
+        .read_next_table_page(&object, &view, &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        next.rows,
+        [
+            vec![CellValue::Text("1".into())],
+            vec![CellValue::Text("2".into())]
+        ]
+    );
+
+    object.name = "uuid_page".to_owned();
+    let mut first = database.read_table(&object).await.unwrap();
+    assert!(first.truncated);
+    first.rows.drain(..2);
+    let next = database
+        .read_next_table_page(&object, &view, &first)
+        .await
+        .unwrap();
+    assert_eq!(next.rows.len(), 60);
+    assert_eq!(
+        next.rows[0],
+        [CellValue::Text(
+            "00000000-0000-0000-0000-0000000000c9".into()
+        )]
+    );
+    assert!(!next.truncated);
 }
 #[path = "../src/secret_store.rs"]
 mod secret_store;
@@ -335,6 +563,190 @@ fn inspect_structure_postgres_mariadb_mysql() {
 }
 
 #[test]
+#[ignore = "requires local fixture databases; DBDECK_STRUCTURE_ENGINE can select one engine"]
+fn compare_table_structure_across_connections() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let selected = std::env::var("DBDECK_STRUCTURE_ENGINE").ok();
+        let mut tested = 0;
+        for (engine, kind, port, variable) in [
+            (
+                "postgres",
+                DatabaseKind::PostgreSql,
+                55432,
+                "DBDECK_PG_PASSWORD",
+            ),
+            (
+                "mariadb",
+                DatabaseKind::MariaDb,
+                53306,
+                "DBDECK_MARIADB_PASSWORD",
+            ),
+            ("mysql", DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD"),
+        ] {
+            if selected
+                .as_deref()
+                .is_some_and(|selected| selected != engine)
+            {
+                continue;
+            }
+            tested += 1;
+            let password = std::env::var(variable).expect("set fixture password");
+            let profile = ConnectionProfile {
+                id: "structure-source".into(),
+                name: "source".into(),
+                kind,
+                host: "127.0.0.1".into(),
+                port,
+                database: "dbdeck_test".into(),
+                username: "dbdeck_test".into(),
+                environment: EnvironmentTag::Local,
+                color: "#000000".into(),
+                read_only: true,
+                tls_mode: TlsMode::Disabled,
+                password_saved: false,
+                gopass_entry: None,
+                tls_files: Default::default(),
+                native_tools_dir: None,
+            };
+            let postgres = matches!(kind, DatabaseKind::PostgreSql);
+            let target_profile = ConnectionProfile {
+                id: "structure-target".into(),
+                database: if postgres {
+                    "dbdeck_test"
+                } else {
+                    "dbdeck_analytics"
+                }
+                .into(),
+                ..profile.clone()
+            };
+            let source_pool = DbPool::connect(&profile, &password).await.unwrap();
+            let target_pool = DbPool::connect(&target_profile, &password).await.unwrap();
+            let table = |schema: &str, name: &str| DbObject {
+                schema: schema.into(),
+                name: name.into(),
+                kind: DbObjectKind::Table,
+            };
+            let (source, equivalent, different) = if postgres {
+                (
+                    table("crm", "events"),
+                    table("audit", "events"),
+                    table("public", "sample_records"),
+                )
+            } else {
+                (
+                    table("dbdeck_test", "sample_records"),
+                    table("dbdeck_test", "sample_records"),
+                    table("dbdeck_analytics", "sample_records"),
+                )
+            };
+            let equal = source_pool
+                .compare_table_structure(&source, &target_pool, &equivalent)
+                .await
+                .unwrap();
+            assert!(equal.is_empty(), "{engine}: {equal:?}");
+            let differences = source_pool
+                .compare_table_structure(&source, &target_pool, &different)
+                .await
+                .unwrap();
+            let changed = |name| {
+                differences
+                    .iter()
+                    .find(|item| item.category == "Столбец" && item.name == name)
+                    .unwrap()
+            };
+            if postgres {
+                assert!(changed("description").after.is_none());
+                assert!(changed("name").before.is_none());
+                assert!(
+                    differences
+                        .iter()
+                        .any(|item| item.category == "Ограничение")
+                );
+                assert!(differences.iter().any(|item| item.category == "Индекс"));
+                let changed_options = source_pool
+                    .compare_table_structure(
+                        &table("crm", "comparison_index_options"),
+                        &target_pool,
+                        &table("audit", "comparison_index_options"),
+                    )
+                    .await
+                    .unwrap();
+                let [index] = changed_options.as_slice() else {
+                    panic!("expected one changed index, got {changed_options:?}");
+                };
+                assert_eq!(index.name, "comparison_brin");
+                assert!(
+                    index
+                        .before
+                        .as_ref()
+                        .unwrap()
+                        .contains("values_per_range=16")
+                );
+                assert!(
+                    index
+                        .after
+                        .as_ref()
+                        .unwrap()
+                        .contains("values_per_range=32")
+                );
+                let empty = table("audit", "comparison_empty");
+                assert!(
+                    source_pool
+                        .inspect_object(&empty)
+                        .await
+                        .unwrap()
+                        .columns
+                        .rows
+                        .is_empty()
+                );
+                assert!(
+                    source_pool
+                        .compare_table_structure(&empty, &target_pool, &empty)
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+            } else {
+                let name = changed("name");
+                assert!(name.before.as_ref().unwrap().contains("varchar(255)"));
+                assert!(name.after.as_ref().unwrap().contains("varchar(150)"));
+                let changes = source_pool
+                    .compare_table_structure(
+                        &table("dbdeck_test", "comparison_case"),
+                        &target_pool,
+                        &table("dbdeck_analytics", "comparison_case"),
+                    )
+                    .await
+                    .unwrap();
+                let [check] = changes.as_slice() else {
+                    panic!("{engine}: expected only the changed CHECK, got {changes:?}");
+                };
+                assert_eq!(check.name, "comparison_positive");
+                let before = check.before.as_ref().unwrap();
+                let after = check.after.as_ref().unwrap();
+                assert!(
+                    before.contains('0') && after.contains('1'),
+                    "{before} -> {after}"
+                );
+            }
+            let absent = table(&source.schema, "dbdeck_absent_comparison");
+            for (left, right, prefix) in [
+                (&absent, &different, "Исходная таблица"),
+                (&source, &absent, "Таблица для сравнения"),
+            ] {
+                let error = source_pool
+                    .compare_table_structure(left, &target_pool, right)
+                    .await
+                    .unwrap_err();
+                assert!(error.starts_with(prefix), "{error}");
+            }
+        }
+        assert!(tested > 0, "unknown DBDECK_STRUCTURE_ENGINE");
+    });
+}
+
+#[test]
 #[ignore = "requires Compose databases with 003 fixtures; read-only catalog/SQL checks"]
 fn multiple_namespaces_and_unformatted_sql() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -360,7 +772,14 @@ fn multiple_namespaces_and_unformatted_sql() {
             } else {
                 &[("dbdeck_test", "sample_records"), ("dbdeck_analytics", "sample_records")]
             };
+            let completion = pool.list_sql_completions().await.unwrap();
+            if matches!(kind, DatabaseKind::PostgreSql) {
+                assert!(completion.search_path.iter().any(|schema| schema == "public"));
+            } else {
+                assert!(completion.search_path.is_empty());
+            }
             for &(schema, name) in namespaces {
+                assert_eq!(completion.namespaces[schema][name].first().map(String::as_str), Some("id"));
                 assert!(catalog.schemas.iter().any(|s| s == schema), "{port}: {schema}");
                 let object = catalog.objects.iter().find(|o| o.schema == schema && o.name == name).unwrap();
                 let browsed = pool.read_table(object).await.unwrap();
@@ -377,6 +796,10 @@ fn multiple_namespaces_and_unformatted_sql() {
             if matches!(kind, DatabaseKind::MySql | DatabaseKind::MariaDb) {
                 let mut scoped = profile.clone();
                 scoped.database = "dbdeck_analytics".into();
+                let selected = pool.connect_database(&scoped.database).await.unwrap();
+                let selected_completion = selected.list_sql_completions().await.unwrap();
+                assert_eq!(selected_completion.search_path, ["dbdeck_analytics"]);
+                assert!(selected_completion.namespaces["dbdeck_test"].contains_key("sample_records"));
                 let only_analytics = pool.list_tables(&scoped).await.unwrap();
                 assert_eq!(only_analytics.schemas, ["dbdeck_analytics"]);
                 assert!(only_analytics.objects.iter().all(|o| o.schema == "dbdeck_analytics"));
@@ -457,4 +880,544 @@ fn postgres_blank_database_lists_databases_and_opens_schemas() {
             }
         }
     });
+}
+
+fn system_catalog_profile(kind: DatabaseKind, port: u16, database: &str) -> ConnectionProfile {
+    ConnectionProfile {
+        id: format!("system-catalog-{port}"),
+        name: "system catalog".into(),
+        kind,
+        host: "127.0.0.1".into(),
+        port,
+        database: database.into(),
+        username: "dbdeck_test".into(),
+        environment: EnvironmentTag::Local,
+        color: "#4f8fe8".into(),
+        read_only: false,
+        tls_mode: TlsMode::Disabled,
+        password_saved: false,
+        gopass_entry: None,
+        tls_files: Default::default(),
+        native_tools_dir: None,
+    }
+}
+
+fn unique_suffix() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{}_{}", std::process::id(), nanos % 1_000_000_000)
+}
+
+fn has_schema(catalog: &database::TableCatalog, name: &str) -> bool {
+    catalog.schemas.iter().any(|schema| schema == name)
+}
+
+async fn pool_close(pool: DbPool) {
+    match pool {
+        DbPool::PostgreSql(pool) => pool.close().await,
+        DbPool::MySql(pool) => pool.close().await,
+    }
+}
+
+#[test]
+#[ignore = "requires Compose PostgreSQL; creates and drops temporary schemas"]
+fn postgres_system_schemas_follow_include_system_flag() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        let profile = system_catalog_profile(DatabaseKind::PostgreSql, 55432, "dbdeck_test");
+        let password = std::env::var("DBDECK_PG_PASSWORD").unwrap();
+        let pool = DbPool::connect(&profile, &password).await.unwrap();
+        let DbPool::PostgreSql(raw) = &pool else {
+            panic!("expected PostgreSQL pool")
+        };
+        let suffix = unique_suffix();
+        // Names mimic the pg_toast / pg_temp_ LIKE filters with the underscore
+        // replaced, so an unescaped `_` wildcard would hide them.
+        let lookalikes = [format!("pgxtoast_{suffix}"), format!("pgxtemp_{suffix}")];
+        let plain = format!("dbdeck_it_user_{suffix}");
+        let all: Vec<&String> = lookalikes.iter().chain([&plain]).collect();
+        for schema in &all {
+            sqlx::query(&format!("CREATE SCHEMA \"{schema}\""))
+                .execute(raw)
+                .await
+                .unwrap();
+            sqlx::query(&format!("CREATE TABLE \"{schema}\".t (id int)"))
+                .execute(raw)
+                .await
+                .unwrap();
+        }
+        let hidden = pool.list_tables_with_system(&profile, false).await;
+        let shown = pool.list_tables_with_system(&profile, true).await;
+        let default = pool.list_tables(&profile).await;
+        for schema in &all {
+            let _ = sqlx::query(&format!("DROP SCHEMA \"{schema}\" CASCADE"))
+                .execute(raw)
+                .await;
+        }
+        let (hidden, shown, default) = (hidden.unwrap(), shown.unwrap(), default.unwrap());
+
+        for system in ["pg_catalog", "information_schema", "pg_toast"] {
+            assert!(!has_schema(&hidden, system), "false must hide {system}");
+            assert!(has_schema(&shown, system), "true must show {system}");
+        }
+        assert!(
+            hidden
+                .objects
+                .iter()
+                .all(|o| o.schema != "pg_catalog" && o.schema != "information_schema")
+        );
+        assert!(shown.objects.iter().any(|o| o.schema == "pg_catalog"));
+        assert!(
+            shown
+                .objects
+                .iter()
+                .any(|o| o.schema == "information_schema")
+        );
+        assert_eq!(default.schemas, hidden.schemas);
+        for catalog in [&hidden, &shown] {
+            assert!(has_schema(catalog, "public"));
+            for schema in &all {
+                assert!(has_schema(catalog, schema), "{schema} must stay visible");
+                assert!(
+                    catalog
+                        .objects
+                        .iter()
+                        .any(|o| &o.schema == *schema && o.name == "t")
+                );
+            }
+        }
+        pool_close(pool).await;
+    });
+}
+
+async fn mysql_family_system_check(kind: DatabaseKind, port: u16, key: &str, root_key: &str) {
+    let profile = system_catalog_profile(kind, port, "");
+    let password = std::env::var(key).unwrap();
+    let pool = DbPool::connect(&profile, &password).await.unwrap();
+    // dbdeck_test cannot create databases: the fixtures are made by root and granted to it.
+    let mut admin_profile = system_catalog_profile(kind, port, "");
+    admin_profile.username = "root".into();
+    let admin = DbPool::connect(&admin_profile, &std::env::var(root_key).unwrap())
+        .await
+        .unwrap();
+    let DbPool::MySql(raw) = &admin else {
+        panic!("expected MySQL pool")
+    };
+    let suffix = unique_suffix();
+    let plain = format!("dbdeck_it_user_{suffix}");
+    // Look-alikes of system names that must never be treated as system.
+    let lookalikes = [
+        format!("mysql_{suffix}"),
+        format!("sys_{suffix}"),
+        format!("performance_schemax_{suffix}"),
+    ];
+    let all: Vec<&String> = lookalikes.iter().chain([&plain]).collect();
+    for db in &all {
+        sqlx::query(&format!("CREATE DATABASE `{db}`"))
+            .execute(raw)
+            .await
+            .unwrap();
+        sqlx::query(&format!("CREATE TABLE `{db}`.t (id int)"))
+            .execute(raw)
+            .await
+            .unwrap();
+        sqlx::query(&format!("GRANT ALL ON `{db}`.* TO 'dbdeck_test'@'%'"))
+            .execute(raw)
+            .await
+            .unwrap();
+    }
+    let scoped_user = system_catalog_profile(kind, port, &plain);
+    let scoped_system = system_catalog_profile(kind, port, "information_schema");
+    let results = (
+        pool.list_tables_with_system(&profile, false).await,
+        pool.list_tables_with_system(&profile, true).await,
+        pool.list_tables(&profile).await,
+        pool.list_tables_with_system(&scoped_user, false).await,
+        pool.list_tables_with_system(&scoped_user, true).await,
+        pool.list_tables_with_system(&scoped_system, false).await,
+        pool.list_tables_with_system(&scoped_system, true).await,
+    );
+    for db in &all {
+        let _ = sqlx::query(&format!("DROP DATABASE `{db}`"))
+            .execute(raw)
+            .await;
+    }
+    let (hidden, shown, default, user_off, user_on, system_off, system_on) = results;
+    let (hidden, shown, default) = (hidden.unwrap(), shown.unwrap(), default.unwrap());
+
+    assert!(
+        !has_schema(&hidden, "information_schema"),
+        "{port}: false must hide information_schema"
+    );
+    assert!(
+        has_schema(&shown, "information_schema"),
+        "{port}: true must show information_schema"
+    );
+    assert!(
+        hidden
+            .objects
+            .iter()
+            .all(|o| o.schema != "information_schema")
+    );
+    assert_eq!(default.schemas, hidden.schemas);
+    for system in ["mysql", "performance_schema", "sys"] {
+        assert!(
+            !has_schema(&hidden, system),
+            "{port}: false must hide {system}"
+        );
+    }
+    for catalog in [&hidden, &shown] {
+        for db in &all {
+            assert!(has_schema(catalog, db), "{port}: {db} must stay visible");
+            assert!(
+                catalog
+                    .objects
+                    .iter()
+                    .any(|o| &o.schema == *db && o.name == "t")
+            );
+        }
+    }
+    // Bind order: (include_system, database, database).
+    for catalog in [user_off.unwrap(), user_on.unwrap()] {
+        assert_eq!(
+            catalog.schemas,
+            [plain.clone()],
+            "{port}: scoped database only"
+        );
+        assert!(catalog.objects.iter().all(|o| o.schema == plain));
+        assert_eq!(catalog.objects.len(), 1);
+    }
+    let system_off = system_off.unwrap();
+    assert!(
+        system_off.schemas.is_empty(),
+        "{port}: false hides an explicitly scoped system schema"
+    );
+    assert!(system_off.objects.is_empty());
+    let system_on = system_on.unwrap();
+    // information_schema holds only SYSTEM VIEW tables, which the object query skips.
+    assert_eq!(system_on.schemas, ["information_schema"]);
+    assert!(system_on.objects.is_empty());
+    pool_close(pool).await;
+    pool_close(admin).await;
+}
+
+#[test]
+#[ignore = "requires Compose MariaDB; creates and drops temporary databases"]
+fn mariadb_system_schemas_follow_include_system_flag() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(mysql_family_system_check(
+        DatabaseKind::MariaDb,
+        53306,
+        "DBDECK_MARIADB_PASSWORD",
+        "DBDECK_MARIADB_ROOT_PASSWORD",
+    ));
+}
+
+#[test]
+#[ignore = "requires Compose MySQL; creates and drops temporary databases"]
+fn mysql_system_schemas_follow_include_system_flag() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(mysql_family_system_check(
+        DatabaseKind::MySql,
+        53307,
+        "DBDECK_MYSQL_PASSWORD",
+        "DBDECK_MYSQL_ROOT_PASSWORD",
+    ));
+}
+
+async fn relation_fixture_sql(pool: &DbPool, sql: &str) {
+    match pool {
+        DbPool::PostgreSql(pool) => {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+        DbPool::MySql(pool) => {
+            sqlx::query(sql).execute(pool).await.unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires local fixtures; DBDECK_RELATIONS_ENGINE can select one engine"]
+fn related_rows_follow_composite_foreign_keys() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    runtime.block_on(async {
+        for (engine, kind, port, password) in [
+            (
+                "postgres",
+                DatabaseKind::PostgreSql,
+                55432,
+                "DBDECK_PG_PASSWORD",
+            ),
+            (
+                "mariadb",
+                DatabaseKind::MariaDb,
+                53306,
+                "DBDECK_MARIADB_PASSWORD",
+            ),
+            ("mysql", DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD"),
+        ] {
+            if std::env::var("DBDECK_RELATIONS_ENGINE").is_ok_and(|selected| selected != engine) {
+                continue;
+            }
+            let profile = ConnectionProfile {
+                id: engine.into(),
+                name: engine.into(),
+                kind,
+                host: "127.0.0.1".into(),
+                port,
+                database: "dbdeck_test".into(),
+                username: "dbdeck_test".into(),
+                environment: EnvironmentTag::Local,
+                color: "#4f8fe8".into(),
+                read_only: false,
+                tls_mode: TlsMode::Disabled,
+                password_saved: false,
+                gopass_entry: None,
+                tls_files: Default::default(),
+                native_tools_dir: None,
+            };
+            let pool = match (engine, std::env::var_os("DBDECK_PG_TEST_SOCKET")) {
+                ("postgres", Some(socket)) => DbPool::PostgreSql(
+                    sqlx::postgres::PgPoolOptions::new()
+                        .connect_with(
+                            sqlx::postgres::PgConnectOptions::new()
+                                .socket(socket)
+                                .port(port)
+                                .database(&profile.database)
+                                .username(&profile.username),
+                        )
+                        .await
+                        .unwrap(),
+                ),
+                _ => DbPool::connect(&profile, &std::env::var(password).expect(password))
+                    .await
+                    .unwrap(),
+            };
+            check_related_rows(&pool, engine).await;
+            if engine == "postgres" {
+                check_partition_related_rows(&pool).await;
+            }
+        }
+    });
+}
+
+async fn check_related_rows(pool: &DbPool, engine: &str) {
+    use database::{ForeignKeyLink, quote_mysql_identifier, quote_pg_identifier};
+    let pg = engine == "postgres";
+    let quote = if pg {
+        quote_pg_identifier
+    } else {
+        quote_mysql_identifier
+    };
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let child_schema = if pg { "public" } else { "dbdeck_test" };
+    let parent_schema = if pg {
+        format!("related-{suffix}")
+    } else {
+        child_schema.to_owned()
+    };
+    let parent = DbObject {
+        schema: parent_schema.clone(),
+        name: format!("parent-{suffix}"),
+        kind: DbObjectKind::Table,
+    };
+    let child = DbObject {
+        schema: child_schema.into(),
+        name: format!("child-{suffix}"),
+        kind: DbObjectKind::Table,
+    };
+    let parent_sql = format!("{}.{}", quote(&parent.schema), quote(&parent.name));
+    let child_sql = format!("{}.{}", quote(&child.schema), quote(&child.name));
+    let parent_column = quote("parent code");
+    let constraint = quote(&format!("composite_{suffix}"));
+    let engine_sql = if pg { "" } else { " ENGINE=InnoDB" };
+    if pg {
+        relation_fixture_sql(pool, &format!("CREATE SCHEMA {}", quote(&parent_schema))).await;
+    }
+    relation_fixture_sql(pool, &format!(
+        "CREATE TABLE {parent_sql} (id INT PRIMARY KEY, tenant INT, {parent_column} VARCHAR(12), UNIQUE (tenant, {parent_column})){engine_sql}"
+    )).await;
+    relation_fixture_sql(pool, &format!(
+        "CREATE TABLE {child_sql} (id INT PRIMARY KEY, fk_code VARCHAR(12), fk_tenant INT,
+         CONSTRAINT {constraint} FOREIGN KEY (fk_tenant, fk_code) REFERENCES {parent_sql} (tenant, {parent_column})){engine_sql}"
+    )).await;
+    relation_fixture_sql(
+        pool,
+        &format!("INSERT INTO {parent_sql} VALUES (1, 10, '20'), (2, 20, '10')"),
+    )
+    .await;
+    relation_fixture_sql(pool, &format!("INSERT INTO {child_sql} VALUES (100, '20', 10), (101, '20', 10), (102, '10', 20), (103, '20', NULL)")).await;
+
+    let child_data = pool.read_table_view(&child, &[], None, 0).await.unwrap();
+    let parent_data = pool.read_table_view(&parent, &[], None, 0).await.unwrap();
+    let key = |data: &database::TableData, id: &str| {
+        let row = data
+            .rows
+            .iter()
+            .find(|row| matches!(&row[0], CellValue::Text(value) if value == id))
+            .unwrap();
+        data.cell_detail_key(row).unwrap()
+    };
+    let outbound: Vec<ForeignKeyLink> = pool.foreign_key_links(&child).await.unwrap();
+    assert_eq!(outbound.len(), 1);
+    let outbound = &outbound[0];
+    assert!(outbound.outbound());
+    assert_eq!(outbound.target(), &parent);
+    assert_eq!(
+        outbound.columns().collect::<Vec<_>>(),
+        [("fk_tenant", "tenant"), ("fk_code", "parent code")]
+    );
+    let picked = pool
+        .read_related_rows(&child, &key(&child_data, "100"), outbound)
+        .await
+        .unwrap();
+    assert!(matches!(picked.rows.as_slice(), [row] if row[0] == CellValue::Text("1".into())));
+    assert!(
+        pool.read_related_rows(&child, &key(&child_data, "103"), outbound)
+            .await
+            .unwrap()
+            .rows
+            .is_empty()
+    );
+
+    let inbound = pool.foreign_key_links(&parent).await.unwrap();
+    assert_eq!(inbound.len(), 1);
+    let inbound = &inbound[0];
+    assert!(!inbound.outbound());
+    assert_eq!(inbound.target(), &child);
+    let picked = pool
+        .read_related_rows(&parent, &key(&parent_data, "1"), inbound)
+        .await
+        .unwrap();
+    assert_eq!(picked.rows.len(), 2);
+    assert!(
+        picked
+            .rows
+            .iter()
+            .all(|row| row[2] == CellValue::Text("10".into()))
+    );
+
+    let drop_fk = if pg {
+        "DROP CONSTRAINT"
+    } else {
+        "DROP FOREIGN KEY"
+    };
+    relation_fixture_sql(
+        pool,
+        &format!("ALTER TABLE {child_sql} {drop_fk} {constraint}"),
+    )
+    .await;
+    let error = pool
+        .read_related_rows(&child, &key(&child_data, "100"), outbound)
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("Внешний ключ изменился"),
+        "{error}"
+    );
+    if pg {
+        relation_fixture_sql(
+            pool,
+            &format!(
+            "ALTER TABLE {child_sql} ADD CONSTRAINT {constraint} FOREIGN KEY (fk_tenant, fk_code)
+             REFERENCES {parent_sql} (tenant, {parent_column})"
+        ),
+        )
+        .await;
+        assert!(
+            pool.read_related_rows(&child, &key(&child_data, "100"), outbound)
+                .await
+                .is_err()
+        );
+    } else {
+        relation_fixture_sql(
+            pool,
+            &format!(
+                "ALTER TABLE {child_sql} DROP PRIMARY KEY, ADD UNIQUE (id),
+             ADD CONSTRAINT {constraint} FOREIGN KEY (fk_tenant, fk_code)
+             REFERENCES {parent_sql} (tenant, {parent_column})"
+            ),
+        )
+        .await;
+        let link = &pool.foreign_key_links(&child).await.unwrap()[0];
+        let error = pool
+            .read_related_rows(&child, &key(&child_data, "100"), link)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("первичный ключ")
+                || error.to_string().contains("Первичный ключ"),
+            "{error}"
+        );
+    }
+    relation_fixture_sql(pool, &format!("DROP TABLE {child_sql}")).await;
+    relation_fixture_sql(pool, &format!("DROP TABLE {parent_sql}")).await;
+    if pg {
+        relation_fixture_sql(pool, &format!("DROP SCHEMA {}", quote(&parent_schema))).await;
+    }
+}
+
+async fn check_partition_related_rows(pool: &DbPool) {
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    let parent = format!("rel_parent_{suffix}");
+    let parent_leaf = format!("{parent}_leaf");
+    let child = format!("rel_child_{suffix}");
+    let child_leaf = format!("{child}_leaf");
+    relation_fixture_sql(pool, &format!(
+        "CREATE TABLE public.{parent} (part INT, id REGCLASS, PRIMARY KEY (part, id)) PARTITION BY RANGE (part)"
+    )).await;
+    relation_fixture_sql(pool, &format!(
+        "CREATE TABLE public.{parent_leaf} PARTITION OF public.{parent} FOR VALUES FROM (0) TO (10)"
+    )).await;
+    relation_fixture_sql(
+        pool,
+        &format!(
+            "CREATE TABLE public.{child} (
+           part INT, id REGCLASS, parent_id REGCLASS, PRIMARY KEY (part, id),
+           FOREIGN KEY (part, parent_id) REFERENCES public.{parent} (part, id)
+         ) PARTITION BY RANGE (part)"
+        ),
+    )
+    .await;
+    relation_fixture_sql(pool, &format!(
+        "CREATE TABLE public.{child_leaf} PARTITION OF public.{child} FOR VALUES FROM (0) TO (10)"
+    )).await;
+    relation_fixture_sql(
+        pool,
+        &format!("INSERT INTO public.{parent} VALUES (1, 'public.{parent}'::regclass)"),
+    )
+    .await;
+    relation_fixture_sql(pool, &format!(
+        "INSERT INTO public.{child} VALUES (1, 'public.{child}'::regclass, 'public.{parent}'::regclass)"
+    )).await;
+
+    for (source, target, outbound, displayed_pk) in [
+        (&child_leaf, &parent, true, &child),
+        (&parent_leaf, &child, false, &parent),
+    ] {
+        let object = DbObject {
+            schema: "public".into(),
+            name: source.clone(),
+            kind: DbObjectKind::Table,
+        };
+        let snapshot = pool.read_table_view(&object, &[], None, 0).await.unwrap();
+        assert_eq!(snapshot.rows[0][1], CellValue::Text(displayed_pk.clone()));
+        let key = snapshot.cell_detail_key(&snapshot.rows[0]).unwrap();
+        let links = pool.foreign_key_links(&object).await.unwrap();
+        assert_eq!(links.len(), 1);
+        let link = &links[0];
+        assert_eq!(link.target().name, *target);
+        assert_eq!(link.outbound(), outbound);
+        let rows = pool
+            .read_related_rows(&object, &key, link)
+            .await
+            .unwrap()
+            .rows;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][1], CellValue::Text(target.clone()));
+    }
+    relation_fixture_sql(pool, &format!("DROP TABLE public.{child}")).await;
+    relation_fixture_sql(pool, &format!("DROP TABLE public.{parent}")).await;
 }

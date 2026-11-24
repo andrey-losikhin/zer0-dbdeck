@@ -1,6 +1,6 @@
-//! Local editor assistance. Neither completion nor syntax checks execute SQL.
+//! Local SQL editor assistance.
 use relm4::gtk::{self, gio, glib, prelude::*, subclass::prelude::*};
-use sourceview5::subclass::prelude::*;
+use sourceview5::{prelude::ViewExt, subclass::prelude::*};
 use std::{
     cell::{Cell, RefCell},
     future::Future,
@@ -10,55 +10,106 @@ use std::{
     time::Duration,
 };
 
-pub const KEYWORDS: &str = "SELECT FROM WHERE JOIN LEFT RIGHT INNER OUTER ON GROUP BY ORDER HAVING LIMIT OFFSET INSERT INTO VALUES UPDATE SET DELETE CREATE ALTER DROP TABLE VIEW INDEX DATABASE SCHEMA AND OR NOT NULL IS IN LIKE ILIKE BETWEEN EXISTS AS DISTINCT UNION ALL CASE WHEN THEN ELSE END COUNT SUM AVG MIN MAX COALESCE CAST DESC ASC TRUE FALSE RETURNING WITH PRIMARY KEY REFERENCES DEFAULT CURRENT_TIMESTAMP BEGIN COMMIT ROLLBACK EXPLAIN ANALYZE";
+pub use crate::sql_completion::Dialect;
+use crate::{database::SqlCompletionCatalog, sql_completion::Completion};
 
-#[derive(Clone)]
-struct Candidate {
-    text: String,
-    folded: String,
-    keyword: bool,
+pub fn format_buffer(editor: &sourceview5::View, dialect: Dialect) -> Result<(), String> {
+    let buffer = editor.buffer();
+    let (mut start, mut end) = buffer.bounds();
+    let original = buffer.text(&start, &end, true);
+    let Some(formatted) = crate::sql_format::format(&original, dialect)? else {
+        return Ok(());
+    };
+    let caret = buffer.cursor_position();
+    let anchor = buffer.iter_at_mark(&buffer.selection_bound()).offset();
+    let new_caret = formatted.map_offset(caret, caret > anchor);
+    let new_anchor = formatted.map_offset(anchor, anchor > caret);
+
+    let completion = editor.completion();
+    completion.block_interactive();
+    completion.hide();
+    buffer.begin_user_action();
+    buffer.delete(&mut start, &mut end);
+    buffer.insert(&mut start, &formatted.text);
+    buffer.select_range(
+        &buffer.iter_at_offset(new_caret),
+        &buffer.iter_at_offset(new_anchor),
+    );
+    buffer.end_user_action();
+    completion.unblock_interactive();
+    Ok(())
 }
-fn candidates(catalog: &[String]) -> Vec<Candidate> {
-    let mut seen = std::collections::HashSet::new();
-    KEYWORDS
-        .split_whitespace()
-        .map(|w| (w.to_owned(), true))
-        .chain(catalog.iter().cloned().map(|w| (w, false)))
-        .filter_map(|(text, keyword)| {
-            let folded = text.to_lowercase();
-            if text.is_empty()
-                || text.len() > 512
-                || text.chars().any(char::is_control)
-                || !seen.insert(folded.clone())
-            {
-                return None;
+
+struct Replacement {
+    start: gtk::TextIter,
+    caret: gtk::TextIter,
+    end: gtk::TextIter,
+    delimiter: Option<char>,
+}
+
+fn replacement_bounds(
+    buffer: &sourceview5::Buffer,
+    context: &sourceview5::CompletionContext,
+    dialect: Dialect,
+) -> Option<Replacement> {
+    if buffer.char_count() > 128 * 1024 {
+        return None;
+    }
+    let (mut start, caret) = context.bounds()?;
+    let parser = dialect.parser();
+    let mut previous = start;
+    while previous.backward_char() && parser.is_identifier_part(previous.char()) {
+        start = previous;
+    }
+    let mut end = caret;
+    while !end.is_end() && parser.is_identifier_part(end.char()) {
+        end.forward_char();
+    }
+    let mut replacement = Replacement {
+        start,
+        caret,
+        end,
+        delimiter: None,
+    };
+
+    let delimiter = dialect.identifier_delimiter();
+    let line = buffer.iter_at_line_offset(caret.line(), 0)?;
+    if !buffer.text(&line, &caret, true).contains(delimiter) {
+        return Some(replacement);
+    }
+    // Lexing up to the caret distinguishes an open identifier from an earlier
+    // closed identifier or quote characters in SQL strings and comments.
+    let before = buffer.text(&buffer.start_iter(), &caret, true);
+    let Err(error) = sqlparser::tokenizer::Tokenizer::new(parser, &before).tokenize() else {
+        return Some(replacement);
+    };
+    if error.location.line != caret.line() as u64 + 1 {
+        return Some(replacement);
+    }
+    let quote =
+        buffer.iter_at_line_offset(caret.line(), error.location.column.saturating_sub(1) as i32)?;
+    if quote.char() != delimiter || quote.offset() >= caret.offset() {
+        return Some(replacement);
+    }
+    replacement.start = quote;
+    replacement.delimiter = Some(delimiter);
+
+    // Include an existing closing delimiter, ignoring doubled escapes.
+    // Keep later lines intact when the identifier has no closing delimiter.
+    let mut probe = caret;
+    while !probe.is_end() && !probe.ends_line() {
+        if probe.char() == delimiter {
+            probe.forward_char();
+            if probe.char() != delimiter {
+                replacement.end = probe;
+                break;
             }
-            Some(Candidate {
-                text,
-                folded,
-                keyword,
-            })
-        })
-        .collect()
+        }
+        probe.forward_char();
+    }
+    Some(replacement)
 }
-fn matching(words: &[Candidate], prefix: &str, after_dot: bool) -> Vec<String> {
-    let prefix = prefix.to_lowercase();
-    words
-        .iter()
-        .filter(|w| {
-            w.folded.starts_with(&prefix)
-                && (prefix.is_empty() || w.folded != prefix)
-                && (!after_dot || (!w.keyword && !w.text.contains('.')))
-        })
-        .take(60)
-        .map(|w| w.text.clone())
-        .collect()
-}
-fn after_dot(context: &sourceview5::CompletionContext) -> bool {
-    context
-        .bounds()
-        .is_some_and(|(mut start, _)| start.backward_char() && start.char() == '.')
-}
+
 mod proposal {
     use super::*;
     #[derive(Default)]
@@ -89,7 +140,7 @@ mod provider {
     use super::*;
     #[derive(Default)]
     pub struct Provider {
-        pub(super) words: RefCell<Vec<Candidate>>,
+        pub(super) completion: RefCell<Completion>,
     }
     #[glib::object_subclass]
     impl ObjectSubclass for Provider {
@@ -100,23 +151,53 @@ mod provider {
     impl ObjectImpl for Provider {}
     impl Provider {
         fn fill(&self, context: &sourceview5::CompletionContext, model: &gio::ListStore) {
-            let suppressed =
-                context
-                    .buffer()
-                    .zip(context.bounds())
-                    .is_some_and(|(buffer, (start, end))| {
-                        sourceview5::prelude::BufferExt::ensure_highlight(&buffer, &start, &end);
-                        ["comment", "string"].iter().any(|class| {
-                            sourceview5::prelude::BufferExt::iter_has_context_class(
-                                &buffer, &start, class,
+            let completion = self.completion.borrow();
+            let items = context
+                .buffer()
+                .and_then(|buffer| {
+                    replacement_bounds(&buffer, context, completion.dialect)
+                        .map(|replacement| (buffer, replacement))
+                })
+                .map(
+                    |(
+                        buffer,
+                        Replacement {
+                            start,
+                            caret,
+                            end,
+                            delimiter,
+                        },
+                    )| {
+                        sourceview5::prelude::BufferExt::ensure_highlight(&buffer, &start, &caret);
+                        if delimiter.is_none()
+                            && ["comment", "string"].iter().any(|class| {
+                                sourceview5::prelude::BufferExt::iter_has_context_class(
+                                    &buffer, &start, class,
+                                )
+                            })
+                        {
+                            return Vec::new();
+                        }
+                        let typed = buffer.text(&start, &caret, true);
+                        let prefix = match delimiter {
+                            Some(quote) => typed[quote.len_utf8()..]
+                                .replace(&quote.to_string().repeat(2), &quote.to_string()),
+                            None => typed.to_string(),
+                        };
+                        completion
+                            .complete(
+                                &buffer.text(&buffer.start_iter(), &start, true),
+                                &prefix,
+                                &buffer.text(&end, &buffer.end_iter(), true),
+                                &buffer.text(&start, &end, true),
+                                delimiter.is_some(),
                             )
-                        })
-                    });
-            let items = matching(&self.words.borrow(), &context.word(), after_dot(context))
-                .into_iter()
-                .filter(|_| !suppressed)
-                .map(SqlProposal::new)
-                .collect::<Vec<_>>();
+                            .into_iter()
+                            .map(SqlProposal::new)
+                            .collect()
+                    },
+                )
+                .unwrap_or_default();
             model.splice(0, model.n_items(), &items);
         }
     }
@@ -170,17 +251,18 @@ mod provider {
             context: &sourceview5::CompletionContext,
             proposal: &sourceview5::CompletionProposal,
         ) {
-            let (Some(proposal), Some(buffer), Some((mut start, mut end))) = (
-                proposal.downcast_ref::<SqlProposal>(),
-                context.buffer(),
-                context.bounds(),
-            ) else {
+            let (Some(proposal), Some(buffer)) =
+                (proposal.downcast_ref::<SqlProposal>(), context.buffer())
+            else {
+                return;
+            };
+            let Some(Replacement {
+                mut start, mut end, ..
+            }) = replacement_bounds(&buffer, context, self.completion.borrow().dialect)
+            else {
                 return;
             };
             let text = proposal.text();
-            while !end.is_end() && (end.char().is_alphanumeric() || end.char() == '_') {
-                end.forward_char();
-            }
             buffer.begin_user_action();
             buffer.delete(&mut start, &mut end);
             buffer.insert(&mut start, &text);
@@ -207,23 +289,18 @@ mod provider {
 }
 glib::wrapper! { pub struct SqlProvider(ObjectSubclass<provider::Provider>) @implements sourceview5::CompletionProvider; }
 impl SqlProvider {
-    pub fn new() -> Self {
+    pub fn new(dialect: Dialect, schema: Option<String>) -> Self {
         let provider: Self = glib::Object::new();
-        provider.set_catalog(&[]);
+        *provider.imp().completion.borrow_mut() = Completion {
+            dialect,
+            schema,
+            ..Completion::default()
+        };
         provider
     }
-    pub fn set_catalog(&self, words: &[String]) {
-        *self.imp().words.borrow_mut() = candidates(words);
+    pub fn set_catalog(&self, catalog: SqlCompletionCatalog) {
+        self.imp().completion.borrow_mut().catalog = catalog;
     }
-    pub fn suggestions(&self, prefix: &str, after_dot: bool) -> Vec<String> {
-        matching(&self.imp().words.borrow(), prefix, after_dot)
-    }
-}
-
-#[derive(Clone, Copy)]
-pub enum Dialect {
-    PostgreSql,
-    MySql,
 }
 #[derive(Debug, PartialEq)]
 pub struct SyntaxIssue {
@@ -235,15 +312,21 @@ pub fn check_syntax(sql: &str, dialect: Dialect) -> Option<SyntaxIssue> {
     if sql.trim().is_empty() || sql.len() > 128 * 1024 {
         return None;
     }
-    let dialect: &dyn sqlparser::dialect::Dialect = match dialect {
-        Dialect::PostgreSql => &sqlparser::dialect::PostgreSqlDialect {},
-        Dialect::MySql => &sqlparser::dialect::MySqlDialect {},
+    let dialect = dialect.parser();
+    let error = match sqlparser::tokenizer::Tokenizer::new(dialect, sql).tokenize_with_location() {
+        Ok(tokens) => {
+            if crate::sql_format::exceeds_parse_budget(&tokens) {
+                return None;
+            }
+            sqlparser::parser::Parser::new(dialect)
+                .with_recursion_limit(64)
+                .with_tokens_with_locations(tokens)
+                .parse_statements()
+                .err()?
+                .to_string()
+        }
+        Err(error) => error.to_string(),
     };
-    let result = sqlparser::parser::Parser::new(dialect)
-        .with_recursion_limit(64)
-        .try_with_sql(sql)
-        .and_then(|mut parser| parser.parse_statements());
-    let error = result.err()?.to_string();
     let location = error
         .rsplit_once(" at Line: ")
         .and_then(|(_, loc)| loc.split_once(", Column: "))
@@ -407,38 +490,6 @@ impl Drop for Diagnostics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn prefix_matching_is_immediate_case_insensitive_and_preserves_keywords() {
-        let words = candidates(&[
-            "sample_records".into(),
-            "public.sample_records".into(),
-            "Сотрудники".into(),
-            "select".into(),
-        ]);
-        for prefix in ["s", "se", "sel", "SeL"] {
-            assert!(matching(&words, prefix, false).contains(&"SELECT".into()));
-        }
-        assert_eq!(matching(&words, "СОТР", false), vec!["Сотрудники"]);
-        assert_eq!(matching(&words, "sam", true), vec!["sample_records"]);
-        assert!(
-            !matching(&words, "", true)
-                .iter()
-                .any(|w| w == "SELECT" || w.contains('.'))
-        );
-        assert!(matching(&words, "nothing", false).is_empty());
-        assert_eq!(words.iter().filter(|w| w.folded == "select").count(), 1);
-        let many = (0..100)
-            .map(|i| format!("table_{i}"))
-            .chain(["bad\nname".into(), "x".repeat(513)])
-            .collect::<Vec<_>>();
-        let many = candidates(&many);
-        assert_eq!(matching(&many, "table_", false).len(), 60);
-        assert!(
-            !many
-                .iter()
-                .any(|w| w.text.contains('\n') || w.text.len() > 512)
-        );
-    }
     #[test]
     fn syntax_checks_dialects_scripts_and_unicode_spans() {
         for dialect in [Dialect::PostgreSql, Dialect::MySql] {

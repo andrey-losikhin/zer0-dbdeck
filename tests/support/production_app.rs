@@ -551,7 +551,16 @@ fn production_confirmation_snapshot_and_readonly_ui() {
         .borrow_mut()
         .insert((0, 1), Some("grid-approved".into()));
     save_table_edits(&ui, &table_key);
-    let (_, entry, accept) = confirmation();
+    let (window, entry, accept) = confirmation();
+    let details = grid_app_tests::preview_details(&window);
+    assert!(
+        details.contains("Было: \"approved\"\n  Станет: \"grid-approved\""),
+        "{details}"
+    );
+    assert!(!accept.is_sensitive());
+    entry.set_text("wrong_db");
+    accept.emit_clicked();
+    assert!(!state.saving.get());
     entry.set_text("dbdeck_test");
     accept.emit_clicked();
     until(|| !state.saving.get());

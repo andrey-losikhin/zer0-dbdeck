@@ -83,14 +83,14 @@ fn postgres_schema_opens_on_explicit_choice() {
     );
     assert!(ui.workspace_groups.borrow().is_empty());
     assert!(ui.empty_session.is_visible());
-    assert!(!ui.empty_session_sql.is_visible());
-    let shown = ui
-        .namespace_selector
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .unwrap()
-        .string();
-    assert_eq!(shown, "Выберите схему");
+    assert!(
+        ui.empty_session_sql.is_visible(),
+        "a SQL query is available before choosing a schema"
+    );
+    assert!(
+        !ui.namespace_row.is_visible(),
+        "PostgreSQL schemas are chosen in the tree"
+    );
 
     find_schema_button(ui.objects.upcast_ref(), tooltip)
         .unwrap()
@@ -107,13 +107,10 @@ fn postgres_schema_opens_on_explicit_choice() {
     assert!(has_css_class(&label, "tab-schema-name"));
     assert!(ui.empty_session.is_visible());
     assert!(ui.empty_session_sql.is_visible());
-    let shown = ui
-        .namespace_selector
-        .selected_item()
-        .and_downcast::<gtk::StringObject>()
-        .unwrap()
-        .string();
-    assert_eq!(shown, "audit");
+    assert!(
+        !ui.namespace_row.is_visible(),
+        "the chosen schema is shown by the tree and the tab, not a dropdown"
+    );
 
     until(|| ui.empty_session_sql.is_mapped());
     grid_app_tests::layout_snapshot(&ui.window, "target/schema-open-empty.png");

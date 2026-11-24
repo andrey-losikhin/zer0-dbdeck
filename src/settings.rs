@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, OpenOptions},
     io::Write,
     os::unix::fs::OpenOptionsExt,
@@ -13,6 +13,8 @@ use ring::{
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::PermissionsExt;
 use zeroize::{Zeroize, Zeroizing};
+
+use crate::database::{DbObject, TableViewState};
 
 const VAULT_VERSION: u32 = 1;
 const PBKDF2_ITERATIONS: u32 = 600_000;
@@ -167,13 +169,55 @@ struct ProfilesFile {
     sql_queries_directory: Option<PathBuf>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TableViewScope {
+    profile_id: String,
+    database: String,
+    schema: String,
+    table: String,
+}
+
+impl TableViewScope {
+    pub fn new(profile: &ConnectionProfile, object: &DbObject) -> Self {
+        Self {
+            profile_id: profile.id.clone(),
+            database: profile.database.clone(),
+            schema: object.schema.clone(),
+            table: object.name.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedViewLayout {
+    pub view: TableViewState,
+    pub hidden_columns: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedTableView {
+    pub scope: TableViewScope,
+    pub name: String,
+    pub layout: SavedViewLayout,
+}
+
+const MAX_VIEW_NAME_CHARS: usize = 80;
+
+fn valid_view_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.chars().any(char::is_control)
+        && name.chars().count() <= MAX_VIEW_NAME_CHARS
+}
+
 pub struct SettingsStore {
     sql_workspace: crate::sql_workspace::SqlWorkspace,
+    saved_table_views: Vec<SavedTableView>,
     path: PathBuf,
     vault: CredentialVault,
     pub profiles: Vec<ConnectionProfile>,
     sql_queries_directory: Option<PathBuf>,
     csv_export_directory: Option<PathBuf>,
+    show_system_schemas: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,12 +240,16 @@ struct PortableBackup {
 struct PortablePayload {
     #[serde(default)]
     sql_workspace: crate::sql_workspace::SqlWorkspace,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    saved_table_views: Vec<SavedTableView>,
     connections: Vec<ConnectionProfile>,
     passwords: HashMap<String, String>,
     #[serde(default)]
     sql_queries_directory: Option<PathBuf>,
     #[serde(default)]
     csv_export_directory: Option<PathBuf>,
+    #[serde(default)]
+    show_system_schemas: bool,
 }
 
 struct CredentialVault {
@@ -268,6 +316,7 @@ impl SettingsStore {
 
         Ok(Self {
             sql_workspace: crate::sql_workspace::SqlWorkspace::default(),
+            saved_table_views: Vec::new(),
             path,
             vault: CredentialVault {
                 path: legacy_vault,
@@ -278,11 +327,51 @@ impl SettingsStore {
             profiles,
             sql_queries_directory,
             csv_export_directory: None,
+            show_system_schemas: false,
         })
     }
 
     pub fn sql_workspace(&self) -> &crate::sql_workspace::SqlWorkspace {
         &self.sql_workspace
+    }
+
+    pub fn saved_table_views<'a>(
+        &'a self,
+        scope: &'a TableViewScope,
+    ) -> impl Iterator<Item = &'a SavedTableView> {
+        self.saved_table_views
+            .iter()
+            .filter(move |view| &view.scope == scope)
+    }
+
+    pub fn save_table_view(&mut self, mut view: SavedTableView) -> Result<(), String> {
+        view.name = view.name.trim().to_owned();
+        if !valid_view_name(&view.name) {
+            return Err(format!(
+                "Введите имя до {MAX_VIEW_NAME_CHARS} символов без управляющих знаков"
+            ));
+        }
+        if !self
+            .profiles
+            .iter()
+            .any(|profile| profile.id == view.scope.profile_id)
+        {
+            return Err("Профиль подключения не найден".to_owned());
+        }
+        self.commit(|store| {
+            store
+                .saved_table_views
+                .retain(|existing| existing.scope != view.scope || existing.name != view.name);
+            store.saved_table_views.push(view);
+        })
+    }
+
+    pub fn delete_table_view(&mut self, scope: &TableViewScope, name: &str) -> Result<(), String> {
+        self.commit(|store| {
+            store
+                .saved_table_views
+                .retain(|view| &view.scope != scope || view.name != name);
+        })
     }
 
     pub fn record_sql(
@@ -315,6 +404,13 @@ impl SettingsStore {
     }
     pub fn set_csv_export_directory(&mut self, directory: PathBuf) -> Result<(), String> {
         self.commit(|store| store.csv_export_directory = Some(directory))
+    }
+
+    pub fn show_system_schemas(&self) -> bool {
+        self.show_system_schemas
+    }
+    pub fn set_show_system_schemas(&mut self, show: bool) -> Result<(), String> {
+        self.commit(|store| store.show_system_schemas = show)
     }
 
     pub fn sql_queries_directory(&self) -> Option<PathBuf> {
@@ -404,8 +500,10 @@ impl SettingsStore {
         self.vault.values = payload.passwords;
         self.profiles = payload.connections;
         self.sql_workspace = payload.sql_workspace;
+        self.saved_table_views = payload.saved_table_views;
         self.sql_queries_directory = payload.sql_queries_directory;
         self.csv_export_directory = payload.csv_export_directory;
+        self.show_system_schemas = payload.show_system_schemas;
         Ok(())
     }
 
@@ -414,16 +512,20 @@ impl SettingsStore {
             return Err("Хранилище заблокировано".to_owned());
         }
         let workspace = self.sql_workspace.clone();
+        let saved_views = self.saved_table_views.clone();
         let profiles = self.profiles.clone();
         let directory = self.sql_queries_directory.clone();
         let csv_directory = self.csv_export_directory.clone();
+        let show_system = self.show_system_schemas;
         let mut values = self.vault.values.clone();
         change(self);
         if let Err(error) = self.write_profiles() {
             self.profiles = profiles;
             self.sql_workspace = workspace;
+            self.saved_table_views = saved_views;
             self.sql_queries_directory = directory;
             self.csv_export_directory = csv_directory;
+            self.show_system_schemas = show_system;
             self.vault.values.values_mut().for_each(Zeroize::zeroize);
             self.vault.values = values;
             return Err(error);
@@ -499,6 +601,9 @@ impl SettingsStore {
         }
         self.commit(|store| {
             store.profiles.retain(|p| p.id != id);
+            store
+                .saved_table_views
+                .retain(|view| view.scope.profile_id != id);
             if let Some(mut value) = store.vault.values.remove(id) {
                 value.zeroize();
             }
@@ -556,10 +661,12 @@ impl SettingsStore {
             .map_err(|_| "Не удалось получить случайный nonce для резервной копии".to_owned())?;
         let payload = PortablePayload {
             sql_workspace: self.sql_workspace.clone(),
+            saved_table_views: self.saved_table_views.clone(),
             connections: self.profiles.clone(),
             passwords: self.vault.values.clone(),
             sql_queries_directory: self.sql_queries_directory.clone(),
             csv_export_directory: self.csv_export_directory.clone(),
+            show_system_schemas: self.show_system_schemas,
         };
         let plaintext = Zeroizing::new(
             serde_json::to_vec(&payload).map_err(|_| "Не удалось собрать резервную копию")?,
@@ -597,6 +704,15 @@ impl SettingsStore {
         }
         let result = self.commit(|store| {
             store.sql_workspace = workspace;
+            let imported_views: HashSet<_> = payload
+                .saved_table_views
+                .iter()
+                .map(|view| (&view.scope, &view.name))
+                .collect();
+            store
+                .saved_table_views
+                .retain(|view| !imported_views.contains(&(&view.scope, &view.name)));
+            store.saved_table_views.extend(payload.saved_table_views);
             if store.sql_queries_directory.is_none() {
                 store.sql_queries_directory = payload.sql_queries_directory;
             }
@@ -683,11 +799,21 @@ fn decrypt_bundle(saved: &PortableBackup, key: &[u8]) -> Result<PortablePayload,
     let payload: PortablePayload =
         serde_json::from_slice(&plain).map_err(|_| "Данные хранилища повреждены")?;
     payload.sql_workspace.validate()?;
-    let mut ids = std::collections::HashSet::new();
+    let mut ids = HashSet::new();
     for profile in &payload.connections {
         validate_profile(profile)?;
         if !ids.insert(&profile.id) {
             return Err("Повторяющийся ID подключения".to_owned());
+        }
+    }
+    let mut names = HashSet::new();
+    for view in &payload.saved_table_views {
+        if !ids.contains(&view.scope.profile_id)
+            || view.name.trim() != view.name
+            || !valid_view_name(&view.name)
+            || !names.insert((&view.scope, &view.name))
+        {
+            return Err("Повреждены сохранённые представления таблиц".to_owned());
         }
     }
     Ok(payload)
@@ -1053,6 +1179,7 @@ mod tests {
         let root = test_dir();
         let mut source = SettingsStore {
             sql_workspace: crate::sql_workspace::SqlWorkspace::default(),
+            saved_table_views: Vec::new(),
             path: root.join("source/config/connections.json"),
             vault: CredentialVault {
                 path: root.join("source/data/credentials.vault"),
@@ -1063,6 +1190,7 @@ mod tests {
             profiles: Vec::new(),
             sql_queries_directory: None,
             csv_export_directory: None,
+            show_system_schemas: false,
         };
         source
             .unlock_or_create_vault("correct horse battery staple")
@@ -1099,6 +1227,7 @@ mod tests {
 
         let mut restored = SettingsStore {
             sql_workspace: crate::sql_workspace::SqlWorkspace::default(),
+            saved_table_views: Vec::new(),
             path: root.join("restored/config/connections.json"),
             vault: CredentialVault {
                 path: root.join("restored/data/credentials.vault"),
@@ -1109,6 +1238,7 @@ mod tests {
             profiles: Vec::new(),
             sql_queries_directory: None,
             csv_export_directory: None,
+            show_system_schemas: false,
         };
         assert!(
             restored
@@ -1238,6 +1368,127 @@ mod tests {
         assert!(source.sql_workspace().history.is_empty());
         assert_eq!(source.sql_workspace().drafts.len(), 1);
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn saved_table_views_are_scoped_encrypted_and_portable() {
+        use super::{
+            PortablePayload, SavedTableView, SavedViewLayout, TableViewScope, TableViewState,
+        };
+        use crate::database::{DbObject, DbObjectKind, TableSort};
+
+        let root = test_dir();
+        let mut store = isolated(&root.join("source"));
+        assert!(
+            store
+                .unlock_or_create_vault("synthetic master password")
+                .is_ok()
+        );
+        let profile = profile("saved-views");
+        store.save_profile(profile.clone(), "").unwrap();
+        let object = DbObject {
+            schema: "public".into(),
+            name: "orders".into(),
+            kind: DbObjectKind::Table,
+        };
+        let scope = TableViewScope::new(&profile, &object);
+        let other_scope = TableViewScope::new(
+            &profile,
+            &DbObject {
+                schema: "archive".into(),
+                ..object
+            },
+        );
+        let mut view = SavedTableView {
+            scope: scope.clone(),
+            name: "ready".into(),
+            layout: SavedViewLayout {
+                view: TableViewState {
+                    filters: Vec::new(),
+                    raw_condition: Some("status = 'private-filter-marker'".into()),
+                    sort: Some(TableSort {
+                        column: "id".into(),
+                        descending: true,
+                    }),
+                },
+                hidden_columns: vec!["notes".into()],
+            },
+        };
+        let other = SavedTableView {
+            scope: other_scope.clone(),
+            ..view.clone()
+        };
+        store.save_table_view(view.clone()).unwrap();
+        store.save_table_view(other.clone()).unwrap();
+        view.layout.hidden_columns.clear();
+        store.save_table_view(view.clone()).unwrap();
+        assert_eq!(
+            store.saved_table_views(&scope).collect::<Vec<_>>(),
+            vec![&view]
+        );
+        assert_eq!(store.saved_table_views(&other_scope).next(), Some(&other));
+
+        let bytes = fs::read_to_string(store.storage_path()).unwrap();
+        assert!(!bytes.contains("private-filter-marker"));
+        let mut reopened = isolated(&root.join("source"));
+        reopened
+            .unlock_with_key(&store.unlock_key().unwrap())
+            .unwrap();
+        assert_eq!(reopened.saved_table_views(&scope).next(), Some(&view));
+
+        let backup = root.join("saved-views.dbdeck");
+        store.export_backup(&backup).unwrap();
+        let mut imported = isolated(&root.join("imported"));
+        for _ in 0..2 {
+            imported
+                .import_backup(&backup, "synthetic master password")
+                .unwrap();
+            assert_eq!(
+                imported.saved_table_views(&scope).collect::<Vec<_>>(),
+                vec![&view]
+            );
+        }
+        let path = imported.path.clone();
+        imported.path = root.join("blocked");
+        fs::create_dir(&imported.path).unwrap();
+        assert!(imported.delete_table_view(&scope, &view.name).is_err());
+        assert_eq!(imported.saved_table_views(&scope).next(), Some(&view));
+        imported.path = path;
+        imported.delete_table_view(&scope, &view.name).unwrap();
+        assert!(imported.saved_table_views(&scope).next().is_none());
+        assert_eq!(
+            imported.saved_table_views(&other_scope).next(),
+            Some(&other)
+        );
+        imported.delete_profile(&profile.id).unwrap();
+        assert!(imported.saved_table_views(&other_scope).next().is_none());
+
+        let legacy: PortablePayload =
+            serde_json::from_str(r#"{"connections":[],"passwords":{}}"#).unwrap();
+        assert!(legacy.saved_table_views.is_empty());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn show_system_schemas_defaults_to_false_and_survives_reload() {
+        let root = test_dir();
+        let mut store = isolated(&root);
+        assert!(!store.show_system_schemas());
+        assert!(store.unlock_or_create_vault("тест").unwrap());
+        assert!(!store.show_system_schemas());
+        store.set_show_system_schemas(true).unwrap();
+        assert!(store.show_system_schemas());
+
+        let mut reloaded = isolated(&root);
+        assert!(!reloaded.show_system_schemas());
+        assert!(!reloaded.unlock_or_create_vault("тест").unwrap());
+        assert!(reloaded.show_system_schemas());
+
+        reloaded.set_show_system_schemas(false).unwrap();
+        let mut again = isolated(&root);
+        again.unlock_or_create_vault("тест").unwrap();
+        assert!(!again.show_system_schemas());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

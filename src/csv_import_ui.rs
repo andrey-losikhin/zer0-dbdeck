@@ -433,7 +433,7 @@ fn show(ui: &Rc<Ui>, profile: ConnectionProfile, object: Option<DbObject>, path:
             move || {
                 let (Some(ui),Some(window))=(owner.upgrade(),window.upgrade().filter(|w|w.is_visible())) else { return; };
                 if generation.get()!=ready.generation { show_error_dialog(&ui,"Параметры изменились","Обновите предпросмотр перед импортом."); return; }
-                let Some(cancel)=start_transfer(&ui) else {return;}; window.close();
+                let Some(cancel)=start_transfer(&ui, "Импорт CSV", &path) else {return;}; window.close();
                 let sender=ui.sender.clone(); let runtime=ui.runtime.clone(); let profile=profile.clone(); let path=path.clone(); let object=ready.object.clone(); let options=ready.options.clone(); let mapping=mapping.clone(); let pool=pool.clone(); ui.status.set_text("Импорт CSV…");
                 let guard=ui.activity.start();
                 ui.runtime.spawn_blocking(move || {

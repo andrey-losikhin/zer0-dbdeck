@@ -22,18 +22,21 @@ builds are not supported.
 ## Features
 
 - PostgreSQL, MySQL and MariaDB profiles, multiple active connections and tabs.
-- Database/schema/table browser, including multiple databases per connection.
+- One tab strip in the header with connection/database labels; database/schema/table tree with system schemas hidden by default.
 - Server-side filters and sorting, raw SQL conditions and incremental table browsing.
+- Named table views restore filters, sorting and hidden columns from encrypted storage.
 - Spreadsheet-style ranges, TSV clipboard, resizable columns and staged cell edits.
 - Optimistic conflict detection, primary-key checks and explicit save/discard.
 - Editable SQL results when a single source table and its primary key can be identified.
 - SQL highlighting, completion, diagnostics, encrypted history and restored drafts.
 - Dedicated SQL sessions, manual transactions, commit/rollback, cancellation and timeouts.
+- Estimated query plans for PostgreSQL, MySQL and MariaDB. EXPLAIN uses one selected statement or the editor contents in a separate read-only session for the tab's database and schema. The server may reject plans for write statements in this session. To plan a query that depends on temporary tables or custom session settings, run EXPLAIN explicitly from the editor. To collect actual execution statistics, enter the database's ANALYZE syntax and use the usual SQL run action.
 - Read-only mode and per-operation confirmation for production writes.
 - CSV import with column mapping; streaming full-table CSV export.
 - Schema-only dumps, full database backups and native SQL/PostgreSQL custom restore.
+- The footer task menu shows running SQL and file operations, progress where available, cancellation and the last ten outcomes for the window.
 - Encrypted portable connection storage, OS-keyring/gopass auto-unlock and gopass references.
-- Command palette, searchable keyboard shortcuts and dark themes including Tokyo Night.
+- Command palette, searchable keyboard shortcuts and dark themes: Tokyo Night, Catppuccin Mocha, Gruvbox Dark, Nord, Rose Pine and Noctalia (follows `~/.config/noctalia/colors.json`).
 
 ## Requirements
 
@@ -87,7 +90,8 @@ the executable is not a standalone static binary.
 1. Create a connection, choose its database engine and transport, and test it.
 2. Open a database and a table, or create an SQL tab beside the existing tabs.
 3. Click to select cells; double-click or press Enter to edit. Changes remain
-   local until saved. Use the command palette to discover available actions.
+   local until saved. The command palette shows actions for the current tab and
+   connection. Search by words or shortcut, use ↑/↓ to select and Enter to run.
 4. Use a read-only database account for browsing. Enable writes separately when needed.
 
 | Shortcut | Action |
@@ -97,6 +101,8 @@ the executable is not a standalone static binary.
 | `Ctrl+Shift+?` | Searchable shortcut reference |
 | `Ctrl+Enter` | Run selected SQL, otherwise the whole editor |
 | `Ctrl+Space` | SQL completion |
+| `Ctrl+Shift+F` | Format the SQL editor contents locally |
+| `Ctrl+Shift+G` | Show the estimated query plan (EXPLAIN) |
 | `Ctrl+Shift+.` | Cancel the SQL query |
 | `Ctrl+Alt+T` | Toggle manual transactions |
 | `Ctrl+Alt+Enter` / `Ctrl+Alt+R` | Commit / rollback |
@@ -105,6 +111,12 @@ the executable is not a standalone static binary.
 | `Ctrl+Shift+I` / `Ctrl+Alt+I` | Native restore / CSV import |
 | `Ctrl+Shift+X` | Cancel a data transfer |
 | `Escape` | Dismiss a popup or cancel the current editor/selection |
+
+Choose **Связанные строки…** (Related rows) from a table cell’s context menu to browse the rows referenced by or referencing that row. The separate viewer follows declared foreign keys, including composite keys. PostgreSQL links with `PERIOD` are outside this viewer’s scope. It reads saved values from the database and shows up to 200 rows per relation. The source row needs a complete primary key.
+
+In **Структура и DDL…** (Structure and DDL), choose **Сравнить структуру…** (Compare structure) and select a table from an open connection of the same database engine. The result shows added, removed and changed columns, constraints and indexes by name, with both definitions for changes. Comparison reads catalog metadata. It covers these three categories and does not generate or run migration SQL.
+
+After a successful comparison, choose **Копировать Markdown** (Copy Markdown) to copy the report with both table and connection names and the comparison result.
 
 ## Data handling and safety
 
@@ -131,10 +143,15 @@ can leave a partially applied native import.
 | --- | --- |
 | Table browser | 200-row pages; up to 10,000 cached rows and 32 MiB of model data |
 | SQL preview | Up to 1,000 rows, 128 columns and 32 MiB of model data |
-| Cell preview | Up to 1,024 characters; truncated values cannot be overwritten |
+| Grid cell | Up to 1,024 characters; truncated values cannot be overwritten |
+| Load cell from database | Up to 16,384 characters (8,191 bytes for binary values), for table rows with a complete primary key. SQL results show the query snapshot. |
 | SQL result CSV | The displayed bounded snapshot |
 | Full-table CSV | Streaming export of the complete table |
 | CSV import | UTF-8, up to 1 MiB per record and 1,024 fields; transactional batches |
+
+When a single integer or PostgreSQL UUID primary key uniquely orders the rows,
+the next page starts after the last loaded key. Other orders with a primary key
+and PostgreSQL inheritance parents use offset pagination.
 
 A preview limit is not a server-side query limit. Use `LIMIT`, filters and suitable
 indexes for large or expensive SELECTs. The full query stream may still be read.

@@ -17,7 +17,9 @@ Rust bridge; Rust controls database access, clipboard data and staged writes.
 
 | Area | Files |
 | --- | --- |
-| Window, tabs, application events | `src/main.rs` |
+| Window, application events, status bar | `src/main.rs` |
+| Footer task list and in-memory outcomes | `src/background_tasks.rs` |
+| Single tab strip in the header bar and connection block of the status bar | `src/tab_strip.rs` |
 | Database adapters, browsing, edits, export | `src/database.rs` |
 | Dedicated SQL connection and transactions | `src/sql_session.rs` |
 | SQL risk classification and source-table detection | `src/sql_risk.rs`, `src/query_edit.rs` |
@@ -32,6 +34,44 @@ Rust bridge; Rust controls database access, clipboard data and staged writes.
 | Keyring/gopass and storage UI | `src/secret_store.rs`, `src/storage_ui.rs` |
 | Production confirmation and TLS controls | `src/production_ui.rs`, `src/connection_tls_ui.rs` |
 | Themes, preferences and keyboard commands | `src/theme.rs`, `src/preferences_ui.rs`, `src/shortcuts.rs` |
+| Noctalia theme (colours read from `~/.config/noctalia/colors.json`) | `src/noctalia.rs` |
+
+## Window layout
+
+One tab strip in the header bar mirrors both workspace notebooks (table tabs and
+SQL tabs). The notebooks keep their tab bars hidden and still own pages and
+selection; the strip only shows them and forwards clicks. Each tab has a type
+icon, a connection colour marker, a title (`schema.table` or `SQL N`) and a small
+second line `connection / database`. A middle click on a table in the tree opens
+it in a new tab. The status bar shows the active tab summary
+(`name - rows - ms - connection`) and a connection block (name, `LOCAL`, `RO`,
+TLS state).
+
+The table pane has a bottom bar with the row count, a "more rows" marker, query
+time, `+ row`, and `Apply (N)` / `Rollback` for staged edits. The SQL pane keeps
+`Execute as Markdown` in the overflow menu and shows Auto Commit as a switch kept
+in sync with the transaction mode.
+
+The catalog tree lists databases, then schemas, then tables; there is no separate
+schema dropdown. System schemas (PostgreSQL `information_schema`, `pg_catalog`,
+`pg_toast`, `pg_temp_*`; MySQL/MariaDB `information_schema`, `mysql`, `sys`,
+`performance_schema`) are hidden by default. The `show_system_schemas` setting
+and the tree checkbox control them.
+
+## Themes
+
+`ThemeMode` (`src/theme.rs`) has Dark, Tokyo Night, Catppuccin Mocha (default),
+Gruvbox Dark, Nord, Rose Pine, Noctalia and System. Each theme is a `Palette`
+plus a CSS file in `assets/themes/` and a GtkSourceView scheme in
+`assets/styles/`; `assets/themes/layout.css` holds shared layout rules that use
+palette roles. Old saved ids still map through `from_id`; unknown ids fall back
+to Catppuccin Mocha.
+
+Noctalia reads `~/.config/noctalia/colors.json`, accepts only `#RRGGBB(AA)`
+values through a strict `Rgb` type, takes missing keys from Tokyo Night, and uses
+Tokyo Night if the file is absent. A file monitor reloads the palette after
+about 250 ms; if a reload fails, the last valid palette stays. Text colours below
+WCAG AA contrast are lightened. The SQL scheme is generated into a cache.
 
 ## Data boundaries
 

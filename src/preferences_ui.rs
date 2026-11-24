@@ -45,7 +45,16 @@ fn row(title: &str, description: &str, icon: &str, control: &impl IsA<gtk::Widge
     let text = gtk::Box::new(gtk::Orientation::Vertical, 4);
     text.set_hexpand(true);
     text.append(&label(title, "settings-row-title"));
-    text.append(&label(description, "settings-description"));
+    if matches!(
+        title,
+        "Файл подключений" | "Менеджер ключа" | "Авторазблокировка" | "Общие пароли"
+    ) {
+        text.append(&label(description, "settings-description"));
+    } else {
+        let details = gtk::Expander::new(Some("Подробнее"));
+        details.set_child(Some(&label(description, "settings-description")));
+        text.append(&details);
+    }
     row.append(&text);
     control.set_valign(gtk::Align::Center);
     row.append(control);
@@ -56,10 +65,39 @@ fn update_preview(preview: &gtk::Box, mode: ThemeMode) {
     while let Some(child) = preview.first_child() {
         preview.remove(&child);
     }
-    for class in ["tokyo-night", "mocha", "graphite", "system"] {
+    for class in [
+        "tokyo-night",
+        "mocha",
+        "graphite",
+        "system",
+        "gruvbox",
+        "nord",
+        "rose-pine",
+        "noctalia",
+    ] {
         preview.remove_css_class(class);
     }
     let (class, name, description) = match mode {
+        ThemeMode::GruvboxDark => (
+            "gruvbox",
+            "Gruvbox Dark",
+            "Тёплая тёмная палитра с приглушёнными акцентами.",
+        ),
+        ThemeMode::Nord => (
+            "nord",
+            "Nord",
+            "Холодная арктическая палитра с голубым акцентом.",
+        ),
+        ThemeMode::RosePine => (
+            "rose-pine",
+            "Rose Pine",
+            "Тёмная палитра с лавандовым акцентом и розовыми оттенками.",
+        ),
+        ThemeMode::Noctalia => (
+            "noctalia",
+            "Noctalia",
+            "Цвета из ~/.config/noctalia/colors.json, обновляются на лету.",
+        ),
         ThemeMode::TokyoNight => (
             "tokyo-night",
             "Tokyo Night",
@@ -154,7 +192,7 @@ pub fn build(parent: &adw::ApplicationWindow) -> PreferencesUi {
     unlock_provider.append(Some("system"), "Системная связка ключей");
     general.append(&row("Менеджер ключа", "gopass хранит отдельную зашифрованную запись dbdeck-unlock. Системная связка может разблокироваться при входе в систему. Для смены менеджера сначала отключите автоматическую разблокировку.", "dialog-password-symbolic",&unlock_provider));
     let remember_unlock = gtk::Button::with_label("Включить…");
-    general.append(&row("Автоматическая разблокировка", "Ключ хранится в выбранном менеджере паролей. На новом компьютере потребуется исходный мастер-пароль. Если связка заблокирована, она может запросить вход.", "changes-prevent-symbolic", &remember_unlock));
+    general.append(&row("Авторазблокировка", "Ключ хранится в выбранном менеджере паролей. На новом компьютере потребуется исходный мастер-пароль. Если связка заблокирована, она может запросить вход.", "changes-prevent-symbolic", &remember_unlock));
     let import_gopass = gtk::Button::with_label("Добавить из gopass…");
     general.append(&row("Общие пароли", "Записи zer0-gopass-tui / zer0-waypass. Импорт параметров БД; пароль читается из gopass при каждом подключении и не дублируется в DBDeck.", "dialog-password-symbolic", &import_gopass));
     general.append(&row(
@@ -210,6 +248,10 @@ pub fn build(parent: &adw::ApplicationWindow) -> PreferencesUi {
     theme_selector.append(Some("tokyo_night"), "Tokyo Night");
     theme_selector.append(Some("dark"), "Сине-графитовая");
     theme_selector.append(Some("catppuccin_mocha"), "Catppuccin Mocha");
+    theme_selector.append(Some("gruvbox_dark"), "Gruvbox Dark");
+    theme_selector.append(Some("nord"), "Nord");
+    theme_selector.append(Some("rose_pine"), "Rose Pine");
+    theme_selector.append(Some("noctalia"), "Noctalia");
     appearance.append(&row(
         "Цветовая схема",
         "Применяется сразу ко всем открытым вкладкам",

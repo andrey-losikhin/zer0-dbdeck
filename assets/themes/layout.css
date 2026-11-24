@@ -1,0 +1,58 @@
+/* Layout-level elements: header tab strip and status-bar connection block.
+   Only named colors, so every theme restyles them through its palette. */
+.workspace-header {
+  padding: 4px 6px;
+  background: @dbdeck_panel;
+  color: @dbdeck_fg;
+}
+.tab-strip { margin: 0 8px; }
+.tab-strip-item {
+  margin: 4px 1px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  color: @dbdeck_muted;
+}
+.tab-strip-item:hover { background: alpha(@dbdeck_fg, 0.08); color: @dbdeck_fg; }
+.tab-strip-item > button.tab-strip-main {
+  min-height: 30px;
+  padding: 1px 4px 1px 8px;
+  border: none;
+  box-shadow: none;
+  background: none;
+  color: inherit;
+}
+.tab-strip-item > button.compact-tab-close { margin-right: 4px; color: inherit; }
+.tab-strip-active {
+  background: @dbdeck_selection;
+  color: @dbdeck_fg;
+  border-color: @dbdeck_border;
+  box-shadow: inset 0 -2px @dbdeck_accent;
+}
+.tab-strip-active label { font-weight: 700; }
+.tab-strip-item label.tab-strip-subtitle { font-size: 12px; font-weight: 400; opacity: 1; }
+.tab-strip-broken { border-color: @warning_color; }
+.tab-strip-add { min-width: 26px; min-height: 26px; padding: 0; color: @dbdeck_muted; }
+.tab-strip-add:hover { color: @dbdeck_fg; }
+
+.status-connection { margin-left: 8px; color: @dbdeck_fg; }
+.status-badge {
+  padding: 0 6px;
+  border-radius: 4px;
+  border: 1px solid @dbdeck_border;
+  background: @dbdeck_panel;
+  color: @dbdeck_fg;
+  font-size: 10px;
+  font-weight: 700;
+}
+.status-badge-prod { border-color: @error_color; }
+.status-badge-warn { border-color: @warning_color; }
+
+.table-filter-summary { margin: 2px 0; }
+.sql-split > separator {
+  min-height: 9px;
+  background: alpha(@dbdeck_fg, 0.12);
+  box-shadow: inset 0 1px @dbdeck_border, inset 0 -1px @dbdeck_border;
+}
+.sql-split > separator:hover, .sql-split > separator:focus {
+  background: @dbdeck_accent;
+}

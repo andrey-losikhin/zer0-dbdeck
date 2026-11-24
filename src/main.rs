@@ -1,5 +1,6 @@
 mod activity;
 mod app_instance;
+mod background_tasks;
 mod catalog_tree;
 mod csv;
 mod csv_import_ui;
@@ -17,24 +18,33 @@ mod loading_bar;
 mod markdown_export;
 mod namespace_ui;
 mod native_backup;
+mod noctalia;
+mod object_search;
 mod output_file;
 mod preferences_ui;
 mod production_ui;
+mod saved_table_views;
 mod secret_store;
 mod settings;
 mod shortcuts;
 mod sql_batch;
 mod sql_batch_ui;
+mod sql_completion;
 mod sql_editor;
+mod sql_explain;
+mod sql_format;
 mod sql_history_ui;
 mod sql_risk;
 mod sql_session;
 mod sql_workspace;
 mod storage_ui;
 mod structure_ui;
+mod tab_strip;
+mod table_relations_ui;
 mod tabulator;
 mod theme;
 mod transfer;
+mod ui_layout;
 mod workspace_ui;
 
 use std::{
@@ -47,14 +57,16 @@ use std::{
     time::Duration,
 };
 
+use background_tasks::{BackgroundTasks, Outcome, TRANSFER};
 use database::{
     CellValue, DbObject, DbPool, FilterLogic, FilterOperator, TableCatalog, TableCellEdit,
-    TableData, TableFilter, TableSort,
+    TableData, TableFilter, TableSort, TableViewState,
 };
 use relm4::adw::prelude::*;
 use relm4::{adw, gtk};
 use settings::{
-    ConnectionProfile, DatabaseKind, EnvironmentTag, ProfileSaveError, SettingsStore, TlsMode,
+    ConnectionProfile, DatabaseKind, EnvironmentTag, ProfileSaveError, SavedViewLayout,
+    SettingsStore, TlsMode,
 };
 use sourceview5::prelude::*;
 use tabulator::TabulatorGrid;
@@ -77,7 +89,12 @@ enum Event {
     TablesLoaded(u64, u64, Result<TableCatalog, String>),
     DatabasesLoaded(u64, u64, Result<Vec<String>, String>),
     NamespaceChoices(String, u64, Result<Vec<String>, String>),
-    TableLoaded(String, String, String, Result<TableData, String>),
+    TableLoaded(
+        String,
+        String,
+        Option<(SavedViewLayout, DbPool)>,
+        Result<TableData, String>,
+    ),
     TablePageLoaded(String, String, usize, Result<TableData, String>),
     TableEditsSaved(String, Result<u64, String>),
     TableRowChanged(String, String, Result<u64, String>),
@@ -89,7 +106,11 @@ enum Event {
         u128,
     ),
     SqlTransactionFinished(String, Result<sql_session::TransactionState, String>),
-    SqlCompletionsLoaded(String, Result<Vec<String>, String>),
+    SqlCompletionsLoaded(
+        String,
+        DbPool,
+        Result<database::SqlCompletionCatalog, String>,
+    ),
     CsvExported(usize, Result<(), String>),
     ExportProgress(usize),
     SqlBatchProgress(usize, usize),
@@ -165,8 +186,7 @@ struct Ui {
     unlock_provider: gtk::ComboBoxText,
     storage_path_label: gtk::Label,
     transfer_cancel: RefCell<Option<Arc<transfer::Cancellation>>>,
-    transfer_cancel_button: gtk::Button,
-    transfer_spinner: adw::Spinner,
+    background_tasks: BackgroundTasks,
     sql_directory_label: gtk::Label,
     csv_directory_label: gtk::Label,
     unlock_busy: Cell<bool>,
@@ -177,11 +197,20 @@ struct Ui {
     preferences: adw::Window,
     application_menu: gtk::MenuButton,
     sidebar_stack: gtk::Stack,
+    sidebar_toggle: gtk::ToggleButton,
+    layout: Rc<RefCell<ui_layout::Layout>>,
     connections_nav: gtk::Button,
     tables_nav: gtk::Button,
+    tables_hint: gtk::Label,
     profiles: gtk::Box,
+    profile_search: gtk::SearchEntry,
+    collapsed_environments: RefCell<HashSet<&'static str>>,
     objects: gtk::Box,
     table_filter: gtk::SearchEntry,
+    object_search_branches: RefCell<Vec<object_search::Branch>>,
+    system_schemas_toggle: gtk::CheckButton,
+    /// Set while the toggle is changed programmatically, so `toggled` does not save it.
+    system_schemas_syncing: Cell<bool>,
     namespace_row: gtk::Box,
     namespace_label: gtk::Label,
     namespace_selector: gtk::DropDown,
@@ -195,6 +224,8 @@ struct Ui {
     active_header: gtk::Box,
     active_details: gtk::Label,
     session_tabs: gtk::Notebook,
+    tab_strip: tab_strip::TabStrip,
+    connection_block: tab_strip::ConnectionBlock,
     table_tabs: gtk::Stack,
     session_table_tabs: RefCell<HashMap<String, gtk::Notebook>>,
     workspace_groups: RefCell<HashMap<String, workspace_ui::Group>>,
@@ -247,10 +278,13 @@ struct SqlTab {
     schema: Option<String>,
     profile_id: String,
     session: sql_session::SqlSession,
+    running_plan: Option<sql_session::SqlSession>,
     transaction_state: sql_session::TransactionState,
     transaction_label: gtk::Label,
+    auto_commit: gtk::Switch,
     transaction_buttons: Vec<gtk::Button>,
     actions_menu: gtk::MenuButton,
+    format_button: gtk::Button,
     page: gtk::Box,
     buffer: sourceview5::Buffer,
     editor: sourceview5::View,
@@ -260,6 +294,7 @@ struct SqlTab {
     export_button: gtk::Button,
     copy_button: gtk::Button,
     result_stack: gtk::Stack,
+    plan_view: gtk::TextView,
     completion_provider: sql_editor::SqlProvider,
     diagnostics: Rc<sql_editor::Diagnostics>,
     style_schemes: sourceview5::StyleSchemeManager,
@@ -283,13 +318,20 @@ struct SqlTab {
     elapsed_timer: Option<gtk::glib::SourceId>,
     /// Whether the last sent statement needed write approval (such SQL is never retried).
     sent_needing_approval: bool,
+    /// Last status-bar summary "N строк · мс · подключение"; reshown when the tab is selected.
+    last_status: Option<String>,
 }
 
-#[derive(Clone, Default)]
-struct TableViewState {
-    filters: Vec<TableFilter>,
-    raw_condition: Option<String>,
-    sort: Option<TableSort>,
+impl SqlTab {
+    fn result_focus_widget(&self) -> Option<&gtk::Widget> {
+        match self.result_stack.visible_child_name().as_deref() {
+            Some("plan") => Some(self.plan_view.upcast_ref()),
+            Some("data") if self.tabulator.webview.is_sensitive() => {
+                Some(self.tabulator.webview.upcast_ref())
+            }
+            _ => None,
+        }
+    }
 }
 
 struct FilterRowWidgets {
@@ -302,6 +344,8 @@ struct FilterRowWidgets {
 }
 
 struct TableFilterPanel {
+    toggle: gtk::ToggleButton,
+    summary: gtk::Label,
     rows: gtk::Box,
     controls: RefCell<Vec<FilterRowWidgets>>,
     columns: RefCell<Vec<String>>,
@@ -314,6 +358,15 @@ struct TableFilterPanel {
     column_width: gtk::SizeGroup,
     operator_width: gtk::SizeGroup,
     row_height: gtk::SizeGroup,
+}
+
+impl TableFilterPanel {
+    fn set_summary(&self, summary: &str) {
+        self.summary.set_text(summary);
+        self.summary.set_visible(!summary.is_empty());
+        self.toggle
+            .set_tooltip_text((!summary.is_empty()).then_some(summary));
+    }
 }
 
 struct TableEditState {
@@ -335,6 +388,12 @@ struct TableEditState {
     discard_button: gtk::Button,
     bulk_button: gtk::Button,
     status: gtk::Label,
+    /// Always visible: "N строк · есть ещё · мс".
+    summary: gtk::Label,
+    add_row_button: gtk::Button,
+    load_started: Cell<Option<std::time::Instant>>,
+    load_ms: Cell<Option<u128>>,
+    loaded_view: RefCell<Option<TableViewState>>,
 }
 
 fn main() {
@@ -362,6 +421,7 @@ fn main() {
 }
 
 fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -> Rc<Ui> {
+    let layout = Rc::new(RefCell::new(ui_layout::Layout::load()));
     let app_title = app_instance::AppInstance::current().title();
     dialogs::watch_toplevels();
     let (sender, receiver) = mpsc::channel();
@@ -372,13 +432,22 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         .default_height(820)
         .build();
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    let header = adw::HeaderBar::new();
-    let title = gtk::Label::new(Some(app_title));
-    title.add_css_class("title");
-    header.set_title_widget(Some(&title));
+    let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    header.add_css_class("titlebar");
+    header.add_css_class("workspace-header");
+    let start_controls = gtk::WindowControls::new(gtk::PackType::Start);
+    start_controls.set_valign(gtk::Align::Center);
+    header.append(&start_controls);
+    let tab_strip = tab_strip::TabStrip::new(app_title);
+    header.append(&tab_strip.root);
+    // Keep native titlebar gestures without reserving space for a centered title.
+    let header_handle = gtk::WindowHandle::new();
+    header_handle.set_child(Some(&header));
+    let connection_block = tab_strip::ConnectionBlock::new();
     let application_menu = gtk::MenuButton::builder()
         .icon_name("open-menu-symbolic")
         .tooltip_text("Меню приложения (Alt+M)")
+        .valign(gtk::Align::Center)
         .build();
     let application_popover = gtk::Popover::new();
     let application_actions = gtk::Box::new(gtk::Orientation::Vertical, 2);
@@ -408,7 +477,10 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         "preferences-desktop-keyboard-shortcuts-symbolic",
     );
     application_menu.set_popover(Some(&application_popover));
-    header.pack_end(&application_menu);
+    header.append(&application_menu);
+    let end_controls = gtk::WindowControls::new(gtk::PackType::End);
+    end_controls.set_valign(gtk::Align::Center);
+    header.append(&end_controls);
     let preferences_ui::PreferencesUi {
         window: preferences,
         export_backup,
@@ -426,7 +498,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     shortcuts::button(&preferences, &export_backup, "<Control><Shift>e");
     shortcuts::button(&preferences, &import_backup, "<Control>o");
     dialogs::install(&preferences);
-    root.append(&header);
+    root.append(&header_handle);
     let activity_bar = loading_bar::new();
     root.append(&activity_bar);
     let connection_banner = adw::Banner::new("Соединение потеряно");
@@ -437,7 +509,10 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
 
     let body = gtk::Paned::new(gtk::Orientation::Horizontal);
     body.set_vexpand(true);
-    body.set_position(318);
+    body.set_position(layout.borrow().sidebar_width);
+    body.set_resize_start_child(false);
+    // Иначе Paned сжимает левую часть и обрезает полосу иконок.
+    body.set_shrink_start_child(false);
     let left_area = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     let navigation_rail = gtk::Box::new(gtk::Orientation::Vertical, 12);
     navigation_rail.set_size_request(54, -1);
@@ -448,7 +523,6 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     update_navigation_rail_icon(&connections_nav, "database");
     let tables_nav = navigation_rail_button("tables", "Таблицы");
     tables_nav.add_css_class("sidebar-nav-button");
-    tables_nav.set_sensitive(false);
     update_navigation_rail_icon(&tables_nav, "tables");
     let settings_button = navigation_rail_button("settings", "Общие настройки");
     settings_button.add_css_class("sidebar-nav-button");
@@ -456,6 +530,12 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     navigation_rail.append(&connections_nav);
     navigation_rail.append(&tables_nav);
     navigation_rail.append(&settings_button);
+    let sidebar_toggle = gtk::ToggleButton::new();
+    sidebar_toggle.set_icon_name("sidebar-show-symbolic");
+    sidebar_toggle.set_tooltip_text(Some("Боковая панель (Ctrl+B)"));
+    sidebar_toggle.set_widget_name("sidebar-toggle");
+    sidebar_toggle.set_active(!layout.borrow().sidebar_collapsed);
+    navigation_rail.append(&sidebar_toggle);
     let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 10);
     let connections_toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 5);
     let connections_title = gtk::Label::new(Some("Подключения"));
@@ -473,8 +553,10 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     connections_toolbar.append(&add_button);
     sidebar.append(&connections_toolbar);
     sidebar.add_css_class("sidebar-panel");
-    let profiles = gtk::Box::new(gtk::Orientation::Vertical, 6);
-    profiles.set_spacing(12);
+    let profile_search = gtk::SearchEntry::new();
+    profile_search.set_placeholder_text(Some("Поиск подключений"));
+    sidebar.append(&profile_search);
+    let profiles = gtk::Box::new(gtk::Orientation::Vertical, 1);
     let profile_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
         .child(&profiles)
@@ -482,13 +564,34 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     sidebar.append(&profile_scroll);
     let objects_page = gtk::Box::new(gtk::Orientation::Vertical, 8);
     objects_page.add_css_class("sidebar-panel");
+    let tables_hint = gtk::Label::new(Some(
+        "Таблицы появятся после подключения к базе данных. Откройте раздел «Подключения» и выберите сервер.",
+    ));
+    tables_hint.set_widget_name("tables-hint");
+    tables_hint.set_wrap(true);
+    tables_hint.set_xalign(0.0);
+    tables_hint.add_css_class("dim-label");
+    objects_page.append(&tables_hint);
     let (namespace_row, namespace_label, namespace_selector, namespace_spinner) =
         namespace_ui::widgets();
     objects_page.append(&namespace_row);
     let table_filter = gtk::SearchEntry::new();
-    table_filter.set_placeholder_text(Some("Фильтр таблиц"));
+    table_filter.set_placeholder_text(Some("Поиск баз, схем и таблиц"));
+    table_filter.set_tooltip_text(Some(
+        "Поиск в загруженном каталоге. Раскройте базу, чтобы загрузить её объекты.",
+    ));
     table_filter.set_visible(false);
     objects_page.append(&table_filter);
+    let system_schemas_toggle = gtk::CheckButton::with_label("Системные схемы");
+    system_schemas_toggle.set_widget_name("system-schemas-toggle");
+    system_schemas_toggle.set_tooltip_text(Some(
+        "Показывать служебные схемы: information_schema, pg_catalog, mysql, sys",
+    ));
+    table_filter
+        .bind_property("visible", &system_schemas_toggle, "visible")
+        .sync_create()
+        .build();
+    objects_page.append(&system_schemas_toggle);
     let objects = gtk::Box::new(gtk::Orientation::Vertical, 3);
     let objects_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -508,12 +611,45 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     left_area.append(&navigation_rail);
     left_area.append(&sidebar_content);
     body.set_start_child(Some(&left_area));
+    sidebar_content.set_visible(sidebar_toggle.is_active());
+    if !sidebar_toggle.is_active() {
+        body.set_position(54);
+    }
+    {
+        let body = body.clone();
+        let content = sidebar_content.clone();
+        let layout = layout.clone();
+        sidebar_toggle.connect_toggled(move |toggle| {
+            let expanded = toggle.is_active();
+            if !expanded {
+                layout.borrow_mut().sidebar_width = body.position().max(318);
+            }
+            layout.borrow_mut().sidebar_collapsed = !expanded;
+            content.set_visible(expanded);
+            body.set_position(if expanded {
+                layout.borrow().sidebar_width
+            } else {
+                54
+            });
+        });
+    }
+    {
+        let layout = layout.clone();
+        let toggle = sidebar_toggle.clone();
+        body.connect_position_notify(move |body| {
+            if toggle.is_active() && body.position() >= 318 {
+                layout.borrow_mut().sidebar_width = body.position();
+            }
+        });
+    }
 
-    let workspace = gtk::Box::new(gtk::Orientation::Vertical, 8);
+    let workspace = gtk::Box::new(gtk::Orientation::Vertical, 4);
     workspace.set_margin_start(12);
     workspace.set_margin_end(14);
+    workspace.set_margin_top(4);
+    // Pages stay here for selection logic; the header tab strip is the visible tab bar.
     let session_tabs = gtk::Notebook::new();
-    session_tabs.set_scrollable(true);
+    session_tabs.set_show_tabs(false);
     session_tabs.set_show_border(false);
     session_tabs.set_visible(false);
     session_tabs.add_css_class("app-header-tabs");
@@ -535,8 +671,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     active_labels.set_hexpand(true);
     active_header_row.append(&active_labels);
     active_header.append(&active_header_row);
+    // Kept for the connection list; the status bar shows this data instead.
     active_header.set_visible(false);
-    workspace.append(&active_header);
 
     let table_tabs = gtk::Stack::new();
     table_tabs.set_transition_type(gtk::StackTransitionType::None);
@@ -544,7 +680,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     table_tabs.set_vexpand(true);
     table_tabs.set_visible(false);
     let landing = gtk::Box::new(gtk::Orientation::Vertical, 14);
-    landing.set_halign(gtk::Align::Center);
+    landing.set_halign(gtk::Align::Fill);
     landing.set_valign(gtk::Align::Center);
     landing.set_hexpand(true);
     landing.set_vexpand(true);
@@ -555,9 +691,16 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     icon.add_css_class("dim-label");
     let landing_title = gtk::Label::new(Some("Начните с подключения к базе данных"));
     landing_title.add_css_class("title-1");
+    landing_title.set_wrap(true);
+    landing_title.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    landing_title.set_justify(gtk::Justification::Center);
+    landing_title.set_max_width_chars(42);
     let landing_description = gtk::Label::new(Some(
-        "Создайте профиль PostgreSQL или MySQL/MariaDB,\nлибо выберите сохранённое подключение слева.",
+        "Создайте профиль PostgreSQL или MySQL/MariaDB, либо выберите сохранённое подключение слева.",
     ));
+    landing_description.set_wrap(true);
+    landing_description.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    landing_description.set_max_width_chars(54);
     landing_description.set_justify(gtk::Justification::Center);
     landing_description.add_css_class("dim-label");
     let create_connection = gtk::Button::with_label("Создать подключение");
@@ -569,13 +712,16 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     landing.append(&create_connection);
     workspace.append(&landing);
     let empty_session = gtk::Box::new(gtk::Orientation::Vertical, 8);
-    empty_session.set_halign(gtk::Align::Center);
+    empty_session.set_halign(gtk::Align::Fill);
     empty_session.set_valign(gtk::Align::Center);
     empty_session.set_hexpand(true);
     empty_session.set_vexpand(true);
     empty_session.set_visible(false);
     let empty_session_hint = gtk::Label::new(None);
     empty_session_hint.add_css_class("dim-label");
+    empty_session_hint.set_wrap(true);
+    empty_session_hint.set_wrap_mode(gtk::pango::WrapMode::WordChar);
+    empty_session_hint.set_max_width_chars(54);
     empty_session_hint.set_justify(gtk::Justification::Center);
     let empty_session_sql = gtk::Button::with_label("Новый SQL-запрос");
     empty_session_sql.add_css_class("suggested-action");
@@ -589,6 +735,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 10);
     footer.set_margin_start(14);
     footer.set_margin_end(14);
+    footer.set_margin_bottom(6);
     footer.add_css_class("app-footer");
     let status = gtk::Label::new(Some("Готово"));
     status.set_xalign(0.0);
@@ -596,13 +743,9 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
     status.set_width_chars(1);
     footer.append(&dialogs::copyable_label(&status));
-    let transfer_spinner = adw::Spinner::new();
-    transfer_spinner.set_size_request(16, 16);
-    transfer_spinner.set_visible(false);
-    footer.append(&transfer_spinner);
-    let transfer_cancel_button = gtk::Button::with_label("Отменить операцию");
-    transfer_cancel_button.set_visible(false);
-    footer.append(&transfer_cancel_button);
+    footer.append(&connection_block.root);
+    let background_tasks = BackgroundTasks::new();
+    footer.append(&background_tasks.button);
     root.append(&footer);
     window.set_content(Some(&root));
 
@@ -637,8 +780,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         unlock_provider,
         storage_path_label: storage_path,
         transfer_cancel: RefCell::new(None),
-        transfer_cancel_button,
-        transfer_spinner,
+        background_tasks,
         sql_directory_label,
         csv_directory_label,
         unlock_busy: Cell::new(false),
@@ -649,11 +791,19 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         application_menu,
         window,
         sidebar_stack: sidebar_stack.clone(),
+        sidebar_toggle: sidebar_toggle.clone(),
+        layout: layout.clone(),
         connections_nav: connections_nav.clone(),
         tables_nav: tables_nav.clone(),
+        tables_hint,
         profiles,
+        profile_search,
+        collapsed_environments: RefCell::new(HashSet::new()),
         objects,
         table_filter,
+        object_search_branches: RefCell::new(Vec::new()),
+        system_schemas_toggle: system_schemas_toggle.clone(),
+        system_schemas_syncing: Cell::new(false),
         namespace_row,
         namespace_label,
         namespace_selector,
@@ -667,6 +817,8 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         active_header,
         active_details,
         session_tabs,
+        tab_strip,
+        connection_block,
         table_tabs,
         session_table_tabs: RefCell::new(HashMap::new()),
         workspace_groups: RefCell::new(HashMap::new()),
@@ -719,6 +871,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         last_active: RefCell::new(HashMap::new()),
         recovered_at: RefCell::new(HashMap::new()),
     });
+    tab_strip::bind(&ui);
     let weak = Rc::downgrade(&ui);
     ui.connection_banner.connect_button_clicked(move |_| {
         let Some(ui) = weak.upgrade() else { return };
@@ -749,6 +902,12 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
         }
     });
     let weak = Rc::downgrade(&ui);
+    ui.profile_search.connect_search_changed(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            refresh_profiles(&ui);
+        }
+    });
+    let weak = Rc::downgrade(&ui);
     ui.table_filter.connect_activate(move |_| {
         if let Some(ui) = weak.upgrade() {
             apply_table_list_filter(&ui);
@@ -769,21 +928,30 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
             ui.preferences.present();
         }
     });
-    let weak = Rc::downgrade(&ui);
-    ui.transfer_cancel_button.connect_clicked(move |button| {
-        if let Some(ui) = weak.upgrade() {
-            if let Some(cancel) = ui.transfer_cancel.borrow().as_ref() {
-                let accepted = cancel.request();
-                ui.status.set_text(if accepted {
-                    "Отменяю экспорт…"
-                } else {
-                    "Завершаю запись файла…"
-                });
-            }
-            button.set_sensitive(false);
-        }
-    });
     namespace_ui::install(&ui);
+    storage_ui::sync_system_schemas(&ui);
+    let weak = Rc::downgrade(&ui);
+    system_schemas_toggle.connect_toggled(move |toggle| {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.system_schemas_syncing.get() {
+            return;
+        }
+        let saved = ui
+            .store
+            .borrow_mut()
+            .as_mut()
+            .map(|store| store.set_show_system_schemas(toggle.is_active()));
+        if let Some(Err(error)) = saved {
+            ui.status.set_text(&error);
+            // Keep the checkbox equal to the stored value when saving failed.
+            ui.system_schemas_syncing.set(true);
+            toggle.set_active(!toggle.is_active());
+            ui.system_schemas_syncing.set(false);
+        }
+        show_table_catalog(&ui);
+    });
     let weak = Rc::downgrade(&ui);
     ui.empty_session_sql.connect_clicked(move |_| {
         let Some(ui) = weak.upgrade() else { return };
@@ -818,9 +986,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     });
     let weak = Rc::downgrade(&ui);
     tables_nav.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade()
-            && ui.objects_available.get()
-        {
+        if let Some(ui) = weak.upgrade() {
             show_sidebar(&ui, "tables");
         }
     });
@@ -895,6 +1061,11 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
     let weak = Rc::downgrade(&ui);
     theme_selector.connect_changed(move |_| {
         if let Some(ui) = weak.upgrade() {
+            if ui.active_theme.get() == ThemeMode::Noctalia {
+                for tab in ui.sql_tabs.borrow().values() {
+                    theme::refresh_sql_schemes(&tab.style_schemes);
+                }
+            }
             refresh_sql_editor_themes(&ui);
         }
     });
@@ -914,6 +1085,26 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
             });
         }
     });
+    let weak = Rc::downgrade(&ui);
+    let provider = theme_provider.clone();
+    if let Some(monitor) = noctalia::watch(move || {
+        let Some(ui) = weak.upgrade() else {
+            return;
+        };
+        if ui.active_theme.get() != ThemeMode::Noctalia {
+            return;
+        }
+        theme::apply_mode(ThemeMode::Noctalia, &provider);
+        for tab in ui.sql_tabs.borrow().values() {
+            theme::refresh_sql_schemes(&tab.style_schemes);
+        }
+        refresh_sql_editor_themes(&ui);
+    }) {
+        // Монитор живёт, пока жив обработчик закрытия окна.
+        ui.window.connect_destroy(move |_| {
+            monitor.cancel();
+        });
+    }
     let weak = Rc::downgrade(&ui);
     let palette_ui = Rc::downgrade(&ui);
     commands_button.connect_clicked(move |_| {
@@ -950,6 +1141,7 @@ fn build_window(app: &adw::Application, runtime: Arc<tokio::runtime::Runtime>) -
             for profile in profiles {
                 if let Err(error) = sql_history_ui::save_drafts(&ui, &profile) { show_error_dialog(&ui, "SQL-вкладки не сохранены", &error); return gtk::glib::Propagation::Stop; }
             }
+            if let Err(error) = ui.layout.borrow().save() { eprintln!("{error}"); }
             if let Some(cancel) = ui.transfer_cancel.borrow().as_ref() { cancel.request(); }
             let sessions: Vec<_> = ui.sql_tabs.borrow().values().map(|t| t.session.clone()).collect();
             for session in sessions { ui.runtime.spawn(async move { session.close().await; }); }
@@ -974,6 +1166,7 @@ fn refresh_profiles(ui: &Rc<Ui>) {
         .as_ref()
         .map(|s| s.profiles.clone())
         .unwrap_or_default();
+    ui.profile_search.set_visible(!profiles.is_empty());
     if profiles.is_empty() {
         let empty = gtk::Label::new(Some("Подключений пока нет\nНажмите «＋ Подключение»"));
         empty.set_wrap(true);
@@ -983,244 +1176,316 @@ fn refresh_profiles(ui: &Rc<Ui>) {
         ui.profiles.append(&empty);
         return;
     }
-    for profile in profiles {
-        let card = gtk::Box::new(gtk::Orientation::Vertical, 2);
-        card.add_css_class("connection-card");
-        if ui
-            .current_profile
-            .borrow()
-            .as_ref()
-            .is_some_and(|current| current.id == profile.id)
-        {
-            card.add_css_class("connection-card-active");
-            card.add_css_class(profile_color_class(&profile.color));
+    let query = ui.profile_search.text().trim().to_lowercase();
+    let matches = |profile: &ConnectionProfile| {
+        query.is_empty()
+            || profile.name.to_lowercase().contains(&query)
+            || profile.host.to_lowercase().contains(&query)
+            || profile.database.to_lowercase().contains(&query)
+    };
+    let mut shown = 0;
+    for environment in [
+        EnvironmentTag::Prod,
+        EnvironmentTag::Stage,
+        EnvironmentTag::Local,
+    ] {
+        let group: Vec<_> = profiles
+            .iter()
+            .filter(|p| p.environment.label() == environment.label() && matches(p))
+            .collect();
+        if group.is_empty() {
+            continue;
         }
-        let top = gtk::Box::new(gtk::Orientation::Horizontal, 7);
-        let dot = gtk::Label::new(Some("●"));
-        dot.set_markup(&format!(
-            "<span foreground=\"{}\">●</span>",
-            escape_markup(&profile.color)
-        ));
-        let name = gtk::Label::new(Some(&profile.name));
-        name.set_xalign(0.0);
-        name.set_hexpand(true);
-        name.add_css_class("heading");
-        name.set_markup(&format!(
-            "<span foreground=\"{}\">{}</span>",
-            escape_markup(&profile.color),
-            escape_markup(&profile.name)
-        ));
-        let default_brand = match profile.kind {
-            DatabaseKind::PostgreSql => "postgresql",
-            DatabaseKind::MySql => "mysql",
-            DatabaseKind::MariaDb => "mariadb",
-        };
-        let brand = penpot_icon_image(
-            ui.server_icons
-                .borrow()
-                .get(&profile_session_key(&profile))
-                .copied()
-                .unwrap_or(default_brand),
-        );
-        brand.set_pixel_size(22);
-        brand.set_size_request(22, 22);
-        brand.remove_css_class("penpot-icon");
-        brand.set_tooltip_text(Some(profile.kind.label()));
-        top.append(&brand);
-        top.append(&dot);
-        top.append(&name);
-        let tag = gtk::Label::new(Some(profile.environment.label()));
-        tag.add_css_class("tag");
-        tag.add_css_class("environment-tag");
-        match profile.environment {
-            EnvironmentTag::Prod => tag.add_css_class("tag-prod"),
-            EnvironmentTag::Stage => tag.add_css_class("tag-stage"),
-            EnvironmentTag::Local => tag.add_css_class("tag-local"),
-        }
-        top.append(&tag);
-        if ui
-            .current_profile
-            .borrow()
-            .as_ref()
-            .is_some_and(|current| current.id == profile.id)
-        {
-            let active = gtk::Label::new(Some("ОТКРЫТО"));
-            active.add_css_class("tag");
-            active.add_css_class("tag-active");
-            top.append(&active);
-        }
-        if matches!(
-            ui.profile_status.borrow().get(&profile.id),
-            Some(ProfileStatus::Broken)
-        ) {
-            let broken = gtk::Image::from_icon_name("network-offline-symbolic");
-            broken.set_tooltip_text(Some("Соединение потеряно"));
-            top.append(&broken);
-        }
-        if is_profile_connected(ui, &profile.id) {
-            top.add_css_class("profile-card-navigable");
-            install_profile_card_navigation(ui, &top, &profile);
-        }
-        card.append(&top);
-        let address = gtk::Label::new(Some(&format!(
-            "{} · {}:{}",
-            profile.kind.label(),
-            profile.host,
-            profile.port
-        )));
-        address.set_xalign(0.0);
-        address.set_single_line_mode(true);
-        address.set_ellipsize(gtk::pango::EllipsizeMode::End);
-        address.set_tooltip_text(Some(&format!(
-            "{} · {}:{}",
-            profile.kind.label(),
-            profile.host,
-            profile.port
-        )));
-        address.add_css_class("dim-label");
-        if is_profile_connected(ui, &profile.id) {
-            address.add_css_class("profile-card-navigable");
-            install_profile_card_navigation(ui, &address, &profile);
-        }
-        card.append(&address);
-        let profile_state = ui.profile_status.borrow().get(&profile.id).cloned();
-        if let Some(state) = profile_state.as_ref() {
-            if !matches!(state, ProfileStatus::Connected) {
-                let (text, style) = match state {
-                    ProfileStatus::Connecting => ("Подключение…".to_owned(), "status-pending"),
-                    ProfileStatus::Verified => {
-                        ("Проверка подключения успешна".to_owned(), "status-success")
-                    }
-                    ProfileStatus::Connected => unreachable!(),
-                    ProfileStatus::Broken => ("Соединение потеряно".to_owned(), "status-error"),
-                    ProfileStatus::Error(error) => (format!("Ошибка: {error}"), "status-error"),
-                };
-                let status = gtk::Label::new(Some(&text));
-                status.set_xalign(0.0);
-                status.set_wrap(true);
-                status.add_css_class("connection-status");
-                status.add_css_class(style);
-                if matches!(state, ProfileStatus::Error(_)) {
-                    card.append(&dialogs::copyable_label(&status));
-                } else {
-                    card.append(&status);
-                }
+        shown += group.len();
+        let label = environment.label();
+        // A search shows every match regardless of collapsed groups.
+        let collapsed = query.is_empty() && ui.collapsed_environments.borrow().contains(label);
+        ui.profiles
+            .append(&profile_group_header(ui, label, group.len(), collapsed));
+        if !collapsed {
+            for profile in group {
+                ui.profiles.append(&profile_row(ui, profile));
             }
         }
-        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 4);
-        actions.set_homogeneous(false);
-        actions.set_margin_top(6);
-        let is_connected = matches!(
-            profile_state.as_ref(),
-            Some(ProfileStatus::Connected | ProfileStatus::Broken)
-        );
-        let is_connecting = matches!(profile_state.as_ref(), Some(ProfileStatus::Connecting));
-        if is_connected {
-            let connected_icon = penpot_icon_image("status-connected");
-            connected_icon.remove_css_class("penpot-icon");
-            connected_icon.set_pixel_size(22);
-            connected_icon.set_size_request(22, 22);
-            let disconnect = gtk::Button::new();
-            disconnect.set_child(Some(&connected_icon));
-            disconnect.add_css_class("flat");
-            disconnect.add_css_class("connection-action");
-            disconnect.add_css_class("connected-action");
-            disconnect.set_tooltip_text(Some("Отключить"));
-            let weak = Rc::downgrade(ui);
-            let profile_id = profile.id.clone();
-            disconnect.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    close_profile_sessions(&ui, &profile_id);
+    }
+    if shown == 0 {
+        let empty = gtk::Label::new(Some("Ничего не найдено"));
+        empty.set_margin_top(18);
+        empty.add_css_class("dim-label");
+        ui.profiles.append(&empty);
+    }
+}
+
+fn profile_group_header(
+    ui: &Rc<Ui>,
+    label: &'static str,
+    count: usize,
+    collapsed: bool,
+) -> gtk::Button {
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let arrow = gtk::Image::from_icon_name(if collapsed {
+        "pan-end-symbolic"
+    } else {
+        "pan-down-symbolic"
+    });
+    arrow.set_pixel_size(12);
+    content.append(&arrow);
+    let title = gtk::Label::new(Some(label));
+    title.set_xalign(0.0);
+    title.set_hexpand(true);
+    content.append(&title);
+    content.append(&gtk::Label::new(Some(&count.to_string())));
+    let header = gtk::Button::new();
+    header.set_child(Some(&content));
+    header.add_css_class("flat");
+    header.add_css_class("connection-group-header");
+    header.set_tooltip_text(Some(if collapsed {
+        "Развернуть группу"
+    } else {
+        "Свернуть группу"
+    }));
+    let weak = Rc::downgrade(ui);
+    header.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            {
+                let mut collapsed = ui.collapsed_environments.borrow_mut();
+                if !collapsed.remove(label) {
+                    collapsed.insert(label);
                 }
-            });
-            shortcuts::button(&card, &disconnect, "<Alt>Return");
-            actions.append(&disconnect);
+            }
+            refresh_profiles(&ui);
+        }
+    });
+    header
+}
+
+fn profile_row_icon(name: &str, size: i32) -> gtk::Image {
+    let icon = penpot_icon_image(name);
+    icon.remove_css_class("penpot-icon");
+    icon.set_pixel_size(size);
+    icon.set_size_request(size, size);
+    icon
+}
+
+/// Copies the profile with its stored password and opens the copy for editing.
+fn duplicate_profile(ui: &Rc<Ui>, profile: &ConnectionProfile) {
+    let mut copy = profile.clone();
+    copy.id = Uuid::new_v4().to_string();
+    copy.name = format!("{} (копия)", profile.name);
+    let result = ui.store.borrow_mut().as_mut().map(|store| {
+        let password = if profile.gopass_entry.is_some() {
+            String::new()
         } else {
-            let connect = gtk::Button::new();
-            let connect_icon = penpot_icon_image("status-idle");
-            connect_icon.remove_css_class("penpot-icon");
-            connect_icon.set_pixel_size(22);
-            connect_icon.set_size_request(22, 22);
-            connect.set_child(Some(&connect_icon));
-            set_penpot_icon_hover(&connect, &connect_icon, "status-idle");
-            connect.add_css_class("flat");
-            connect.add_css_class("connection-action");
-            if is_connecting {
-                connect.set_tooltip_text(Some("Подключение..."));
-                connect.set_sensitive(false);
-                let spinner = adw::Spinner::new();
-                spinner.set_size_request(22, 22);
-                connect.set_child(Some(&spinner));
-            } else {
-                connect.set_tooltip_text(Some("Подключить"));
-            }
-            let weak = Rc::downgrade(ui);
-            let saved = profile.clone();
-            connect.connect_clicked(move |_| {
-                if let Some(ui) = weak.upgrade() {
-                    connect_profile(&ui, saved.clone());
-                }
-            });
-            shortcuts::button(&card, &connect, "<Alt>Return");
-            actions.append(&connect);
+            store.password(&profile.id)?
+        };
+        store
+            .save_profile(copy.clone(), &password)
+            .map_err(|error| match error {
+                ProfileSaveError::Secret(error) | ProfileSaveError::Settings(error) => error,
+            })
+    });
+    match result {
+        Some(Ok(())) => {
+            ui.status.set_text("Подключение скопировано");
+            refresh_profiles(ui);
+            show_connection_form(ui, Some(copy));
         }
-        let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-        spacer.set_hexpand(true);
-        actions.append(&spacer);
-        let edit = gtk::Button::new();
-        let edit_icon = penpot_icon_image("edit");
-        edit_icon.remove_css_class("penpot-icon");
-        edit_icon.set_pixel_size(22);
-        edit_icon.set_size_request(22, 22);
-        edit.set_child(Some(&edit_icon));
-        set_penpot_icon_hover(&edit, &edit_icon, "edit");
-        edit.add_css_class("flat");
-        edit.add_css_class("connection-action");
-        edit.set_tooltip_text(Some("Изменить подключение"));
-        edit.set_size_request(28, 28);
-        let weak = Rc::downgrade(ui);
-        let saved = profile.clone();
-        edit.connect_clicked(move |_| {
-            if let Some(ui) = weak.upgrade() {
-                let after_unlock = ui.clone();
-                let profile = saved.clone();
-                ensure_vault_unlocked(&ui, move || {
-                    show_connection_form(&after_unlock, Some(profile))
-                });
-            }
-        });
-        shortcuts::button(&card, &edit, "<Alt>e");
-        actions.append(&edit);
-        let delete = gtk::Button::new();
-        let delete_icon = penpot_icon_image("delete");
-        delete_icon.remove_css_class("penpot-icon");
-        delete_icon.set_pixel_size(22);
-        delete_icon.set_size_request(22, 22);
-        delete.set_child(Some(&delete_icon));
-        set_penpot_icon_hover(&delete, &delete_icon, "delete");
-        delete.add_css_class("flat");
-        delete.add_css_class("connection-action");
-        delete.set_tooltip_text(Some("Удалить подключение"));
-        delete.set_size_request(28, 28);
+        Some(Err(error)) => show_error_dialog(ui, "Подключение не скопировано", &error),
+        None => {}
+    }
+}
+
+/// Single click focuses an open connection; double click or Enter opens a closed one.
+fn activate_profile_row(ui: &Rc<Ui>, profile: &ConnectionProfile) {
+    if is_profile_connected(ui, &profile.id) {
+        select_connection_database(ui, profile);
+    } else if !matches!(
+        ui.profile_status.borrow().get(&profile.id),
+        Some(ProfileStatus::Connecting)
+    ) {
+        connect_profile(ui, profile.clone());
+    }
+}
+
+fn profile_row(ui: &Rc<Ui>, profile: &ConnectionProfile) -> gtk::Box {
+    let card = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    card.add_css_class("connection-row");
+    card.add_css_class(profile_color_class(&profile.color));
+    card.set_focusable(true);
+    let database = if profile.database.trim().is_empty() {
+        String::new()
+    } else {
+        format!(" · {}", profile.database)
+    };
+    card.set_tooltip_text(Some(&format!(
+        "{} · {}:{}{database}",
+        profile.kind.label(),
+        profile.host,
+        profile.port
+    )));
+    if ui
+        .current_profile
+        .borrow()
+        .as_ref()
+        .is_some_and(|current| current.id == profile.id)
+    {
+        card.add_css_class("connection-row-active");
+    }
+    let top = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    top.add_css_class("connection-row-line");
+    let default_brand = match profile.kind {
+        DatabaseKind::PostgreSql => "postgresql",
+        DatabaseKind::MySql => "mysql",
+        DatabaseKind::MariaDb => "mariadb",
+    };
+    let brand = profile_row_icon(
+        ui.server_icons
+            .borrow()
+            .get(&profile_session_key(profile))
+            .copied()
+            .unwrap_or(default_brand),
+        16,
+    );
+    top.append(&brand);
+    let name = gtk::Label::new(Some(&profile.name));
+    name.set_xalign(0.0);
+    name.set_hexpand(true);
+    name.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    name.add_css_class("connection-name");
+    top.append(&name);
+    let profile_state = ui.profile_status.borrow().get(&profile.id).cloned();
+    if matches!(profile_state, Some(ProfileStatus::Broken)) {
+        let broken = gtk::Image::from_icon_name("network-offline-symbolic");
+        broken.set_tooltip_text(Some("Соединение потеряно"));
+        top.append(&broken);
+    }
+    let is_connected = matches!(
+        profile_state.as_ref(),
+        Some(ProfileStatus::Connected | ProfileStatus::Broken)
+    );
+    let is_connecting = matches!(profile_state.as_ref(), Some(ProfileStatus::Connecting));
+    let edit = gtk::Button::new();
+    let edit_icon = profile_row_icon("edit", 18);
+    edit.set_child(Some(&edit_icon));
+    set_penpot_icon_hover(&edit, &edit_icon, "edit");
+    edit.add_css_class("flat");
+    edit.add_css_class("connection-action");
+    edit.add_css_class("connection-hover-action");
+    edit.set_tooltip_text(Some("Изменить подключение"));
+    let weak = Rc::downgrade(ui);
+    let saved = profile.clone();
+    edit.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            let after_unlock = ui.clone();
+            let profile = saved.clone();
+            ensure_vault_unlocked(&ui, move || {
+                show_connection_form(&after_unlock, Some(profile))
+            });
+        }
+    });
+    shortcuts::button(&card, &edit, "<Alt>e");
+    top.append(&edit);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    actions.add_css_class("connection-hover-action");
+    backup_ui::install(ui, &card, &actions, profile);
+    top.append(&actions);
+    if is_connected {
+        let disconnect = gtk::Button::new();
+        disconnect.set_child(Some(&profile_row_icon("status-connected", 18)));
+        disconnect.add_css_class("flat");
+        disconnect.add_css_class("connection-action");
+        disconnect.add_css_class("connected-action");
+        disconnect.set_tooltip_text(Some("Отключить"));
         let weak = Rc::downgrade(ui);
         let profile_id = profile.id.clone();
-        let profile_name = profile.name.clone();
-        delete.connect_clicked(move |_| {
+        disconnect.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
-                let after_unlock = ui.clone();
-                let profile_id = profile_id.clone();
-                let profile_name = profile_name.clone();
-                ensure_vault_unlocked(&ui, move || {
-                    show_delete_profile_dialog(&after_unlock, &profile_id, &profile_name)
-                });
+                close_profile_sessions(&ui, &profile_id);
             }
         });
-        shortcuts::button(&card, &delete, "<Alt>Delete");
-        actions.append(&delete);
-        backup_ui::install(ui, &card, &actions, &profile);
-        card.append(&actions);
-        ui.profiles.append(&card);
+        shortcuts::button(&card, &disconnect, "<Alt>Return");
+        top.append(&disconnect);
+    } else {
+        let connect = gtk::Button::new();
+        let connect_icon = profile_row_icon("status-idle", 18);
+        connect.set_child(Some(&connect_icon));
+        set_penpot_icon_hover(&connect, &connect_icon, "status-idle");
+        connect.add_css_class("flat");
+        connect.add_css_class("connection-action");
+        if is_connecting {
+            connect.set_tooltip_text(Some("Подключение..."));
+            connect.set_sensitive(false);
+            let spinner = adw::Spinner::new();
+            spinner.set_size_request(18, 18);
+            connect.set_child(Some(&spinner));
+        } else {
+            connect.add_css_class("connection-hover-action");
+            connect.set_tooltip_text(Some("Подключить"));
+        }
+        let weak = Rc::downgrade(ui);
+        let saved = profile.clone();
+        connect.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                connect_profile(&ui, saved.clone());
+            }
+        });
+        shortcuts::button(&card, &connect, "<Alt>Return");
+        top.append(&connect);
     }
+    card.append(&top);
+    if let Some(state) = profile_state.as_ref() {
+        let status = match state {
+            ProfileStatus::Verified => {
+                Some(("Проверка подключения успешна".to_owned(), "status-success"))
+            }
+            ProfileStatus::Error(error) => Some((format!("Ошибка: {error}"), "status-error")),
+            ProfileStatus::Connecting | ProfileStatus::Connected | ProfileStatus::Broken => None,
+        };
+        if let Some((text, style)) = status {
+            let status = gtk::Label::new(Some(&text));
+            status.set_xalign(0.0);
+            status.set_wrap(true);
+            status.add_css_class("connection-status");
+            status.add_css_class(style);
+            if matches!(state, ProfileStatus::Error(_)) {
+                card.append(&dialogs::copyable_label(&status));
+            } else {
+                card.append(&status);
+            }
+        }
+    }
+    let click = gtk::GestureClick::new();
+    click.set_button(1);
+    let weak = Rc::downgrade(ui);
+    let saved = profile.clone();
+    click.connect_released(move |_, presses, _, _| {
+        let Some(ui) = weak.upgrade() else { return };
+        let connected = is_profile_connected(&ui, &saved.id);
+        if (connected && presses == 1) || (!connected && presses == 2) {
+            activate_profile_row(&ui, &saved);
+        }
+    });
+    top.add_controller(click);
+    let keys = gtk::EventControllerKey::new();
+    let weak = Rc::downgrade(ui);
+    let saved = profile.clone();
+    keys.connect_key_pressed(move |_, key, _, state| {
+        let plain = !state.intersects(
+            gtk::gdk::ModifierType::CONTROL_MASK
+                | gtk::gdk::ModifierType::ALT_MASK
+                | gtk::gdk::ModifierType::SHIFT_MASK,
+        );
+        if plain
+            && matches!(key, gtk::gdk::Key::Return | gtk::gdk::Key::KP_Enter)
+            && let Some(ui) = weak.upgrade()
+        {
+            activate_profile_row(&ui, &saved);
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
+    });
+    card.add_controller(keys);
+    card
 }
 
 fn is_profile_connected(ui: &Ui, profile_id: &str) -> bool {
@@ -1228,24 +1493,6 @@ fn is_profile_connected(ui: &Ui, profile_id: &str) -> bool {
         .borrow()
         .values()
         .any(|(profile, _)| profile.id == profile_id)
-}
-
-fn install_profile_card_navigation(
-    ui: &Rc<Ui>,
-    widget: &impl IsA<gtk::Widget>,
-    profile: &ConnectionProfile,
-) {
-    widget.set_cursor_from_name(Some("pointer"));
-    let gesture = gtk::GestureClick::new();
-    gesture.set_button(1);
-    let weak = Rc::downgrade(ui);
-    let profile = profile.clone();
-    gesture.connect_released(move |_, _, _, _| {
-        if let Some(ui) = weak.upgrade() {
-            select_connection_database(&ui, &profile);
-        }
-    });
-    widget.add_controller(gesture);
 }
 
 fn select_connection_database(ui: &Rc<Ui>, profile: &ConnectionProfile) {
@@ -1352,6 +1599,8 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
     notebook.set_hexpand(true);
     notebook.set_vexpand(true);
     notebook.set_show_border(false);
+    notebook.set_show_tabs(false);
+    tab_strip::watch_notebook(ui, &notebook);
     let name = session_key.to_owned();
     ui.table_tabs.add_named(&notebook, Some(&name));
     let weak = Rc::downgrade(ui);
@@ -1369,7 +1618,7 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
         ui.active_group_by_session
             .borrow_mut()
             .insert(session.clone(), name.clone());
-        if let Some(query_id) = key.strip_prefix("sql::") {
+        if key.starts_with("sql::") {
             ui.active_table_by_session
                 .borrow_mut()
                 .insert(name.clone(), key.clone());
@@ -1384,7 +1633,22 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
             ui.table_tabs.set_visible(true);
             ui.empty_session.set_visible(false);
             ui.active_header.set_visible(false);
-            ui.status.set_text(&format!("SQL-запрос {}", query_id));
+            let connection = ui
+                .sessions
+                .borrow()
+                .get(&session)
+                .map(|(profile, _)| profile.name.clone())
+                .unwrap_or_default();
+            let last = {
+                let tabs = ui.sql_tabs.borrow();
+                key.strip_prefix("sql::")
+                    .and_then(|id| tabs.get(id))
+                    .and_then(|tab| tab.last_status.clone())
+            };
+            ui.status
+                .set_text(&last.unwrap_or_else(|| format!("SQL · {connection}")));
+            tab_strip::sync_connection(&ui);
+            tab_strip::refresh(&ui);
             ui.tab_switching.set(false);
             return;
         }
@@ -1399,6 +1663,7 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
             *ui.current_profile.borrow_mut() = Some(profile);
             *ui.pool.borrow_mut() = Some(pool);
         }
+        tab_strip::refresh(&ui);
         ui.table_tabs.set_visible_child_name(&name);
         ui.table_tabs.set_visible(true);
         ui.empty_session.set_visible(false);
@@ -1407,30 +1672,6 @@ fn ensure_session_table_tabs(ui: &Rc<Ui>, session_key: &str) -> gtk::Notebook {
     ui.session_table_tabs
         .borrow_mut()
         .insert(session_key.to_owned(), notebook.clone());
-    let sql_button = gtk::Button::new();
-    let source = workspace_ui::source(ui, session_key);
-    let profile_color = ui
-        .sessions
-        .borrow()
-        .get(&source)
-        .map(|(profile, _)| profile.color.clone())
-        .unwrap_or_else(|| "#4f8fe8".to_owned());
-    let sql_icon = profile_tab_icon("sql-query", &profile_color);
-    sql_icon.set_pixel_size(20);
-    sql_icon.set_size_request(20, 20);
-    sql_button.set_child(Some(&sql_icon));
-    sql_button.set_tooltip_text(Some("Открыть новую вкладку SQL-запроса"));
-    sql_button.add_css_class("flat");
-    sql_button.add_css_class("circular");
-    sql_button.add_css_class("sql-tab-add");
-    let weak = Rc::downgrade(ui);
-    let query_session_key = session_key.to_owned();
-    sql_button.connect_clicked(move |_| {
-        if let Some(ui) = weak.upgrade() {
-            create_sql_tab(&ui, &query_session_key);
-        }
-    });
-    notebook.set_action_widget(&sql_button, gtk::PackType::End);
     compact_notebook_header(&notebook);
     notebook
 }
@@ -1680,7 +1921,11 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     editor.add_css_class("sql-editor");
     editor.connect_unmap(|editor| editor.completion().hide());
 
-    let completion_provider = sql_editor::SqlProvider::new();
+    let dialect = match profile.kind {
+        DatabaseKind::PostgreSql => sql_editor::Dialect::PostgreSql,
+        DatabaseKind::MySql | DatabaseKind::MariaDb => sql_editor::Dialect::MySql,
+    };
+    let completion_provider = sql_editor::SqlProvider::new(dialect, schema.clone());
     editor.completion().add_provider(&completion_provider);
     editor.completion().set_select_on_show(true);
 
@@ -1711,6 +1956,12 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
         "Режим транзакций этой SQL-вкладки. Ctrl+Alt+T — переключить.",
     ));
     toolbar.append(&transaction_label);
+    let auto_commit = gtk::Switch::new();
+    auto_commit.set_widget_name("sql-auto-commit");
+    auto_commit.set_active(true);
+    auto_commit.set_valign(gtk::Align::Center);
+    auto_commit.set_tooltip_text(Some("Auto Commit (Ctrl+Alt+T)"));
+    toolbar.append(&auto_commit);
     let popover = gtk::Popover::new();
     popover.set_has_arrow(false);
     popover.add_css_class("sql-actions-popover");
@@ -1770,12 +2021,44 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     let write_id = id.clone();
     write_button.connect_clicked(move |_| {
         if let Some(ui) = owner.upgrade() {
-            run_sql_tab_policy(&ui, &write_id, None, false, true);
+            run_sql_tab_policy(&ui, &write_id, None, false, SqlRunMode::Write);
+        }
+    });
+    let explain_button = sql_menu_action(
+        &menu,
+        &popover,
+        "План запроса (EXPLAIN, Ctrl+Shift+G)",
+        "view-list-symbolic",
+    );
+    explain_button.set_widget_name("sql-explain");
+    let owner = Rc::downgrade(ui);
+    let explain_id = id.clone();
+    explain_button.connect_clicked(move |_| {
+        if let Some(ui) = owner.upgrade() {
+            explain_sql_tab(&ui, &explain_id);
         }
     });
 
     let open_button = sql_menu_action(&menu, &popover, "Открыть SQL…", "document-open-symbolic");
     let save_button = sql_menu_action(&menu, &popover, "Сохранить SQL", "document-save-symbolic");
+    let format_button = sql_menu_action(
+        &menu,
+        &popover,
+        "Форматировать SQL (Ctrl+Shift+F)",
+        "document-edit-symbolic",
+    );
+    format_button.set_widget_name("sql-format");
+    let weak = Rc::downgrade(ui);
+    let format_editor = editor.clone();
+    format_button.connect_clicked(move |_| {
+        if let Err(error) = sql_editor::format_buffer(&format_editor, dialect) {
+            if let Some(ui) = weak.upgrade() {
+                show_error_dialog(&ui, "Не удалось форматировать SQL", &error);
+            }
+        } else {
+            format_editor.grab_focus();
+        }
+    });
     let rename_button =
         sql_menu_action(&menu, &popover, "Переименовать…", "document-edit-symbolic");
     let directory_button =
@@ -1784,12 +2067,12 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     let export_button =
         sql_menu_action(&menu, &popover, "Экспорт CSV…", "document-save-as-symbolic");
     export_button.set_sensitive(false);
-    let run_button = gtk::Button::with_label("Выполнить");
-    run_button.add_css_class("suggested-action");
-    run_button.add_css_class("sql-run-button");
-    run_button.set_tooltip_text(Some("Выполнить выделенный SQL или весь текст (Ctrl+Enter)"));
-    toolbar.append(&run_button);
-    let batch_button = gtk::Button::with_label("Выполнить в Markdown…");
+    let batch_button = sql_menu_action(
+        &menu,
+        &popover,
+        "Выполнить в Markdown…",
+        "x-office-document-symbolic",
+    );
     batch_button.set_tooltip_text(Some(
         "Выполнить весь текст по одному читающему запросу и сохранить результаты и ошибки в .md",
     ));
@@ -1800,7 +2083,11 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
             sql_batch_ui::choose_report(&ui, &batch_id);
         }
     });
-    toolbar.append(&batch_button);
+    let run_button = gtk::Button::with_label("Выполнить");
+    run_button.add_css_class("suggested-action");
+    run_button.add_css_class("sql-run-button");
+    run_button.set_tooltip_text(Some("Выполнить выделенный SQL или весь текст (Ctrl+Enter)"));
+    toolbar.append(&run_button);
     let stop_button = gtk::Button::from_icon_name("media-playback-stop-symbolic");
     stop_button.set_tooltip_text(Some("Остановить запрос (Ctrl+Shift+.)"));
     stop_button.set_sensitive(false);
@@ -1837,10 +2124,7 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
         &buffer,
         &syntax_message,
         ui.runtime.clone(),
-        match profile.kind {
-            DatabaseKind::PostgreSql => sql_editor::Dialect::PostgreSql,
-            DatabaseKind::MySql | DatabaseKind::MariaDb => sql_editor::Dialect::MySql,
-        },
+        dialect,
         &theme::palette(ui.active_theme.get()).error,
     );
 
@@ -1867,7 +2151,7 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     grid.set_visible(false);
     let weak = Rc::downgrade(ui);
     let result_key = page_key.clone();
-    let tabulator = TabulatorGrid::new(move |message| {
+    let tabulator = TabulatorGrid::new(true, move |message| {
         if let Some(ui) = weak.upgrade() {
             handle_tabulator_message(&ui, &result_key, &message);
         }
@@ -1895,10 +2179,13 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
         .discard_button
         .connect_clicked(move |_| discard_grid.finish_edit(true));
     tabulator.set_theme(&theme::grid_css(ui.active_theme.get()));
-    let copy_result = sql_menu_action(&menu, &popover, "Копировать ячейки", "edit-copy-symbolic");
+    let copy_result = sql_menu_action(
+        &menu,
+        &popover,
+        "Копировать результат",
+        "edit-copy-symbolic",
+    );
     copy_result.set_sensitive(false);
-    let copy_grid = tabulator.clone();
-    copy_result.connect_clicked(move |_| copy_grid.copy_selection());
     let result_scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
@@ -1912,11 +2199,49 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     result_stack.set_vexpand(true);
     result_stack.add_named(&sql_empty_results(), Some("empty"));
     result_stack.add_named(&result_scroll, Some("data"));
+    let plan_view = gtk::TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .left_margin(8)
+        .right_margin(8)
+        .top_margin(6)
+        .bottom_margin(6)
+        .build();
+    let plan_scroll = gtk::ScrolledWindow::builder().child(&plan_view).build();
+    result_stack.add_named(&plan_scroll, Some("plan"));
     result_stack.set_visible_child_name("empty");
+    let copy_grid = tabulator.clone();
+    let copy_stack = result_stack.downgrade();
+    let copy_plan = plan_view.clone();
+    copy_result.connect_clicked(move |_| {
+        if copy_stack
+            .upgrade()
+            .and_then(|stack| stack.visible_child_name())
+            .as_deref()
+            == Some("plan")
+        {
+            let buffer = copy_plan.buffer();
+            let (start, end) = buffer.selection_bounds().unwrap_or_else(|| buffer.bounds());
+            copy_plan
+                .clipboard()
+                .set_text(&buffer.text(&start, &end, false));
+        } else {
+            copy_grid.copy_selection();
+        }
+    });
     result_region.append(&result_stack);
     result_region.append(&edit_state.toolbar);
     split.set_end_child(Some(&result_region));
-    split.set_position(340);
+    split.set_position(ui.layout.borrow().sql_position);
+    let layout = ui.layout.clone();
+    split.connect_position_notify(move |split| {
+        if split.position() > 0 {
+            layout.borrow_mut().sql_position = split.position();
+        }
+    });
+    // Тонкую ручку перекрывает WebView результата, широкая ловит перетаскивание.
+    split.set_wide_handle(true);
+    split.add_css_class("sql-split");
     split.set_resize_start_child(true);
     split.set_resize_end_child(true);
     split.set_shrink_start_child(false);
@@ -1940,6 +2265,12 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     tab_label.set_tooltip_text(Some(&page_key));
     tab_label.append(&profile_tab_icon("sql-query", &profile.color));
     let title = gtk::Label::new(Some(&format!("SQL {query_number}")));
+    let weak_ui = Rc::downgrade(ui);
+    title.connect_label_notify(move |_| {
+        if let Some(ui) = weak_ui.upgrade() {
+            tab_strip::refresh(&ui);
+        }
+    });
     title.set_ellipsize(gtk::pango::EllipsizeMode::End);
     title.set_width_chars(8);
     title.set_max_width_chars(20);
@@ -1970,12 +2301,14 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
             ),
             transaction_state: sql_session::TransactionState::default(),
             transaction_label,
+            auto_commit: auto_commit.clone(),
             transaction_buttons: vec![
                 manual_button.clone(),
                 commit_button.clone(),
                 rollback_button.clone(),
             ],
             actions_menu: actions_button,
+            format_button,
             page: page.clone(),
             buffer: buffer.clone(),
             editor: editor.clone(),
@@ -1985,6 +2318,8 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
             export_button: export_button.clone(),
             copy_button: copy_result,
             result_stack,
+            plan_view,
+            running_plan: None,
             run_button: run_button.clone(),
             stop_button: stop_button.clone(),
             timeout,
@@ -2007,6 +2342,7 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
             started: None,
             elapsed_timer: None,
             sent_needing_approval: false,
+            last_status: None,
         },
     );
     let tab_index = notebook.append_page(&page, Some(&tab_label));
@@ -2038,7 +2374,7 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     let stop_id = id.clone();
     stop_button.connect_clicked(move |_| {
         if let Some(ui) = weak.upgrade() {
-            stop_sql_tab(&ui, &stop_id);
+            stop_sql_tab(&ui, &stop_id, None);
         }
     });
     let weak = Rc::downgrade(ui);
@@ -2047,6 +2383,40 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
         if let Some(ui) = weak.upgrade() {
             reset_sql_session(&ui, &reset_id);
         }
+    });
+    manual_button
+        .bind_property("sensitive", &auto_commit, "sensitive")
+        .sync_create()
+        .build();
+    let weak = Rc::downgrade(ui);
+    let switch_id = id.clone();
+    auto_commit.connect_state_set(move |_, wanted| {
+        let Some(ui) = weak.upgrade() else {
+            return gtk::glib::Propagation::Proceed;
+        };
+        // try_borrow: update_transaction_controls sets the switch while holding the tab.
+        let manual = match ui.sql_tabs.try_borrow() {
+            Ok(tabs) => tabs.get(&switch_id).map(|tab| tab.transaction_state.manual),
+            Err(_) => None,
+        };
+        if manual.is_some_and(|manual| manual == wanted) {
+            change_sql_transaction(&ui, &switch_id, None);
+            // Until the session confirms, the switch shows the actual mode;
+            // update_transaction_controls moves it once the change lands.
+            let weak = Rc::downgrade(&ui);
+            let id = switch_id.clone();
+            gtk::glib::idle_add_local_once(move || {
+                let Some(ui) = weak.upgrade() else { return };
+                if let Ok(tabs) = ui.sql_tabs.try_borrow()
+                    && let Some(tab) = tabs.get(&id)
+                {
+                    tab.auto_commit.set_active(!tab.transaction_state.manual);
+                    tab.auto_commit.set_state(!tab.transaction_state.manual);
+                }
+            });
+            return gtk::glib::Propagation::Stop;
+        }
+        gtk::glib::Propagation::Proceed
     });
     for (button, action) in [
         (manual_button, None),
@@ -2152,12 +2522,15 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
 
     ui.status
         .set_text(&format!("Открыта SQL-вкладка {query_number}"));
+    load_sql_completions(ui, &id, pool);
+}
+
+fn load_sql_completions(ui: &Ui, id: &str, pool: DbPool) {
     let sender = ui.sender.clone();
-    let runtime = ui.runtime.clone();
-    let completion_id = id.clone();
-    runtime.spawn(async move {
-        let result = pool.list_sql_completions(&profile).await;
-        let _ = sender.send(Event::SqlCompletionsLoaded(completion_id, result));
+    let id = id.to_owned();
+    ui.runtime.spawn(async move {
+        let result = pool.list_sql_completions().await;
+        let _ = sender.send(Event::SqlCompletionsLoaded(id, pool, result));
     });
 }
 
@@ -2198,14 +2571,26 @@ fn run_sql_tab(ui: &Rc<Ui>, id: &str) {
     run_sql_tab_with_text(ui, id, None);
 }
 fn run_sql_tab_with_text(ui: &Rc<Ui>, id: &str, snapshot: Option<String>) {
-    run_sql_tab_policy(ui, id, snapshot, false, false);
+    run_sql_tab_policy(ui, id, snapshot, false, SqlRunMode::Normal);
 }
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SqlRunMode {
+    Normal,
+    Write,
+    Explain,
+}
+
+fn explain_sql_tab(ui: &Rc<Ui>, id: &str) {
+    run_sql_tab_policy(ui, id, None, false, SqlRunMode::Explain);
+}
+
 fn run_sql_tab_policy(
     ui: &Rc<Ui>,
     id: &str,
     snapshot: Option<String>,
     approved: bool,
-    force_write: bool,
+    mode: SqlRunMode,
 ) {
     let key = format!("sql::{id}");
     if let Some(state) = ui.table_edit_states.borrow().get(&key) {
@@ -2251,29 +2636,46 @@ fn run_sql_tab_policy(
     let Some((profile, _)) = ui.sessions.borrow().get(&session_key).cloned() else {
         return;
     };
-    let Some((session, state)) = ui
-        .sql_tabs
-        .borrow()
-        .get(id)
-        .map(|t| (t.session.clone(), t.transaction_state))
-    else {
+    let Some((session, state, idle)) = ui.sql_tabs.borrow().get(id).map(|t| {
+        (
+            t.session.clone(),
+            t.transaction_state,
+            t.run_button.is_sensitive(),
+        )
+    }) else {
         return;
     };
-    let needs_approval = session.requires_write_approval(&sql, state)
-        || (force_write
-            && matches!(profile.environment, EnvironmentTag::Prod)
-            && !profile.read_only);
+    let explain = mode == SqlRunMode::Explain;
+    if explain && !idle {
+        return;
+    }
+    let plan = if explain {
+        match sql_explain::EstimatedPlan::new(profile.kind, &sql) {
+            Ok(plan) => Some(plan),
+            Err(error) => {
+                show_error_dialog(ui, "Не удалось построить план запроса", &error);
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    let needs_approval = !explain
+        && (session.requires_write_approval(&sql, state)
+            || (mode == SqlRunMode::Write
+                && matches!(profile.environment, EnvironmentTag::Prod)
+                && !profile.read_only));
     if block_if_broken(
         ui,
         &session_key,
-        Some(RetryAction::Sql {
+        (!explain).then(|| RetryAction::Sql {
             tab_id: id.to_owned(),
             needed_approval: needs_approval,
             in_transaction: state.pending,
         }),
     ) {
         if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) {
-            tab.executed_sql = Some(sql.clone());
+            tab.executed_sql = (!explain).then_some(sql);
             tab.status
                 .set_text("Соединение потеряно. Переподключитесь и повторите запрос.");
         }
@@ -2296,7 +2698,7 @@ fn run_sql_tab_policy(
                         .get(&id)
                         .is_some_and(|t| t.session.identity() == expected)
                     {
-                        run_sql_tab_policy(&ui, &id, Some(sql.clone()), true, force_write);
+                        run_sql_tab_policy(&ui, &id, Some(sql.clone()), true, mode);
                     }
                 }
             },
@@ -2311,17 +2713,29 @@ fn run_sql_tab_policy(
     if !tab.run_button.is_sensitive() {
         return;
     }
-    let session = tab.session.clone();
+    let session = if explain {
+        let session = tab.session.for_estimated_plan();
+        tab.running_plan = Some(session.clone());
+        session
+    } else {
+        tab.session.clone()
+    };
+    session.clear_cancel_request();
     let session_key = tab.session_key.clone();
     let timeout = tab.timeout.value_as_int() as u64;
     tab.editor.completion().hide();
-    tab.executed_sql = Some(sql.clone());
+    // History and reconnect replay use runnable editor SQL only.
+    tab.executed_sql = (!explain).then(|| sql.clone());
     tab.request_id = request_id.clone();
     tab.sent_needing_approval = needs_approval;
     ui.last_active
         .borrow_mut()
         .insert(format!("sql::{id}"), std::time::Instant::now());
-    tab.status.set_text("Выполняю запрос…");
+    tab.status.set_text(if explain {
+        "Строю план запроса…"
+    } else {
+        "Выполняю запрос…"
+    });
     tab.run_button.set_sensitive(false);
     tab.stop_button.set_sensitive(true);
     for button in &tab.transaction_buttons {
@@ -2330,6 +2744,7 @@ fn run_sql_tab_policy(
     tab.export_button.set_sensitive(false);
     tab.copy_button.set_sensitive(false);
     tab.result_stack.set_visible_child_name("empty");
+    tab.plan_view.buffer().set_text("");
     tab.error_message.set_text("");
     tab.error_message.set_visible(false);
     tab.result = None;
@@ -2340,23 +2755,58 @@ fn run_sql_tab_policy(
         tab.grid.remove(&child);
     }
     start_sql_timer(ui, id, tab);
+    let task_title = ui.sessions.borrow().get(&session_key).map_or_else(
+        || tab.query_name.clone(),
+        |(profile, _)| {
+            format!(
+                "{} · {} · {}",
+                tab.query_name, profile.name, profile.database
+            )
+        },
+    );
+    let task_title = if explain {
+        format!("EXPLAIN · {task_title}")
+    } else {
+        task_title
+    };
     drop(tabs);
-    ui.status.set_text("Выполняю SQL-запрос…");
+    ui.status.set_text(if explain {
+        "Строю план запроса…"
+    } else {
+        "Выполняю SQL-запрос…"
+    });
 
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
     let tab_id = id.to_owned();
+    let weak = Rc::downgrade(ui);
+    let cancel_tab = tab_id.clone();
+    let cancel_request = request_id.clone();
+    ui.background_tasks
+        .start(&request_id, &task_title, move || {
+            if let Some(ui) = weak.upgrade() {
+                stop_sql_tab(&ui, &cancel_tab, Some(&cancel_request));
+            }
+        });
     let guard = ui.activity.start();
     runtime.spawn(async move {
         let _guard = guard;
         let started = std::time::Instant::now();
-        let result = if approved {
+        let result = if let Some(plan) = plan {
+            let result = session.execute_with_timeout(plan.sql(), timeout).await;
+            session.close().await;
+            result
+        } else if approved {
             session.execute_authorized(&sql, timeout, true).await
         } else {
             session.execute_with_timeout(&sql, timeout).await
         };
         let result = report_lost(session.pool(), &sender, &session_key, result).await;
-        let state = session.state().await;
+        let state = if explain {
+            state
+        } else {
+            session.state().await
+        };
         let _ = sender.send(Event::SqlQueryFinished(
             tab_id,
             request_id,
@@ -2367,13 +2817,18 @@ fn run_sql_tab_policy(
     });
 }
 
-fn stop_sql_tab(ui: &Rc<Ui>, id: &str) {
-    if let Some(tab) = ui.sql_tabs.borrow().get(id) {
-        if tab.stop_button.is_sensitive() {
-            tab.stop_button.set_sensitive(false);
-            tab.status.set_text("Отменяю запрос на сервере…");
-            tab.session.request_cancel();
-        }
+fn stop_sql_tab(ui: &Rc<Ui>, id: &str, expected_request: Option<&str>) {
+    if let Some(tab) = ui.sql_tabs.borrow().get(id)
+        && expected_request.is_none_or(|request| tab.request_id == request)
+        && tab.stop_button.is_sensitive()
+    {
+        tab.stop_button.set_sensitive(false);
+        tab.status.set_text("Отменяю запрос на сервере…");
+        tab.running_plan
+            .as_ref()
+            .unwrap_or(&tab.session)
+            .request_cancel();
+        ui.background_tasks.cancel_status(&tab.request_id, true);
     }
 }
 
@@ -2397,8 +2852,9 @@ fn start_sql_timer(ui: &Rc<Ui>, id: &str, tab: &mut SqlTab) {
         if let Some(started) = tab.started
             && tab.stop_button.is_sensitive()
         {
-            tab.status
-                .set_text(&format!("Выполняется... {} с", started.elapsed().as_secs()));
+            let status = format!("Выполняется… {} с", started.elapsed().as_secs());
+            tab.status.set_text(&status);
+            ui.background_tasks.progress(&tab.request_id, &status);
         }
         gtk::glib::ControlFlow::Continue
     }));
@@ -2565,6 +3021,11 @@ fn update_transaction_controls(tab: &mut SqlTab, state: sql_session::Transaction
     } else {
         "Auto Commit"
     });
+    let auto = !state.manual;
+    if tab.auto_commit.is_active() != auto {
+        tab.auto_commit.set_active(auto);
+    }
+    tab.auto_commit.set_state(auto);
     if state.pending {
         tab.transaction_label.add_css_class("status-pending");
     } else {
@@ -2752,7 +3213,11 @@ fn sql_file_path(directory: &std::path::Path, name: &str) -> PathBuf {
     directory.join(safe_query_file_component(&file_name))
 }
 
-fn start_transfer(ui: &Rc<Ui>) -> Option<Arc<transfer::Cancellation>> {
+fn start_transfer(
+    ui: &Rc<Ui>,
+    operation: &str,
+    path: &std::path::Path,
+) -> Option<Arc<transfer::Cancellation>> {
     if ui.transfer_cancel.borrow().is_some() {
         show_error_dialog(
             ui,
@@ -2763,15 +3228,42 @@ fn start_transfer(ui: &Rc<Ui>) -> Option<Arc<transfer::Cancellation>> {
     }
     let cancel = Arc::new(transfer::Cancellation::new());
     *ui.transfer_cancel.borrow_mut() = Some(cancel.clone());
-    ui.transfer_cancel_button.set_sensitive(true);
-    ui.transfer_cancel_button.set_visible(true);
-    ui.transfer_spinner.set_visible(true);
+    let title = path.file_name().map_or_else(
+        || operation.to_owned(),
+        |name| format!("{operation} · {}", name.to_string_lossy()),
+    );
+    let weak = Rc::downgrade(ui);
+    ui.background_tasks.start(TRANSFER, &title, move || {
+        if let Some(ui) = weak.upgrade() {
+            cancel_transfer(&ui);
+        }
+    });
     Some(cancel)
 }
-fn finish_transfer(ui: &Ui) {
+
+fn cancel_transfer(ui: &Ui) {
+    if ui.background_tasks.can_cancel(TRANSFER)
+        && let Some(cancel) = ui.transfer_cancel.borrow().as_ref()
+    {
+        let accepted = cancel.request();
+        ui.background_tasks.cancel_status(TRANSFER, accepted);
+        ui.status.set_text(if accepted {
+            "Запрошена отмена операции…"
+        } else {
+            "Операция завершается…"
+        });
+    }
+}
+
+fn transfer_progress(ui: &Ui, text: &str) {
+    if ui.background_tasks.progress(TRANSFER, text) {
+        ui.status.set_text(text);
+    }
+}
+
+fn finish_transfer(ui: &Ui, outcome: Outcome) {
     ui.transfer_cancel.borrow_mut().take();
-    ui.transfer_cancel_button.set_visible(false);
-    ui.transfer_spinner.set_visible(false);
+    ui.background_tasks.finish(TRANSFER, outcome);
 }
 
 fn refresh_file_location_labels(ui: &Ui) {
@@ -3117,7 +3609,8 @@ fn choose_sql_csv_export(ui: &Rc<Ui>, id: &str) {
                 ui.status.set_text("Сохраняю результат запроса в CSV…");
                 let sender = ui.sender.clone();
                 let runtime = ui.runtime.clone();
-                let Some(cancel) = start_transfer(&ui) else {
+                let Some(cancel) = start_transfer(&ui, "Экспорт результата SQL в CSV", &path)
+                else {
                     dialog.destroy();
                     return;
                 };
@@ -3128,7 +3621,9 @@ fn choose_sql_csv_export(ui: &Rc<Ui>, id: &str) {
                     let result = if cancel.is_cancelled() {
                         Err("Экспорт отменён".into())
                     } else {
-                        write_snapshot_csv(&path, &data, &cancel, |_| {})
+                        write_snapshot_csv(&path, &data, &cancel, |count| {
+                            let _ = sender.send(Event::ExportProgress(count));
+                        })
                     };
                     let event = match result {
                         Ok(()) => (rows, Ok(())),
@@ -3338,10 +3833,18 @@ fn close_session(ui: &Rc<Ui>, session_key: &str) {
         ui.session_tabs.set_visible(false);
         *ui.current_profile.borrow_mut() = None;
         *ui.pool.borrow_mut() = None;
+        tab_strip::refresh(ui);
         namespace_ui::sync(ui);
         ui.active_header.set_visible(false);
+        ui.connection_block.set(None);
         ui.table_tabs.set_visible(false);
         ui.empty_session.set_visible(false);
+        // Drop the closed connection's tree: its rows hold the old pool.
+        clear_box(&ui.objects);
+        ui.object_search_branches.borrow_mut().clear();
+        ui.table_list_items.borrow_mut().clear();
+        ui.selected_table_button.borrow_mut().take();
+        ui.table_filter.set_visible(false);
         ui.objects_available.set(false);
         set_tables_nav_sensitive(ui, false);
         show_sidebar(ui, "connections");
@@ -3501,6 +4004,7 @@ fn close_table_tab(ui: &Rc<Ui>, key: &str) {
         ui.table_view_states.borrow_mut().remove(key);
         ui.table_filter_panels.borrow_mut().remove(key);
         ui.table_requests.borrow_mut().remove(key);
+        ui.table_more_loading.borrow_mut().remove(key);
         ui.table_data.borrow_mut().remove(key);
         ui.table_edit_states.borrow_mut().remove(key);
         ui.table_spinners.borrow_mut().remove(key);
@@ -3549,6 +4053,7 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
         .is_none_or(|current| profile_session_key(current) != session_key);
     *ui.current_profile.borrow_mut() = Some(profile.clone());
     *ui.pool.borrow_mut() = Some(pool);
+    tab_strip::refresh(ui);
     let group = workspace_ui::active(ui, session_key);
     if let Some(index) = session_page_index(ui, &group) {
         if ui.session_tabs.current_page() != Some(index) {
@@ -3589,6 +4094,7 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
     ));
     set_profile_accent(&ui.active_header, &profile.color);
     ui.active_header.set_visible(false);
+    ui.connection_block.set(Some(&profile));
     ui.landing.set_visible(false);
     activate_session_table(ui, session_key);
     namespace_ui::sync(ui);
@@ -3597,6 +4103,7 @@ fn select_session(ui: &Rc<Ui>, session_key: &str) {
         ui.objects_available.set(false);
         set_tables_nav_sensitive(ui, false);
         clear_box(&ui.objects);
+        ui.object_search_branches.borrow_mut().clear();
         show_table_catalog(ui);
     }
 }
@@ -3632,7 +4139,7 @@ fn activate_session_table(ui: &Ui, session_key: &str) {
             ui.tab_switching.set(false);
             ui.table_tabs.set_visible(true);
             ui.empty_session.set_visible(false);
-            ui.active_header.set_visible(true);
+            tab_strip::sync_connection(ui);
             return;
         }
         if let Some(query_id) = key.strip_prefix("sql::")
@@ -3650,7 +4157,7 @@ fn activate_session_table(ui: &Ui, session_key: &str) {
         notebook.set_current_page(Some(0));
         ui.table_tabs.set_visible(true);
         ui.empty_session.set_visible(false);
-        ui.active_header.set_visible(true);
+        tab_strip::sync_connection(ui);
         return;
     }
     ui.table_tabs.set_visible(false);
@@ -3804,11 +4311,7 @@ fn select_schema_button(ui: &Ui, selected: &gtk::Button) {
 }
 
 fn apply_table_list_filter(ui: &Ui) {
-    let query = ui.table_filter.text().trim().to_lowercase();
-    for (button, object) in ui.table_list_items.borrow().iter() {
-        let name_matches = object.name.to_lowercase().contains(&query);
-        button.set_visible(name_matches);
-    }
+    object_search::apply(ui);
 }
 
 fn install_table_context_menu(
@@ -3818,6 +4321,23 @@ fn install_table_context_menu(
     object: DbObject,
     table_key: String,
 ) {
+    let middle = gtk::GestureClick::new();
+    middle.set_button(2);
+    let weak = Rc::downgrade(ui);
+    let middle_object = object.clone();
+    let middle_session = profile_session_key(&profile);
+    middle.connect_released(move |gesture, _, _, _| {
+        gesture.set_state(gtk::EventSequenceState::Claimed);
+        let Some(ui) = weak.upgrade() else { return };
+        if !ui.sessions.borrow().contains_key(&middle_session) {
+            ui.status.set_text("База отключена. Раскройте её заново.");
+            return;
+        }
+        select_session(&ui, &middle_session);
+        open_table(&ui, middle_object.clone(), true);
+    });
+    anchor.add_controller(middle);
+
     let gesture = gtk::GestureClick::new();
     gesture.set_button(3);
     gesture.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -3968,9 +4488,7 @@ fn context_menu_action(icon_name: &str, title: &str) -> gtk::Button {
 }
 
 fn show_sidebar(ui: &Ui, page: &str) {
-    if page == "tables" && !ui.objects_available.get() {
-        return;
-    }
+    ui.sidebar_toggle.set_active(true);
     ui.sidebar_stack.set_visible_child_name(page);
     if page == "connections" {
         ui.connections_nav.add_css_class("sidebar-nav-active");
@@ -3983,8 +4501,9 @@ fn show_sidebar(ui: &Ui, page: &str) {
     update_navigation_rail_icon(&ui.tables_nav, "tables");
 }
 
-fn set_tables_nav_sensitive(ui: &Ui, sensitive: bool) {
-    ui.tables_nav.set_sensitive(sensitive);
+/// Кнопка "Таблицы" всегда активна; без каталога раздел показывает подсказку.
+fn set_tables_nav_sensitive(ui: &Ui, available: bool) {
+    ui.tables_hint.set_visible(!available);
     update_navigation_rail_icon(&ui.tables_nav, "tables");
 }
 
@@ -3995,7 +4514,9 @@ fn show_delete_profile_dialog(ui: &Rc<Ui>, profile_id: &str, profile_name: &str)
         .message_type(gtk::MessageType::Warning)
         .buttons(gtk::ButtonsType::YesNo)
         .text(format!("Удалить подключение «{profile_name}»?"))
-        .secondary_text("Сохранённый профиль и его пароль будут удалены с этого компьютера.")
+        .secondary_text(
+            "Профиль, его пароль и сохранённые виды таблиц будут удалены с этого компьютера.",
+        )
         .build();
     let weak = Rc::downgrade(ui);
     let profile_id = profile_id.to_owned();
@@ -4239,7 +4760,10 @@ fn choose_table_csv_export(ui: &Rc<Ui>, table_key: &str, table_name: &str) {
         Some("Отмена"),
     );
     configure_csv_chooser(ui, &chooser);
-    chooser.set_current_name(&format!("{table_name}.csv"));
+    chooser.set_current_name(&format!(
+        "{}-shown.csv",
+        safe_query_file_component(table_name)
+    ));
     let weak = Rc::downgrade(ui);
     chooser.connect_response(move |dialog, response| {
         if response == gtk::ResponseType::Accept {
@@ -4247,7 +4771,8 @@ fn choose_table_csv_export(ui: &Rc<Ui>, table_key: &str, table_name: &str) {
                 (weak.upgrade(), dialog.file().and_then(|file| file.path()))
             {
                 remember_csv_directory(&ui, &path);
-                let Some(cancel) = start_transfer(&ui) else {
+                let Some(cancel) = start_transfer(&ui, "Экспорт выборки в CSV", &path)
+                else {
                     dialog.destroy();
                     return;
                 };
@@ -4260,7 +4785,9 @@ fn choose_table_csv_export(ui: &Rc<Ui>, table_key: &str, table_name: &str) {
                     let result = if cancel.is_cancelled() {
                         Err("Экспорт отменён".into())
                     } else {
-                        write_snapshot_csv(&path, &data, &cancel, |_| {})
+                        write_snapshot_csv(&path, &data, &cancel, |count| {
+                            let _ = sender.send(Event::ExportProgress(count));
+                        })
                     };
                     let _ = sender.send(Event::CsvExported(rows, result));
                 });
@@ -4294,7 +4821,10 @@ fn choose_full_table_csv_export(
         Some("Отмена"),
     );
     configure_csv_chooser(ui, &chooser);
-    chooser.set_current_name(&format!("{table_name}.csv"));
+    chooser.set_current_name(&format!(
+        "{}-all.csv",
+        safe_query_file_component(table_name)
+    ));
     let weak = Rc::downgrade(ui);
     let object = object.clone();
     let table_name = table_name.to_owned();
@@ -4310,7 +4840,8 @@ fn choose_full_table_csv_export(
                 let runtime = ui.runtime.clone();
                 let pool = pool.clone();
                 let object = object.clone();
-                let Some(cancel) = start_transfer(&ui) else {
+                let Some(cancel) = start_transfer(&ui, "Экспорт таблицы в CSV", &path)
+                else {
                     dialog.destroy();
                     return;
                 };
@@ -4489,8 +5020,6 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
         } else {
             "Новое подключение"
         })
-        .default_height(680)
-        .default_width(600)
         .build();
     dialog.set_decorated(true);
     dialog.set_deletable(true);
@@ -4616,6 +5145,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
     }));
     password_note.set_xalign(0.0);
     password_note.set_wrap(true);
+    password_note.set_max_width_chars(72);
     password_note.add_css_class("dim-label");
     content.append(&password_note);
     let test_feedback = gtk::Label::new(Some("Проверка соединения ещё не запускалась"));
@@ -4634,6 +5164,8 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
     content.append(&buttons);
     let scroll = gtk::ScrolledWindow::builder()
         .child(&content)
+        .propagate_natural_width(true)
+        .propagate_natural_height(true)
         .vexpand(true)
         .build();
     dialog.set_content(Some(&scroll));
@@ -5175,6 +5707,13 @@ fn set_feedback(ui: &Ui, message: &str, state_class: &str) {
     }
 }
 
+fn show_system_schemas(ui: &Ui) -> bool {
+    ui.store
+        .borrow()
+        .as_ref()
+        .is_some_and(SettingsStore::show_system_schemas)
+}
+
 fn show_table_catalog(ui: &Rc<Ui>) {
     let (Some(pool), Some(profile)) = (
         ui.pool.borrow().clone(),
@@ -5189,6 +5728,7 @@ fn show_table_catalog(ui: &Rc<Ui>) {
     } else {
         ui.objects.set_sensitive(false);
         clear_box(&ui.objects);
+        ui.object_search_branches.borrow_mut().clear();
         ui.objects.append(&loading_row("Загружаю таблицы…"));
         ui.table_list_items.borrow_mut().clear();
         ui.selected_table_button.borrow_mut().take();
@@ -5211,6 +5751,7 @@ fn show_table_catalog(ui: &Rc<Ui>) {
             catalog_scope.database = saved.database.clone();
         }
     }
+    let include_system = show_system_schemas(ui);
     let guard = ui.activity.start();
     runtime.spawn(async move {
         let _guard = guard;
@@ -5224,7 +5765,9 @@ fn show_table_catalog(ui: &Rc<Ui>) {
                 report_lost(&pool, &sender, &session_key, result).await,
             )
         } else {
-            let result = pool.list_tables(&catalog_scope).await;
+            let result = pool
+                .list_tables_with_system(&catalog_scope, include_system)
+                .await;
             Event::TablesLoaded(
                 generation,
                 view_generation,
@@ -5396,6 +5939,8 @@ fn append_schema_tree(
         } else {
             schema_button.set_tooltip_text(Some(&format!("{}: {}", profile.database, schema)));
         }
+        let user_expanded = Rc::new(Cell::new(expanded));
+        let expanded_for_toggle = user_expanded.clone();
         let children_for_toggle = children.clone();
         let disclosure_for_toggle = disclosure.clone();
         let folder_for_toggle = folder.clone();
@@ -5420,8 +5965,9 @@ fn append_schema_tree(
             });
             // First click on an inactive schema opens it; later clicks toggle,
             // even when opening the group did not succeed.
-            let expanded = (!group_active && !open_requested.replace(true))
-                || !children_for_toggle.is_visible();
+            let expanded =
+                (!group_active && !open_requested.replace(true)) || !expanded_for_toggle.get();
+            expanded_for_toggle.set(expanded);
             children_for_toggle.set_visible(expanded);
             disclosure_for_toggle.set_text(if expanded { "▾" } else { "▸" });
             set_penpot_icon(
@@ -5440,6 +5986,7 @@ fn append_schema_tree(
                 if !group_active {
                     open_schema_group(&ui, &profile_for_group, &schema_identity.1);
                 }
+                apply_table_list_filter(&ui);
             }
         });
         let sql_button = tree_sql_button(&if database_group {
@@ -5455,7 +6002,20 @@ fn append_schema_tree(
                 open_sql_in_schema(&ui, &profile_for_sql, &schema_for_sql);
             }
         });
-        parent.append(&tree_line(&schema_button, &sql_button));
+        let line = tree_line(&schema_button, &sql_button);
+        parent.append(&line);
+        ui.object_search_branches
+            .borrow_mut()
+            .push(object_search::Branch {
+                name: schema.clone(),
+                line,
+                children: children.clone(),
+                disclosure: disclosure.clone(),
+                icon: folder.clone(),
+                open_icon,
+                closed_icon,
+                expanded: user_expanded,
+            });
         if let Some(objects) = objects_by_schema.remove(&schema) {
             for object in objects {
                 let button = table_object_button(&object);
@@ -5662,6 +6222,7 @@ fn sync_broken_tab_icons(ui: &Ui) {
     for (key, is_broken) in tabs {
         set_tab_broken_icon(ui, &key, is_broken);
     }
+    tab_strip::refresh(ui);
 }
 
 fn set_tab_broken_icon(ui: &Ui, key: &str, broken: bool) {
@@ -5880,14 +6441,25 @@ fn replace_tab_session(ui: &Rc<Ui>, id: &str) {
     let was_running = !tab.run_button.is_sensitive();
     let previous = std::mem::replace(
         &mut tab.session,
-        sql_session::SqlSession::with_profile_and_schema(pool, &profile, tab.schema.clone()),
+        sql_session::SqlSession::with_profile_and_schema(
+            pool.clone(),
+            &profile,
+            tab.schema.clone(),
+        ),
     );
+    tab.editor.completion().hide();
+    tab.completion_provider.set_catalog(Default::default());
+    load_sql_completions(ui, id, pool);
     previous.request_cancel();
     ui.runtime.spawn(async move {
         previous.close().await;
     });
     if was_running {
         // A new request id makes the late result of the old query be ignored.
+        if let Some(plan) = tab.running_plan.take() {
+            plan.request_cancel();
+        }
+        ui.background_tasks.cancel_status(&tab.request_id, true);
         tab.request_id = Uuid::new_v4().to_string();
         stop_sql_timer(tab);
         tab.run_button.set_sensitive(true);
@@ -6117,10 +6689,12 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     set_tables_nav_sensitive(ui, true);
                     ui.objects_available.set(true);
                     clear_box(&ui.objects);
+                    ui.object_search_branches.borrow_mut().clear();
                     ui.objects.append(&loading_row("Загружаю таблицы…"));
                     show_sidebar(ui, "tables");
                     *ui.current_profile.borrow_mut() = Some(profile.clone());
                     *ui.pool.borrow_mut() = Some(pool.clone());
+                    tab_strip::refresh(ui);
                     ui.sessions
                         .borrow_mut()
                         .insert(session_key.clone(), (profile.clone(), pool.clone()));
@@ -6166,6 +6740,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                         transport_summary(&profile)
                     ));
                     set_profile_accent(&ui.active_header, &profile.color);
+                    ui.connection_block.set(Some(&profile));
                     sql_history_ui::restore_drafts(ui, &profile);
                     show_table_catalog(ui);
                 }
@@ -6189,10 +6764,10 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     refresh_profiles(ui);
                     if ui.sessions.borrow().is_empty() {
                         ui.active_header.set_visible(false);
+                        ui.connection_block.set(None);
                         ui.table_tabs.set_visible(false);
                         ui.landing.set_visible(true);
                         ui.active.set_text("Нет активного подключения");
-                    } else {
                     }
                     ui.objects.set_sensitive(true);
                     stop_loading_spinners(&ui.objects);
@@ -6244,9 +6819,9 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                         return;
                     }
                     let schemas = catalog.schemas.clone();
-                    ui.table_filter.set_text("");
                     ui.table_filter.set_visible(true);
                     clear_box(&ui.objects);
+                    ui.object_search_branches.borrow_mut().clear();
                     ui.table_list_items.borrow_mut().clear();
                     ui.selected_table_button.borrow_mut().take();
                     ui.objects_available.set(!schemas.is_empty());
@@ -6288,14 +6863,28 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 }
             }
         }
-        Event::TableLoaded(tab_key, request_id, name, result) => {
+        Event::TableLoaded(tab_key, request_id, saved_view, mut result) => {
             if ui.table_requests.borrow().get(&tab_key) != Some(&request_id) {
                 return;
             }
             set_table_spinner(ui, &tab_key, false);
+            let load_time = ui
+                .table_edit_states
+                .borrow()
+                .get(&tab_key)
+                .and_then(|state| state.load_started.take());
+            if result.is_ok()
+                && let Some((layout, pool)) = saved_view
+            {
+                result = result.and_then(|data| {
+                    saved_table_views::commit_loaded(ui, &tab_key, layout, &pool, &data.columns)?;
+                    Ok(data)
+                });
+            }
             if result.is_err() {
                 if let Some(grid) = ui.tabulator_grids.borrow().get(&tab_key) {
                     grid.set_locked(false);
+                    grid.reset_page_request();
                 }
             }
             let grid = ui.table_grids.borrow().get(&tab_key).cloned();
@@ -6339,6 +6928,10 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                         .borrow_mut()
                         .insert(tab_key.clone(), data.clone());
                     if let Some(state) = ui.table_edit_states.borrow().get(&tab_key) {
+                        if let Some(started) = load_time {
+                            state.load_ms.set(Some(started.elapsed().as_millis()));
+                        }
+                        update_table_summary(state, &data);
                         let editable = can_edit_table_cells(ui, &tab_key, &data);
                         state.cell_edit_allowed.set(editable);
                         let status = if !ui
@@ -6395,16 +6988,11 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     if data.truncated_columns {
                         details.push("показаны первые 64 столбца".to_owned());
                     }
-                    ui.status.set_text(&format!(
-                        "{}. {} строк{}",
-                        name,
-                        data.rows.len(),
-                        if details.is_empty() {
-                            String::new()
-                        } else {
-                            format!(" ({})", details.join("; "))
-                        }
-                    ));
+                    if let Some(edit) = ui.table_edit_states.borrow().get(&tab_key) {
+                        edit.summary.set_tooltip_text(Some(&details.join("; ")));
+                        edit.loaded_view.replace(Some(view_state));
+                    }
+                    ui.status.set_text("Готово");
                 }
                 Err(error) => {
                     let lost_session = ui
@@ -6433,6 +7021,9 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             let mut next = match result {
                 Ok(next) => next,
                 Err(error) => {
+                    if let Some(grid) = ui.tabulator_grids.borrow().get(&table_key) {
+                        grid.reset_page_request();
+                    }
                     ui.status
                         .set_text(&format!("Не удалось загрузить следующую страницу: {error}"));
                     return;
@@ -6443,30 +7034,41 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 return;
             };
             let current = Arc::make_mut(current);
-            if current.rows.len() != offset || current.columns != next.columns {
+            if current.rows.len() != offset {
+                return;
+            }
+            if current.columns != next.columns
+                || current.cell_detail_key_columns != next.cell_detail_key_columns
+            {
+                current.truncated = false;
+                if let Some(tabulator) = ui.tabulator_grids.borrow().get(&table_key) {
+                    tabulator.append_data(offset, &[], false, &[]);
+                }
+                if let Some(state) = ui.table_edit_states.borrow().get(&table_key) {
+                    update_table_summary(state, current);
+                }
+                ui.status
+                    .set_text("Структура таблицы изменилась. Обновите данные");
                 return;
             }
             current.rows.append(&mut next.rows);
             let limited = current.trim_preview(database::MAX_BROWSE_ROWS)
                 || (next.truncated && current.rows.len() >= database::MAX_BROWSE_ROWS);
-            let added = current.rows.len() - offset;
             current.truncated = next.truncated && !limited;
+            if let Some(state) = ui.table_edit_states.borrow().get(&table_key) {
+                update_table_summary(state, current);
+            }
             if let Some(tabulator) = ui.tabulator_grids.borrow().get(&table_key) {
                 tabulator.append_data(
                     offset,
                     &grid_rows_from_rows(&current.rows[offset..]),
                     current.truncated,
-                    &grid_blocked_cells(&current),
+                    &grid_blocked_cells_from(current, offset),
                 );
             }
             ui.status.set_text(&if limited {
                 "Достигнут лимит предпросмотра (10 000 строк / 32 МиБ). Уточните фильтр или экспортируйте всю таблицу.".into()
             } else {format!("Загружено строк: {}",current.rows.len())});
-            if added == 0 {
-                if let Some(tabulator) = ui.tabulator_grids.borrow().get(&table_key) {
-                    tabulator.append_data(offset, &[], false, &[]);
-                }
-            }
         }
         Event::TableEditsSaved(table_key, result) => {
             if result.is_err() {
@@ -6518,13 +7120,24 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 }
             }
         }
-        Event::SqlCompletionsLoaded(id, result) => {
+        Event::SqlCompletionsLoaded(id, source, result) => {
             let tabs = ui.sql_tabs.borrow();
             let Some(tab) = tabs.get(&id) else {
                 return;
             };
+            if !ui
+                .sessions
+                .borrow()
+                .get(&tab.session_key)
+                .is_some_and(|(_, current)| current.same_pool(&source))
+            {
+                return;
+            }
             match result {
-                Ok(words) => tab.completion_provider.set_catalog(&words),
+                Ok(catalog) => {
+                    tab.editor.completion().hide();
+                    tab.completion_provider.set_catalog(catalog);
+                }
                 Err(error) => tab
                     .status
                     .set_text(&format!("Подсказки объектов недоступны: {error}")),
@@ -6562,6 +7175,8 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             }
         }
         Event::SqlQueryFinished(id, request_id, result, state, elapsed_ms) => {
+            ui.background_tasks
+                .finish(&request_id, Outcome::for_result(&result));
             let Some(mut tab) = ui.sql_tabs.borrow_mut().remove(&id) else {
                 return;
             };
@@ -6580,6 +7195,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             stop_sql_timer(&mut tab);
             update_transaction_controls(&mut tab, state);
             sql_history_ui::record(ui, &tab, &result, elapsed_ms);
+            let explain = tab.running_plan.take().is_some();
             match result {
                 Ok(result) => {
                     render_query_result(&tab.grid, &result.data);
@@ -6591,7 +7207,8 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     ui.table_data
                         .borrow_mut()
                         .insert(key.clone(), result.data.clone());
-                    let editable = !state.manual
+                    let editable = !explain
+                        && !state.manual
                         && !state.pending
                         && can_edit_table_cells(ui, &key, &result.data);
                     if let Some(state) = ui.table_edit_states.borrow().get(&key) {
@@ -6599,55 +7216,83 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                         state.cell_edit_allowed.set(editable);
                         update_table_edit_controls(state, None);
                     }
-                    tab.tabulator.set_data(
-                        &result.data.columns,
-                        &grid_rows(&result.data),
-                        editable,
-                        false,
-                        false,
-                        &result.read_only_columns,
-                        &grid_blocked_cells(&result.data),
-                    );
+                    let text_plan = explain && tab.risk_dialect == sql_risk::Dialect::PostgreSql;
+                    if text_plan {
+                        let lines = result
+                            .data
+                            .rows
+                            .iter()
+                            .filter_map(|row| match row.first() {
+                                Some(database::CellValue::Text(line)) => Some(line.as_str()),
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        let buffer = tab.plan_view.buffer();
+                        buffer.set_text(&lines.join("\n"));
+                        buffer.place_cursor(&buffer.start_iter());
+                    } else {
+                        tab.tabulator.set_data(
+                            &result.data.columns,
+                            &grid_rows(&result.data),
+                            editable,
+                            false,
+                            false,
+                            &result.read_only_columns,
+                            &grid_blocked_cells(&result.data),
+                        );
+                    }
                     tab.export_button
                         .set_sensitive(!result.data.columns.is_empty());
                     let has_rows = !result.data.rows.is_empty();
                     tab.copy_button.set_sensitive(has_rows);
-                    tab.result_stack.set_visible_child_name(if has_rows {
-                        "data"
-                    } else {
-                        "empty"
-                    });
-                    let summary = format!("{} · {elapsed_ms} мс", query_result_summary(&result));
-                    tab.status
-                        .set_text(&if !result.data.columns.is_empty() && !editable {
-                            format!("{summary} · только чтение")
+                    tab.result_stack
+                        .set_visible_child_name(if text_plan && has_rows {
+                            "plan"
+                        } else if has_rows {
+                            "data"
                         } else {
-                            summary
+                            "empty"
                         });
-                    tab.status.set_tooltip_text((!editable).then_some("Для редактирования нужен SELECT прямых столбцов одной таблицы, полный первичный ключ и профиль с правом записи. JOIN, вычисления и агрегаты доступны для чтения."));
+                    let summary = format!("{} · {elapsed_ms} мс", query_result_summary(&result));
+                    tab.status.set_text(&if explain {
+                        format!("Оценочный план (EXPLAIN) · {summary}")
+                    } else if !result.data.columns.is_empty() && !editable {
+                        format!("{summary} · только чтение")
+                    } else {
+                        summary
+                    });
+                    tab.status.set_tooltip_text(if explain {
+                        Some("План содержит оценки оптимизатора")
+                    } else {
+                        (!editable).then_some("Для редактирования нужен SELECT прямых столбцов одной таблицы, полный первичный ключ и профиль с правом записи. JOIN, вычисления и агрегаты доступны для чтения.")
+                    });
                     tab.error_message.set_text("");
                     tab.error_message.set_visible(false);
+                    let line = "Готово".to_owned();
                     tab.result = Some(result.data);
                     if is_active {
-                        ui.status
-                            .set_text(&format!("SQL-запрос: {} строк", result.row_count));
+                        ui.status.set_text(&line);
                     }
+                    tab.last_status = Some(line);
                 }
                 Err(error) => {
-                    queue_retry_if_lost(
-                        ui,
-                        &tab.session_key,
-                        RetryAction::Sql {
-                            tab_id: id.clone(),
-                            needed_approval: tab.sent_needing_approval,
-                            in_transaction: state.pending,
-                        },
-                    );
+                    if !explain {
+                        queue_retry_if_lost(
+                            ui,
+                            &tab.session_key,
+                            RetryAction::Sql {
+                                tab_id: id.clone(),
+                                needed_approval: tab.sent_needing_approval,
+                                in_transaction: state.pending,
+                            },
+                        );
+                    }
                     tab.tabulator.set_locked(false);
                     tab.status.set_text("Запрос завершился с ошибкой");
                     tab.error_message
                         .set_text(&format!("Ошибка запроса: {error}"));
                     tab.error_message.set_visible(true);
+                    tab.last_status = None;
                     if is_active {
                         ui.status.set_text("Ошибка выполнения SQL-запроса");
                     }
@@ -6655,11 +7300,12 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             }
             ui.sql_tabs.borrow_mut().insert(id, tab);
         }
-        Event::CsvImportProgress(rows) => ui.status.set_text(&format!(
-            "CSV: обработано {rows} строк; транзакция ещё не сохранена…"
-        )),
+        Event::CsvImportProgress(rows) => transfer_progress(
+            ui,
+            &format!("CSV: обработано {rows} строк; транзакция ещё не сохранена…"),
+        ),
         Event::CsvImported(profile, object, result) => {
-            finish_transfer(ui);
+            finish_transfer(ui, Outcome::for_result(&result));
             match result {
                 Ok(rows) => {
                     let key = format!(
@@ -6680,7 +7326,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             }
         }
         Event::RestoreFinished(profile, result) => {
-            finish_transfer(ui);
+            finish_transfer(ui, Outcome::for_result(&result));
             if ui
                 .current_profile
                 .borrow()
@@ -6723,11 +7369,11 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 ),
             }
         }
-        Event::DumpProgress(bytes) => ui
-            .status
-            .set_text(&format!("Бэкап: {:.1} МиБ…", bytes as f64 / 1048576.0)),
+        Event::DumpProgress(bytes) => {
+            transfer_progress(ui, &format!("Бэкап: {:.1} МиБ…", bytes as f64 / 1048576.0));
+        }
         Event::DumpFinished(path, kind, result) => {
-            finish_transfer(ui);
+            finish_transfer(ui, Outcome::for_result(&result));
             match result {
                 Ok(warnings) => {
                     ui.status
@@ -6754,12 +7400,19 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 }
             }
         }
-        Event::ExportProgress(count) => ui.status.set_text(&format!("Экспорт CSV: {count} строк…")),
-        Event::SqlBatchProgress(index, total) => ui
-            .status
-            .set_text(&format!("Markdown: запрос {index} из {total}…")),
+        Event::ExportProgress(count) => {
+            transfer_progress(ui, &format!("Экспорт CSV: {count} строк…"));
+        }
+        Event::SqlBatchProgress(index, total) => {
+            transfer_progress(ui, &format!("Markdown: запрос {index} из {total}…"));
+        }
         Event::SqlBatchFinished(path, result) => {
-            finish_transfer(ui);
+            let outcome = match &result {
+                Ok(summary) if summary.stopped => Outcome::PartialReport,
+                Ok(summary) if summary.failed > 0 => Outcome::WithErrors,
+                _ => Outcome::for_result(&result),
+            };
+            finish_transfer(ui, outcome);
             match result {
                 Ok(summary) => {
                     let text = format!(
@@ -6792,7 +7445,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
             }
         }
         Event::CsvExported(rows, result) => {
-            finish_transfer(ui);
+            finish_transfer(ui, Outcome::for_result(&result));
             match result {
                 Ok(()) => ui.status.set_text(&format!("CSV сохранён: {rows} строк")),
                 Err(error) => {
@@ -6841,16 +7494,177 @@ fn grid_rows_from_rows(rows: &[Vec<CellValue>]) -> Vec<Vec<Option<String>>> {
 }
 
 fn grid_blocked_cells(data: &TableData) -> Vec<(usize, usize)> {
-    data.rows
+    grid_blocked_cells_from(data, 0)
+}
+
+fn grid_blocked_cells_from(data: &TableData, offset: usize) -> Vec<(usize, usize)> {
+    data.rows[offset..]
         .iter()
         .enumerate()
         .flat_map(|(row, cells)| {
             cells.iter().enumerate().filter_map(move |(column, value)| {
                 matches!(value, CellValue::Truncated(_) | CellValue::DecodeError(_))
-                    .then_some((row, column))
+                    .then_some((offset + row, column))
             })
         })
         .collect()
+}
+
+fn show_grid_cell(ui: &Rc<Ui>, table_key: &str, row: usize, column: usize) {
+    let tables = ui.table_data.borrow();
+    let Some(data) = tables.get(table_key) else {
+        return;
+    };
+    let (Some(name), Some(cells)) = (data.columns.get(column), data.rows.get(row)) else {
+        return;
+    };
+    let Some(value) = cells.get(column) else {
+        return;
+    };
+    let pending = ui
+        .table_edit_states
+        .borrow()
+        .get(table_key)
+        .and_then(|state| state.pending.borrow().get(&(row, column)).cloned());
+    let (text, note) = match (pending.as_ref(), value) {
+        (Some(Some(text)), _) | (None, CellValue::Text(text)) => (text.as_str(), None),
+        (Some(None), _) | (None, CellValue::Null) => ("NULL", Some("Значение SQL NULL")),
+        (None, CellValue::Truncated(text)) => (
+            text.as_str(),
+            Some("Показана только загруженная часть значения"),
+        ),
+        (None, CellValue::DecodeError(text)) => {
+            (text.as_str(), Some("Не удалось прочитать значение"))
+        }
+    };
+
+    let window = adw::Window::builder()
+        .title(format!("Значение ячейки · {name}"))
+        .transient_for(&ui.window)
+        .destroy_with_parent(true)
+        .default_width(680)
+        .default_height(360)
+        .build();
+    add_escape_to_window(&window);
+    let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    content.append(&adw::HeaderBar::new());
+    let note = note.map(|note| {
+        let label = gtk::Label::new(Some(note));
+        label.set_wrap(true);
+        label.set_margin_top(8);
+        label.set_margin_bottom(8);
+        content.append(&label);
+        label
+    });
+    let view = gtk::TextView::builder()
+        .editable(false)
+        .monospace(true)
+        .wrap_mode(gtk::WrapMode::WordChar)
+        .left_margin(12)
+        .right_margin(12)
+        .top_margin(12)
+        .bottom_margin(12)
+        .build();
+    let buffer = view.buffer();
+    buffer.set_text(&text.replace('\0', "␀"));
+    buffer.place_cursor(&buffer.start_iter());
+    if let Some(note) = note
+        && pending.is_none()
+        && matches!(value, CellValue::Truncated(_))
+        && !table_key.starts_with("sql::")
+        && let Some(object) = ui.table_objects.borrow().get(table_key).cloned()
+        && object.kind == database::DbObjectKind::Table
+        && let Some(key) = data.cell_detail_key(cells)
+    {
+        let load = gtk::Button::with_label("Загрузить из БД");
+        load.set_halign(gtk::Align::Center);
+        content.append(&load);
+        let table_key = table_key.to_owned();
+        let snapshot = Arc::downgrade(data);
+        let owner = Rc::downgrade(ui);
+        let column = name.clone();
+        load.connect_clicked(move |button| {
+            let pool = owner.upgrade().and_then(|ui| {
+                let tables = ui.table_data.borrow();
+                let current = tables.get(&table_key)?;
+                if !std::ptr::eq(snapshot.as_ptr(), Arc::as_ptr(current)) {
+                    return None;
+                }
+                let profiles = ui.table_profiles.borrow();
+                let session_key = profile_session_key(profiles.get(&table_key)?);
+                ui.sessions
+                    .borrow()
+                    .get(&session_key)
+                    .map(|(_, pool)| (ui.runtime.clone(), pool.clone()))
+            });
+            let Some((runtime, pool)) = pool else {
+                note.set_text("Данные таблицы изменились или подключение закрыто");
+                button.set_sensitive(false);
+                return;
+            };
+            let (object, column, key) = (object.clone(), column.clone(), key.clone());
+            load_grid_cell(
+                &runtime,
+                async move { pool.read_table_cell(&object, &column, &key).await },
+                &note,
+                &buffer,
+                button,
+            );
+        });
+    }
+    content.append(
+        &gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&view)
+            .build(),
+    );
+    window.set_content(Some(&content));
+    window.present();
+    view.grab_focus();
+}
+
+fn load_grid_cell(
+    runtime: &tokio::runtime::Runtime,
+    read: impl std::future::Future<Output = Result<CellValue, db_error::DbError>> + Send + 'static,
+    note: &gtk::Label,
+    buffer: &gtk::TextBuffer,
+    button: &gtk::Button,
+) {
+    button.set_sensitive(false);
+    note.set_text("Загрузка значения из БД…");
+    let worker = runtime
+        .spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(15), read).await });
+    let (note, buffer, button) = (note.downgrade(), buffer.downgrade(), button.downgrade());
+    gtk::glib::MainContext::default().spawn_local(async move {
+        let result = worker.await;
+        let (Some(note), Some(buffer), Some(button)) =
+            (note.upgrade(), buffer.upgrade(), button.upgrade())
+        else {
+            return;
+        };
+        let limit = database::MAX_CELL_DETAIL_CHARS;
+        let (text, status) = match result {
+            Ok(Ok(Ok(CellValue::Text(text)))) => (Some(text), "Текущее значение из БД".to_owned()),
+            Ok(Ok(Ok(CellValue::Truncated(text)))) => (
+                Some(text),
+                format!("Текущее значение из БД показано частично · предел {limit} символов"),
+            ),
+            Ok(Ok(Ok(CellValue::Null))) => {
+                (Some("NULL".to_owned()), "Значение SQL NULL".to_owned())
+            }
+            Ok(Ok(Err(error))) => (None, format!("Не удалось загрузить значение: {error}")),
+            Ok(Err(_)) => (None, "Истекло время ожидания загрузки значения".to_owned()),
+            _ => (None, "Не удалось загрузить значение".to_owned()),
+        };
+        if let Some(text) = text {
+            buffer.set_text(&text.replace('\0', "␀"));
+            buffer.place_cursor(&buffer.start_iter());
+            button.set_visible(false);
+        } else {
+            button.set_sensitive(true);
+        }
+        note.set_text(&status);
+    });
 }
 
 fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
@@ -6858,6 +7672,46 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
         return;
     };
     match message.get("type").and_then(serde_json::Value::as_str) {
+        Some("viewRelations") => {
+            let generation = message["generation"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok());
+            let row = message["row"]
+                .as_u64()
+                .and_then(|row| usize::try_from(row).ok());
+            if let (Some(generation), Some(row)) = (generation, row) {
+                table_relations_ui::show(ui, table_key, generation, row);
+            }
+        }
+        Some("viewCell") => {
+            let Some(generation) = message["generation"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                return;
+            };
+            if !ui
+                .tabulator_grids
+                .borrow()
+                .get(table_key)
+                .is_some_and(|grid| {
+                    grid.generation() == Some(generation) && grid.webview.is_sensitive()
+                })
+            {
+                return;
+            }
+            if let (Some(row), Some(column)) = (
+                message["row"]
+                    .as_u64()
+                    .and_then(|row| usize::try_from(row).ok()),
+                message["column"]
+                    .as_str()
+                    .and_then(|field| field.strip_prefix('c'))
+                    .and_then(|column| column.parse::<usize>().ok()),
+            ) {
+                show_grid_cell(ui, table_key, row, column);
+            }
+        }
         Some("edit") => {
             // Ignore an in-flight clipboard/editor message after refresh or save locked the view.
             if ui
@@ -7003,30 +7857,45 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
             run_table_row_action(ui, table_key, row, action);
         }
         Some("loadMore") => {
-            if !ui
-                .table_more_loading
-                .borrow_mut()
-                .insert(table_key.to_owned())
-            {
+            let Some(generation) = message["generation"]
+                .as_str()
+                .and_then(|value| Uuid::parse_str(value).ok())
+            else {
+                return;
+            };
+            let Some(grid) = ui.tabulator_grids.borrow().get(table_key).cloned() else {
+                return;
+            };
+            if grid.generation() != Some(generation) {
                 return;
             }
+            if !grid.webview.is_sensitive() {
+                grid.reset_page_request();
+                return;
+            }
+            let view_state = ui
+                .table_edit_states
+                .borrow()
+                .get(table_key)
+                .and_then(|edit| {
+                    if edit.load_started.get().is_some() {
+                        return None;
+                    }
+                    edit.loaded_view.borrow().clone()
+                });
             let (Some(profile), Some(object), Some(view_state), Some(current)) = (
                 ui.table_profiles.borrow().get(table_key).cloned(),
                 ui.table_objects.borrow().get(table_key).cloned(),
-                ui.table_view_states.borrow().get(table_key).cloned(),
-                ui.table_data
-                    .borrow()
-                    .get(table_key)
-                    .map(|data| (data.rows.len(), data.truncated)),
+                view_state,
+                ui.table_data.borrow().get(table_key).cloned(),
             ) else {
-                ui.table_more_loading.borrow_mut().remove(table_key);
                 return;
             };
-            if !current.1 || current.0 >= database::MAX_BROWSE_ROWS {
-                if current.0 >= database::MAX_BROWSE_ROWS {
-                    ui.status.set_text("Показаны первые 10 000 строк. Уточните фильтр или экспортируйте всю таблицу потоком.");
-                }
-                ui.table_more_loading.borrow_mut().remove(table_key);
+            let offset = current.rows.len();
+            if !current.truncated
+                || current.primary_key.is_empty()
+                || offset >= database::MAX_BROWSE_ROWS
+            {
                 return;
             }
             let Some((_, pool)) = ui
@@ -7035,15 +7904,16 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
                 .get(&profile_session_key(&profile))
                 .cloned()
             else {
-                ui.table_more_loading.borrow_mut().remove(table_key);
+                grid.reset_page_request();
                 return;
             };
-            let offset = current.0;
             let key = table_key.to_owned();
             let Some(request_id) = ui.table_requests.borrow().get(table_key).cloned() else {
-                ui.table_more_loading.borrow_mut().remove(table_key);
                 return;
             };
+            if !ui.table_more_loading.borrow_mut().insert(key.clone()) {
+                return;
+            }
             let sender = ui.sender.clone();
             let session_key = profile_session_key(&profile);
             set_table_spinner(ui, table_key, true);
@@ -7051,14 +7921,9 @@ fn handle_tabulator_message(ui: &Rc<Ui>, table_key: &str, message: &str) {
             ui.runtime.spawn(async move {
                 let _guard = guard;
                 let result = pool
-                    .read_table_view_with_condition(
-                        &object,
-                        &view_state.filters,
-                        view_state.raw_condition.as_deref(),
-                        view_state.sort.as_ref(),
-                        offset,
-                    )
+                    .read_next_table_page(&object, &view_state, &current)
                     .await;
+                drop(current);
                 let result = report_lost(&pool, &sender, &session_key, result).await;
                 let _ = sender.send(Event::TablePageLoaded(key, request_id, offset, result));
             });
@@ -7147,7 +8012,7 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
             .set_text("Выберите конкретную базу данных перед открытием таблицы");
         return;
     }
-    ui.active_header.set_visible(true);
+    tab_strip::sync_connection(ui);
     let name = format!("{}.{}", object.schema, object.name);
     let table_name = object.name.clone();
     let session_key = profile_session_key(&profile);
@@ -7207,11 +8072,15 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     grid.set_vexpand(true);
     let tabulator_key = tab_key.clone();
     let weak = Rc::downgrade(ui);
-    let tabulator = TabulatorGrid::new(move |message| {
-        if let Some(ui) = weak.upgrade() {
-            handle_tabulator_message(&ui, &tabulator_key, &message);
-        }
-    });
+    let tabulator = TabulatorGrid::with_relations(
+        true,
+        object.kind == database::DbObjectKind::Table,
+        move |message| {
+            if let Some(ui) = weak.upgrade() {
+                handle_tabulator_message(&ui, &tabulator_key, &message);
+            }
+        },
+    );
     tabulator.set_theme(&theme::grid_css(ui.active_theme.get()));
     grid.set_visible(false);
     let page_content = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -7266,11 +8135,24 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     };
     let footer = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     footer.add_css_class("table-footer");
-    footer.append(&filter_panel.1.sql_mode);
+
+    footer.append(&table_edit_state.summary);
+    table_edit_state
+        .add_row_button
+        .set_visible(!profile.read_only);
+    footer.append(&table_edit_state.add_row_button);
+    let weak = Rc::downgrade(ui);
+    let add_row_key = tab_key.clone();
+    table_edit_state.add_row_button.connect_clicked(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            run_table_row_action(&ui, &add_row_key, usize::MAX, "Добавить строку");
+        }
+    });
     let footer_space = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     footer_space.set_hexpand(true);
     footer_space.append(&edit_toolbar);
     footer.append(&footer_space);
+    footer.append(&tabulator.column_chooser());
     footer.append(&export_csv);
     page_content.append(&filter_panel.0);
     page_content.append(&scroll);
@@ -7400,6 +8282,7 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
     let runtime = ui.runtime.clone();
     let request_id_for_event = request_id.clone();
     let guard = ui.activity.start();
+    start_table_load_timer(ui, &tab_key);
     runtime.spawn(async move {
         let _guard = guard;
         let result = pool.read_table(&object).await;
@@ -7407,7 +8290,7 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
         let _ = sender.send(Event::TableLoaded(
             tab_key,
             request_id_for_event,
-            name,
+            None,
             result,
         ));
     });
@@ -7415,6 +8298,8 @@ fn open_table(ui: &Rc<Ui>, object: DbObject, open_in_new_tab: bool) {
 
 fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<TableFilterPanel>) {
     let panel = Rc::new(TableFilterPanel {
+        toggle: gtk::ToggleButton::new(),
+        summary: gtk::Label::new(None),
         rows: gtk::Box::new(gtk::Orientation::Vertical, 4),
         controls: RefCell::new(Vec::new()),
         columns: RefCell::new(Vec::new()),
@@ -7475,12 +8360,54 @@ fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<Tabl
     panel.row_height.add_widget(&actions);
     actions.append(&panel.add);
     actions.append(&panel.apply);
-    actions.append(&panel.clear);
+
     toolbar.append(&actions);
+    let heading = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    heading.add_css_class("table-filter-summary");
+    panel.summary.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    panel.summary.set_max_width_chars(48);
+    panel.summary.set_visible(false);
+    let toggle_content = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    let arrow = gtk::Image::from_icon_name("pan-end-symbolic");
+    toggle_content.append(&arrow);
+    toggle_content.append(&gtk::Label::new(Some("Фильтры")));
+    toggle_content.append(&panel.summary);
+    panel.toggle.set_child(Some(&toggle_content));
+    panel.toggle.set_valign(gtk::Align::Center);
+    let spacer = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    spacer.set_hexpand(true);
+    let views = saved_table_views::menu(ui, table_key);
+    views.set_valign(gtk::Align::Center);
+    panel.clear.set_label("Сбросить");
+    heading.append(&panel.toggle);
+    heading.append(&spacer);
+    heading.append(&views);
+    heading.append(&panel.clear);
+    container.append(&heading);
+    actions.append(&panel.sql_mode);
+    toolbar.set_visible(false);
+    panel
+        .toggle
+        .update_relation(&[gtk::accessible::Relation::Controls(&[toolbar.upcast_ref()])]);
+    panel
+        .toggle
+        .update_state(&[gtk::accessible::State::Expanded(Some(false))]);
+    let toolbar_for_expand = toolbar.clone();
+    panel.toggle.connect_toggled(move |toggle| {
+        let expanded = toggle.is_active();
+        toolbar_for_expand.set_visible(expanded);
+        toggle.update_state(&[gtk::accessible::State::Expanded(Some(expanded))]);
+        arrow.set_icon_name(Some(if expanded {
+            "pan-down-symbolic"
+        } else {
+            "pan-end-symbolic"
+        }));
+    });
     container.append(&toolbar);
     let weak_panel = Rc::downgrade(&panel);
     panel.sql_mode.connect_toggled(move |button| {
         if let Some(panel) = weak_panel.upgrade() {
+            panel.toggle.set_active(true);
             let raw = button.is_active();
             filter_rows_scroll.set_visible(!raw);
             panel.raw.set_visible(raw);
@@ -7494,6 +8421,7 @@ fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<Tabl
     let weak = Rc::downgrade(ui);
     let panel_for_add = panel.clone();
     panel.add.connect_clicked(move |_| {
+        panel_for_add.toggle.set_active(true);
         let columns = panel_for_add.columns.borrow().clone();
         if !columns.is_empty() {
             append_filter_row(&panel_for_add, &columns, None);
@@ -7539,6 +8467,9 @@ fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<Tabl
                     let state = states.entry(key_for_apply.clone()).or_default();
                     state.filters = filters.clone();
                     state.raw_condition = raw_condition;
+                    let summary = table_filter_summary(state);
+                    panel_for_apply.set_summary(&summary);
+                    panel_for_apply.toggle.set_active(false);
                     drop(states);
                     reload_table_view(&ui, &key_for_apply);
                 }
@@ -7579,6 +8510,7 @@ fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<Tabl
             state.filters.clear();
             state.raw_condition = None;
             drop(states);
+            panel_for_clear.set_summary("");
             panel_for_clear.raw.set_text("");
             let columns = panel_for_clear.columns.borrow().clone();
             clear_filter_rows(&panel_for_clear);
@@ -7589,6 +8521,53 @@ fn create_table_filter_panel(ui: &Rc<Ui>, table_key: &str) -> (gtk::Box, Rc<Tabl
         }
     });
     (container, panel)
+}
+
+fn table_filter_summary(state: &TableViewState) -> String {
+    if let Some(raw) = &state.raw_condition {
+        format!("WHERE {raw}")
+    } else {
+        state
+            .filters
+            .iter()
+            .enumerate()
+            .map(|(index, filter)| {
+                let operators = [
+                    FilterOperator::Equal,
+                    FilterOperator::NotEqual,
+                    FilterOperator::Contains,
+                    FilterOperator::NotContains,
+                    FilterOperator::StartsWith,
+                    FilterOperator::EndsWith,
+                    FilterOperator::Greater,
+                    FilterOperator::GreaterEqual,
+                    FilterOperator::Less,
+                    FilterOperator::LessEqual,
+                    FilterOperator::In,
+                    FilterOperator::NotIn,
+                    FilterOperator::IsNull,
+                    FilterOperator::IsNotNull,
+                ];
+                let operator = operators
+                    .iter()
+                    .position(|op| *op == filter.operator)
+                    .unwrap();
+                let logic = if index == 0 {
+                    ""
+                } else if filter.logic == FilterLogic::Or {
+                    " OR "
+                } else {
+                    " AND "
+                };
+                format!(
+                    "{logic}{} {} {}",
+                    filter.column,
+                    filter_operator_labels()[operator],
+                    filter.value
+                )
+            })
+            .collect::<String>()
+    }
 }
 
 fn filter_operator_labels() -> [&'static str; 14] {
@@ -7840,13 +8819,27 @@ fn create_table_edit_state() -> Rc<TableEditState> {
         grid_editing: Cell::new(false),
         cell_edit_allowed: Cell::new(false),
         toolbar: edit_toolbar.clone(),
-        save_button: gtk::Button::with_label("Сохранить"),
-        discard_button: gtk::Button::with_label("Отменить"),
+        save_button: gtk::Button::with_label("Проверить правки…"),
+        discard_button: gtk::Button::with_label("Откатить"),
         bulk_button: gtk::Button::with_label("Заменить столбец…"),
         status: gtk::Label::new(Some(
             "Клик — выделить; двойной клик — редактировать; Ctrl+C/V — буфер",
         )),
+        summary: gtk::Label::new(None),
+        add_row_button: gtk::Button::with_label("+ строка"),
+        load_started: Cell::new(None),
+        load_ms: Cell::new(None),
+        loaded_view: RefCell::new(None),
     });
+    table_edit_state.summary.add_css_class("table-rows-summary");
+    table_edit_state.add_row_button.add_css_class("flat");
+    table_edit_state
+        .add_row_button
+        .add_css_class("table-add-row-button");
+    table_edit_state
+        .add_row_button
+        .set_tooltip_text(Some("Добавить строку со значениями по умолчанию"));
+    table_edit_state.add_row_button.set_visible(false);
     table_edit_state
         .save_button
         .add_css_class("suggested-action");
@@ -7870,6 +8863,23 @@ fn create_table_edit_state() -> Rc<TableEditState> {
     table_edit_state
 }
 
+fn update_table_summary(state: &TableEditState, data: &TableData) {
+    let mut parts = vec![format!("{} строк", data.rows.len())];
+    if data.truncated && !data.primary_key.is_empty() {
+        parts.push("есть ещё".to_owned());
+    }
+    if let Some(ms) = state.load_ms.get() {
+        parts.push(format!("{ms} мс"));
+    }
+    state.summary.set_text(&parts.join(" · "));
+}
+
+fn start_table_load_timer(ui: &Ui, table_key: &str) {
+    if let Some(state) = ui.table_edit_states.borrow().get(table_key) {
+        state.load_started.set(Some(std::time::Instant::now()));
+    }
+}
+
 fn update_table_edit_controls(state: &TableEditState, message: Option<&str>) {
     let cell_count = state.pending.borrow().len();
     let bulk_pending = state.bulk_column.borrow().is_some();
@@ -7877,6 +8887,11 @@ fn update_table_edit_controls(state: &TableEditState, message: Option<&str>) {
     state.toolbar.set_visible(dirty || state.saving.get());
     let can_save = dirty && !state.saving.get();
     state.save_button.set_sensitive(can_save);
+    state.save_button.set_label(&if cell_count > 0 {
+        format!("Проверить правки ({cell_count})…")
+    } else {
+        "Проверить правки…".to_owned()
+    });
     if can_save {
         state.save_button.add_css_class("table-save-ready");
     } else {
@@ -8276,14 +9291,37 @@ fn discard_table_edits(ui: &Rc<Ui>, table_key: &str) {
     }
 }
 
-fn save_table_edits(ui: &Rc<Ui>, table_key: &str) {
-    save_table_edits_authorized(ui, table_key, false);
+fn edit_preview_value(value: Option<&str>) -> String {
+    let Some(value) = value else {
+        return "NULL".to_owned();
+    };
+    let mut chars = value.chars();
+    let prefix = chars.by_ref().take(240).collect::<String>();
+    if chars.next().is_some() {
+        format!("{prefix:?} (фрагмент)")
+    } else {
+        format!("{prefix:?}")
+    }
 }
-fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
+
+fn edit_preview_original(value: &CellValue) -> String {
+    match value {
+        CellValue::Text(text) => edit_preview_value(Some(text)),
+        CellValue::Null => edit_preview_value(None),
+        CellValue::Truncated(text) => format!("Усечено: {}", edit_preview_value(Some(text))),
+        CellValue::DecodeError(_) => "Ошибка чтения".to_owned(),
+    }
+}
+
+fn save_table_edits(ui: &Rc<Ui>, table_key: &str) {
+    save_table_edits_confirmed(ui, table_key, false);
+}
+
+fn save_table_edits_confirmed(ui: &Rc<Ui>, table_key: &str, confirmed: bool) {
     let Some(state) = ui.table_edit_states.borrow().get(table_key).cloned() else {
         return;
     };
-    if state.saving.get() {
+    if state.saving.get() || state.grid_editing.get() {
         return;
     }
     if state.editing_cell.get().is_some() {
@@ -8292,95 +9330,169 @@ fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
     if state.editing_column.get().is_some() {
         finish_inline_column_edit(ui, table_key);
     }
-    let Some(object) = ui.table_objects.borrow().get(table_key).cloned() else {
+    let (Some(object), Some(data), Some(profile)) = (
+        ui.table_objects.borrow().get(table_key).cloned(),
+        ui.table_data.borrow().get(table_key).cloned(),
+        ui.table_profiles.borrow().get(table_key).cloned(),
+    ) else {
         return;
     };
-    let Some(data) = ui.table_data.borrow().get(table_key).cloned() else {
-        return;
-    };
-    let profile_read_only = ui
-        .table_profiles
-        .borrow()
-        .get(table_key)
-        .is_none_or(|profile| profile.read_only);
-    if profile_read_only {
+    if profile.read_only {
         state
             .status
             .set_text("Профиль подключения работает в режиме только чтение");
         return;
     }
-    let session_key = ui
-        .table_profiles
+    let session_key = profile_session_key(&profile);
+    let Some(pool) = ui
+        .sessions
         .borrow()
-        .get(table_key)
-        .map(profile_session_key);
-    let Some(pool) =
-        session_key.and_then(|key| ui.sessions.borrow().get(&key).map(|(_, pool)| pool.clone()))
+        .get(&session_key)
+        .map(|(_, pool)| pool.clone())
     else {
         state.status.set_text("Нет активного подключения к БД");
         return;
     };
     let bulk_column = state.bulk_column.borrow().clone();
     let cell_changes = state.pending.borrow().clone();
-    let Some(profile) = ui.table_profiles.borrow().get(table_key).cloned() else {
+    if bulk_column.is_none() && cell_changes.is_empty() {
         return;
-    };
-    if matches!(profile.environment, EnvironmentTag::Prod)
-        && !approved
-        && (bulk_column.is_some() || !cell_changes.is_empty())
-    {
+    }
+    let sql_id = table_key.strip_prefix("sql::");
+    let sql_session =
+        sql_id.and_then(|id| ui.sql_tabs.borrow().get(id).map(|tab| tab.session.clone()));
+    let production = matches!(profile.environment, EnvironmentTag::Prod);
+    if !confirmed {
+        const PREVIEW_EDITS: usize = 50;
+
+        let mut details = format!("Таблица {:?}.{:?}\n\n", object.schema, object.name);
+        if let Some((column, value)) = &bulk_column {
+            let Some(name) = data.columns.get(*column) else {
+                state
+                    .status
+                    .set_text("Выбранный столбец больше не доступен");
+                return;
+            };
+            details.push_str(&format!(
+                "Массовая замена столбца {name:?}\nНовое значение: {}\nБудут обновлены все строки таблицы, включая строки вне текущего фильтра.",
+                edit_preview_value(value.as_deref())
+            ));
+        } else {
+            if !can_edit_table_cells(ui, table_key, &data) {
+                state.status.set_text(
+                    "Правки ячеек недоступны. Проверьте первичный ключ и режим транзакции.",
+                );
+                return;
+            }
+            let mut changes = cell_changes.iter().collect::<Vec<_>>();
+            changes.sort_unstable_by_key(|(position, _)| **position);
+            let row_count = changes
+                .chunk_by(|(left, _), (right, _)| left.0 == right.0)
+                .count();
+            details.push_str(&format!(
+                "Строк в наборе правок: {row_count} · Ячеек: {}\n",
+                changes.len()
+            ));
+            if changes.len() > PREVIEW_EDITS {
+                details.push_str(&format!(
+                    "Показаны первые {PREVIEW_EDITS} правок. Будут применены все правки.\n"
+                ));
+            }
+            let keys = data
+                .primary_key
+                .iter()
+                .filter_map(|key| {
+                    data.columns
+                        .iter()
+                        .position(|name| name == key)
+                        .map(|index| (key, index))
+                })
+                .collect::<Vec<_>>();
+            for ((row, column), value) in changes.into_iter().take(PREVIEW_EDITS) {
+                let (Some(values), Some(name)) = (data.rows.get(*row), data.columns.get(*column))
+                else {
+                    state
+                        .status
+                        .set_text("Таблица обновилась; отмените и повторите изменения");
+                    return;
+                };
+                let Some(original) = values.get(*column) else {
+                    state
+                        .status
+                        .set_text("Таблица обновилась; отмените и повторите изменения");
+                    return;
+                };
+                let key = keys
+                    .iter()
+                    .filter_map(|(name, index)| {
+                        values
+                            .get(*index)
+                            .map(|value| format!("{name:?} = {}", edit_preview_original(value)))
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                details.push_str(&format!(
+                    "\nСтрока {} · {key} · {name:?}\n  Было: {}\n  Станет: {}\n",
+                    row + 1,
+                    edit_preview_original(original),
+                    edit_preview_value(value.as_deref())
+                ));
+            }
+        }
         let owner = Rc::downgrade(ui);
         let key = table_key.to_owned();
-        let snapshot = data.clone();
-        let pending = cell_changes.clone();
-        let bulk = bulk_column.clone();
-        let details = if let Some((column, value)) = &bulk {
-            format!(
-                "Массовая замена столбца {} в {}.{}\nНовое значение: {:?}\nБудут изменены ВСЕ строки таблицы, а не только видимые или отфильтрованные.",
-                data.columns.get(*column).map(String::as_str).unwrap_or("?"),
-                object.schema,
-                object.name,
-                value
-            )
-        } else {
-            format!(
-                "{}.{}: изменено {} ячеек.\n{:?}",
-                object.schema,
-                object.name,
-                pending.len(),
-                pending
-            )
-        };
-        production_ui::confirm(
-            ui,
-            &profile,
-            "Сохранить изменения таблицы PROD",
-            &details,
-            move || {
-                if let Some(ui) = owner.upgrade() {
-                    let unchanged = ui
-                        .table_data
+        let snapshot = Arc::downgrade(&data);
+        let sql_snapshot = sql_session
+            .as_ref()
+            .map(|session| (session.identity(), session.revision()));
+        production_ui::confirm_table_edits(ui, &profile, &details, move || {
+            let Some(ui) = owner.upgrade() else {
+                return;
+            };
+            let unchanged = ui
+                .table_data
+                .borrow()
+                .get(&key)
+                .is_some_and(|current| snapshot.ptr_eq(&Arc::downgrade(current)))
+                && ui
+                    .table_edit_states
+                    .borrow()
+                    .get(&key)
+                    .is_some_and(|current| Rc::ptr_eq(current, &state))
+                && !state.saving.get()
+                && !state.grid_editing.get()
+                && state.editing_cell.get().is_none()
+                && state.editing_column.get().is_none()
+                && *state.pending.borrow() == cell_changes
+                && *state.bulk_column.borrow() == bulk_column
+                && ui.table_objects.borrow().get(&key).is_some_and(|current| {
+                    current.schema == object.schema
+                        && current.name == object.name
+                        && current.kind == object.kind
+                })
+                && ui.table_profiles.borrow().get(&key).is_some_and(|current| {
+                    !current.read_only
+                        && production == matches!(current.environment, EnvironmentTag::Prod)
+                        && profile_session_key(current) == session_key
+                })
+                && ui
+                    .sessions
+                    .borrow()
+                    .get(&session_key)
+                    .is_some_and(|(_, current)| pool.same_pool(current))
+                && key.strip_prefix("sql::").and_then(|id| {
+                    ui.sql_tabs
                         .borrow()
-                        .get(&key)
-                        .is_some_and(|data| Arc::ptr_eq(data, &snapshot))
-                        && ui
-                            .table_edit_states
-                            .borrow()
-                            .get(&key)
-                            .is_some_and(|state| {
-                                *state.pending.borrow() == pending
-                                    && *state.bulk_column.borrow() == bulk
-                            });
-                    if unchanged {
-                        save_table_edits_authorized(&ui, &key, true);
-                    } else {
-                        ui.status.set_text(
-                            "Правки изменились после подтверждения. Подтвердите их заново.",
-                        );
-                    }
-                }
-            },
-        );
+                        .get(id)
+                        .map(|tab| (tab.session.identity(), tab.session.revision()))
+                }) == sql_snapshot;
+            if unchanged {
+                save_table_edits_confirmed(&ui, &key, true);
+            } else {
+                ui.status
+                    .set_text("Данные или правки изменились. Откройте предпросмотр заново.");
+            }
+        });
         return;
     }
 
@@ -8466,9 +9578,6 @@ fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
     if let Some(grid) = ui.tabulator_grids.borrow().get(table_key) {
         grid.set_locked(true);
     }
-    let sql_session = table_key
-        .strip_prefix("sql::")
-        .and_then(|id| ui.sql_tabs.borrow().get(id).map(|tab| tab.session.clone()));
     let sender = ui.sender.clone();
     let table_key = table_key.to_owned();
     let runtime = ui.runtime.clone();
@@ -8477,7 +9586,7 @@ fn save_table_edits_authorized(ui: &Rc<Ui>, table_key: &str, approved: bool) {
         let _guard = guard;
         let result = match sql_session {
             Some(session) => {
-                if approved {
+                if production {
                     session.update_cells_authorized(&object, &edits, true).await
                 } else {
                     session.update_cells(&object, &edits).await
@@ -8737,6 +9846,10 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
         }
         return;
     }
+    load_table_view(ui, table_key, None);
+}
+
+fn load_table_view(ui: &Rc<Ui>, table_key: &str, saved_view: Option<SavedViewLayout>) -> bool {
     if let Some(state) = ui.table_edit_states.borrow().get(table_key)
         && (state.saving.get()
             || state.grid_editing.get()
@@ -8746,12 +9859,12 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
         state
             .status
             .set_text("Сначала сохраните или отмените изменения перед обновлением таблицы");
-        return;
+        return false;
     }
     let profile = ui.table_profiles.borrow().get(table_key).cloned();
     let object = ui.table_objects.borrow().get(table_key).cloned();
     let (Some(profile), Some(object)) = (profile, object) else {
-        return;
+        return false;
     };
     let session_key = profile_session_key(&profile);
     if block_if_broken(
@@ -8759,7 +9872,7 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
         &session_key,
         Some(RetryAction::LoadTable(table_key.to_owned())),
     ) {
-        return;
+        return false;
     }
     let pool = ui
         .sessions
@@ -8767,14 +9880,18 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
         .get(&session_key)
         .map(|(_, pool)| pool.clone());
     let Some(pool) = pool else {
-        return;
+        return false;
     };
-    let state = ui
-        .table_view_states
-        .borrow()
-        .get(table_key)
-        .cloned()
-        .unwrap_or_default();
+    let state = saved_view.as_ref().map_or_else(
+        || {
+            ui.table_view_states
+                .borrow()
+                .get(table_key)
+                .cloned()
+                .unwrap_or_default()
+        },
+        |layout| layout.view.clone(),
+    );
     if let Some(grid) = ui.tabulator_grids.borrow().get(table_key) {
         grid.set_locked(true);
     }
@@ -8788,8 +9905,8 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
     let sender = ui.sender.clone();
     let runtime = ui.runtime.clone();
     let table_key = table_key.to_owned();
-    let name = format!("{}.{}", object.schema, object.name);
     set_table_spinner(ui, &table_key, true);
+    start_table_load_timer(ui, &table_key);
     let guard = ui.activity.start();
     runtime.spawn(async move {
         let _guard = guard;
@@ -8803,8 +9920,12 @@ fn reload_table_view(ui: &Rc<Ui>, table_key: &str) {
             )
             .await;
         let result = report_lost(&pool, &sender, &session_key, result).await;
-        let _ = sender.send(Event::TableLoaded(table_key, request_id, name, result));
+        let saved_view = saved_view.map(|layout| (layout, pool));
+        let _ = sender.send(Event::TableLoaded(
+            table_key, request_id, saved_view, result,
+        ));
     });
+    true
 }
 
 fn render_query_result(grid: &gtk::Grid, _data: &TableData) {
@@ -8831,6 +9952,18 @@ fn install_css() -> gtk::CssProvider {
          .grid-column-resize-handle:hover { background: color-mix(in srgb, var(--accent-color) 22%, transparent); }\
          .sidebar-title { margin: 0 0 2px; }\
          .connection-card { border-radius: 8px; padding: 7px 8px; margin: 1px 0; }\
+         .connection-row { border-left: 3px solid transparent; border-radius: 4px 6px 6px 4px; padding: 0 2px 0 8px; margin: 0; }\
+         .connection-row-line { min-height: 30px; }\
+         .connection-row:hover { background: alpha(currentColor, 0.06); }\
+         .connection-row-active { background: alpha(currentColor, 0.10); }\
+         .connection-row:focus-visible { outline: 1px solid alpha(currentColor, 0.4); outline-offset: -1px; }\
+         .connection-row .connection-name { font-size: 13px; }\
+         .connection-row .connection-action { min-width: 24px; min-height: 24px; padding: 1px; }\
+         .connection-row menubutton > button { min-width: 24px; min-height: 24px; padding: 1px; }\
+         .connection-row .connection-hover-action { opacity: 0; }\
+         .connection-row:hover .connection-hover-action, .connection-row:focus-within .connection-hover-action { opacity: 1; }\
+         .connection-row .connection-status { margin: 0 4px 6px 22px; }\
+         .connection-group-header { min-height: 22px; padding: 0 6px; margin-top: 8px; font-size: 10px; font-weight: 700; opacity: 0.65; }\
          .active-connection-header { border-left-width: 4px; border-radius: 8px; padding: 8px 12px; }\
          .connection-details { font-size: 0.84em; }\
          .app-footer { min-height: 32px; padding: 0 14px; }\
@@ -9011,12 +10144,6 @@ fn clear_grid(widget: &gtk::Grid) {
     while let Some(child) = widget.first_child() {
         widget.remove(&child);
     }
-}
-fn escape_markup(text: &str) -> String {
-    text.replace('&', "&amp;")
-        .replace('"', "&quot;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
 }
 
 #[cfg(test)]

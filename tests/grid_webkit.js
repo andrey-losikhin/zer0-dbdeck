@@ -79,6 +79,26 @@
             key('Escape'); await wait();
             assert(!document.querySelector('.tabulator-menu'), 'Escape did not close menu');
         });
+        await test('cell menu requests the selected value from Rust', async () => {
+            await click(cell(1,1).getElement());
+            key('F10', {shiftKey:true}); await wait();
+            const items = [...document.querySelectorAll('.tabulator-menu-item')];
+            const item = items.find(item => item.textContent === 'Просмотреть значение…');
+            assert(item, 'preview action missing: ' + items.map(item => item.textContent).join(', '));
+            assert(document.activeElement === item, 'preview action did not receive keyboard focus');
+            key('Enter', {}, item);
+            for (let i=0; i<50 && !window.dbdeckPreviewReceived; i++) await wait(20);
+            assert(window.dbdeckPreviewReceived, 'preview request did not reach Rust');
+            assert(!editingCell, 'preview started editing');
+        });
+        await test('grid lock closes an open cell menu', async () => {
+            await click(cell(1,1).getElement());
+            key('F10', {shiftKey:true}); await wait();
+            assert(document.querySelector('.tabulator-menu'), 'cell menu missing before lock');
+            window.dbdeckSetLocked(true);
+            assert(!document.querySelector('.tabulator-menu'), 'stale cell menu survived lock');
+            window.dbdeckSetLocked(false);
+        });
         await test('double click opens inline editor and Escape cancels its value', async () => {
             const before = cell(1,1).getValue();
             mouse(cell(1,1).getElement(), 'dblclick', {detail:2}); await wait();
@@ -238,10 +258,59 @@
             assert(range().getRows().length === 240, 'append lost selection');
             key('Escape'); await wait(); assert(!table.getRanges().length, 'Escape after scroll');
         });
+        await test('column chooser preserves staged values and skips hidden cells in range actions', async () => {
+            await table.scrollToRow(1, 'top', false);
+            await click(cell(1,2).getElement());
+            window.dbdeckPaste('staged before hiding');
+            window.dbdeckCopy();
+            send({type:'testColumns', action:'hide'});
+            for (let i=0; i<50 && table.getColumn('c2').isVisible(); i++) await wait(20);
+            assert(!table.getColumn('c2').isVisible(), 'native chooser did not hide c2');
+            assert(!range() && !copiedRange, 'hidden column left a stale range');
+            assert(cell(1,2).getValue() === 'staged before hiding', 'hiding discarded the edit');
+
+            await drag(cell(1,1).getElement(), cell(1,3).getElement());
+            assert(range().getColumns().map(column => column.getField()).join(',') === 'c1,c3', 'range contains a hidden field');
+            window.dbdeckPaste('first\tsecond');
+            assert(cell(1,1).getValue() === 'first' && cell(1,3).getValue() === 'second', 'paste did not map visible fields');
+            const clipboard = new DataTransfer();
+            document.dispatchEvent(new ClipboardEvent('copy', {clipboardData:clipboard, cancelable:true}));
+            assert(clipboard.getData('text/plain') === 'first\tsecond', 'clipboard copied a hidden field');
+            key('Delete');
+            assert(cell(1,1).getValue() === null && cell(1,3).getValue() === null, 'clear missed a visible cell');
+            assert(cell(1,2).getValue() === 'staged before hiding', 'paste or clear overwrote the hidden cell');
+            key('a', {ctrlKey:true});
+            await wait();
+            assert(range().getColumns().length === 11, 'select all included a hidden column');
+        });
+        await test('column choice follows names on reload and always leaves a visible field', async () => {
+            for (const [action, value] of [['fallback', 'Column 2'], ['missing', 'Column 0']]) {
+                send({type:'testColumns', action});
+                for (let i=0; i<50 && table.getData()[0]?.c0 !== value; i++) await wait(20);
+                assert(table.getData()[0]?.c0 === value && table.getColumn('c0').isVisible(), 'single-column reload did not leave a visible field');
+            }
+            send({type:'testColumns', action:'reload'});
+            for (let i=0; i<50 && table.getData()[0]?.c0 !== 'hidden'; i++) await wait(20);
+            assert(table.getData()[0]?.c0 === 'hidden', 'reload timed out');
+            assert(!table.getColumn('c0').isVisible() && table.getColumn('c2').isVisible(), 'reload lost the choice or hid the new field');
+            send({type:'testColumns', action:'last'});
+            for (let i=0; i<50 && table.getColumn('c2').isVisible(); i++) await wait(20);
+            assert(visibleDataColumns().map(column => column.getField()).join(',') === 'c1', 'last visible field changed');
+            key('ArrowDown');
+            await wait();
+            assert(range()?.getColumns()[0]?.getField() === 'c1', 'keyboard selected a hidden field');
+            send({type:'testColumns', action:'showAll'});
+            for (let i=0; i<50 && visibleDataColumns().length < 3; i++) await wait(20);
+            assert(visibleDataColumns().length === 3, 'show all did not restore columns');
+        });
         await test('replacement/discard clears edits and selection; SQL remains read-only and locally sortable', async () => {
+            await click(table.getRows('visible')[0].getCell('c1').getElement());
+            key('F10', {shiftKey:true}); await wait();
+            assert(document.querySelector('.tabulator-menu'), 'cell menu missing before replacement');
             const payload = {server_sort:false, columns:[{title:'result',field:'c0',editable:false}], rows:[
                 {index:0,values:['z'],editable:[true]}, {index:1,values:['a'],editable:[true]}]};
             await window.dbdeckSetData(payload, false); await wait(80);
+            assert(!document.querySelector('.tabulator-menu'), 'stale cell menu survived replacement');
             assert(!table.getRanges().length, 'replacement selection');
             assert(!document.querySelector('.dbdeck-edited'), 'replacement staged style');
             await click(cell(0,0).getElement()); mouse(cell(0,0).getElement(), 'dblclick', {detail:2});

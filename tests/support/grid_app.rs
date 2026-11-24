@@ -40,19 +40,572 @@ pub(super) fn js(grid: &TabulatorGrid, script: &str) -> serde_json::Value {
     serde_json::from_str(&raw).unwrap()
 }
 
+fn edits_preview() -> (gtk::Window, gtk::Button) {
+    let mut window = None;
+    until(|| {
+        window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+            .find(|w| w.is_visible() && w.widget_name() == "table-edit-preview");
+        window.is_some()
+    });
+    let window = window.unwrap();
+    let accept = named_widget(window.upcast_ref(), "table-edit-accept")
+        .unwrap()
+        .downcast()
+        .unwrap();
+    (window, accept)
+}
+
+pub(super) fn preview_details(window: &gtk::Window) -> String {
+    let text = named_widget(window.upcast_ref(), "confirmation-details")
+        .unwrap()
+        .downcast::<gtk::TextView>()
+        .unwrap();
+    let buffer = text.buffer();
+    buffer
+        .text(&buffer.start_iter(), &buffer.end_iter(), true)
+        .into()
+}
+
+#[test]
+#[ignore = "requires GTK display; no database connection"]
+fn table_edit_preview_checks_snapshot_and_bulk_scope() {
+    gtk::init().unwrap();
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.dbdeck.edit-preview-test")
+        .build();
+    app.register(None::<&gtk::gio::Cancellable>).unwrap();
+    let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let ui = build_window(&app, runtime.clone());
+    let key = "edit-preview";
+    let profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+        "id": key, "name": "Preview fixture", "kind": "postgre_sql", "host": "localhost",
+        "port": 5432, "database": "preview_db", "username": "local",
+        "environment": "local", "color": "#ffffff", "read_only": false, "tls_mode": "disabled"
+    }))
+    .unwrap();
+    let fixture_pool = || {
+        let _guard = runtime.enter();
+        let socket = std::env::temp_dir().join(format!("dbdeck-no-socket-{}", Uuid::new_v4()));
+        DbPool::PostgreSql(
+            sqlx::postgres::PgPoolOptions::new()
+                .min_connections(0)
+                .connect_lazy_with(sqlx::postgres::PgConnectOptions::new().socket(socket)),
+        )
+    };
+    let session_key = profile_session_key(&profile);
+    ui.sessions
+        .borrow_mut()
+        .insert(session_key.clone(), (profile.clone(), fixture_pool()));
+    ui.table_profiles.borrow_mut().insert(key.into(), profile);
+    ui.table_objects.borrow_mut().insert(
+        key.into(),
+        DbObject {
+            schema: "public".into(),
+            name: "items".into(),
+            kind: database::DbObjectKind::Table,
+        },
+    );
+    let data = Arc::new(TableData {
+        columns: vec!["a".into(), "b".into(), "title".into()],
+        rows: vec![vec![
+            CellValue::Text("2".into()),
+            CellValue::Text("3".into()),
+            CellValue::Null,
+        ]],
+        primary_key: vec!["b".into(), "a".into()],
+        cell_detail_key_columns: vec![],
+        truncated: false,
+        truncated_columns: false,
+    });
+    ui.table_data.borrow_mut().insert(key.into(), data.clone());
+    let state = create_table_edit_state();
+    ui.table_edit_states
+        .borrow_mut()
+        .insert(key.into(), state.clone());
+    state
+        .pending
+        .borrow_mut()
+        .insert((0, 2), Some("NULL".into()));
+
+    save_table_edits(&ui, key);
+    let (window, accept) = edits_preview();
+    let details = preview_details(&window);
+    assert!(
+        details.contains(r#""b" = "3", "a" = "2" · "title""#),
+        "{details}"
+    );
+    assert!(
+        details.contains("Было: NULL\n  Станет: \"NULL\""),
+        "{details}"
+    );
+    assert!(!state.saving.get());
+    window.close();
+    accept.emit_clicked();
+    assert!(!state.saving.get());
+    assert_eq!(state.pending.borrow()[&(0, 2)].as_deref(), Some("NULL"));
+
+    save_table_edits(&ui, key);
+    let (_, accept) = edits_preview();
+    state
+        .pending
+        .borrow_mut()
+        .insert((0, 2), Some("newer".into()));
+    accept.emit_clicked();
+    assert!(ui.status.text().contains("Откройте предпросмотр заново"));
+    assert!(!state.saving.get());
+    assert_eq!(state.pending.borrow()[&(0, 2)].as_deref(), Some("newer"));
+
+    save_table_edits(&ui, key);
+    let (_, accept) = edits_preview();
+    ui.sessions.borrow_mut().get_mut(&session_key).unwrap().1 = fixture_pool();
+    ui.status.set_text("");
+    accept.emit_clicked();
+    assert!(ui.status.text().contains("Откройте предпросмотр заново"));
+    assert!(!state.saving.get());
+    assert_eq!(state.pending.borrow()[&(0, 2)].as_deref(), Some("newer"));
+
+    state.pending.borrow_mut().clear();
+    *state.bulk_column.borrow_mut() = Some((2, Some("я".repeat(241))));
+    save_table_edits(&ui, key);
+    let (window, accept) = edits_preview();
+    let details = preview_details(&window);
+    assert!(
+        details.contains(r#"Массовая замена столбца "title""#),
+        "{details}"
+    );
+    assert!(
+        details.contains("включая строки вне текущего фильтра"),
+        "{details}"
+    );
+    assert!(details.contains("(фрагмент)"), "{details}");
+    ui.table_data
+        .borrow_mut()
+        .insert(key.into(), Arc::new((*data).clone()));
+    accept.emit_clicked();
+    assert!(!state.saving.get());
+    assert!(state.bulk_column.borrow().is_some());
+    assert!(ui.status.text().contains("Откройте предпросмотр заново"));
+}
+
+#[test]
+#[ignore = "requires GTK display; no database connection"]
+fn cell_preview_preserves_multiline_text_and_indicates_truncation() {
+    gtk::init().unwrap();
+    adw::init().unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.dbdeck.cell-preview-test")
+        .build();
+    app.register(None::<&gtk::gio::Cancellable>).unwrap();
+    let ui = build_window(&app, Arc::new(tokio::runtime::Runtime::new().unwrap()));
+    let data = Arc::new(TableData {
+        columns: vec!["text".to_owned(), "id".to_owned()],
+        rows: vec![
+            vec![
+                CellValue::Text("first\n<second>  ".to_owned()),
+                CellValue::Text("1".to_owned()),
+            ],
+            vec![
+                CellValue::Truncated("loaded portion".to_owned()),
+                CellValue::Text("2".to_owned()),
+            ],
+            vec![
+                CellValue::Truncated("loaded portion".to_owned()),
+                CellValue::Truncated("incomplete key".to_owned()),
+            ],
+        ],
+        primary_key: vec!["id".to_owned()],
+        cell_detail_key_columns: vec![database::CellDetailKeyColumn {
+            name: "id".to_owned(),
+            key_type: "int".to_owned(),
+        }],
+        truncated: false,
+        truncated_columns: false,
+    });
+    for key in ["preview", "sql::preview"] {
+        ui.table_data
+            .borrow_mut()
+            .insert(key.to_owned(), data.clone());
+        ui.table_objects.borrow_mut().insert(
+            key.to_owned(),
+            DbObject {
+                schema: "public".to_owned(),
+                name: "preview".to_owned(),
+                kind: database::DbObjectKind::Table,
+            },
+        );
+        let grid = TabulatorGrid::new(true, |_| {});
+        grid.set_data(&data.columns, &[], false, false, false, &[], &[]);
+        ui.tabulator_grids.borrow_mut().insert(key.to_owned(), grid);
+    }
+    let state = create_table_edit_state();
+    state
+        .pending
+        .borrow_mut()
+        .insert((0, 0), Some("edited\n<line>  ".to_owned()));
+    ui.table_edit_states
+        .borrow_mut()
+        .insert("preview".to_owned(), state);
+    let grid = ui.tabulator_grids.borrow()["preview"].clone();
+    let stale_generation = grid.generation().unwrap();
+    grid.set_data(&data.columns, &[], false, false, false, &[], &[]);
+    handle_tabulator_message(
+        &ui,
+        "preview",
+        &serde_json::json!({
+            "type": "viewCell", "row": 1, "column": "c0", "generation": stale_generation,
+        })
+        .to_string(),
+    );
+    assert!(
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::Window>().ok())
+            .all(|window| window.title().as_deref() != Some("Значение ячейки · text"))
+    );
+    for (key, row, expected, truncated, can_load) in [
+        ("preview", 0, "edited\n<line>  ", false, false),
+        ("preview", 1, "loaded portion", true, true),
+        ("preview", 2, "loaded portion", true, false),
+        ("sql::preview", 1, "loaded portion", true, false),
+    ] {
+        let generation = ui.tabulator_grids.borrow()[key].generation().unwrap();
+        handle_tabulator_message(
+            &ui,
+            key,
+            &serde_json::json!({ "type": "viewCell", "row": row, "column": "c0", "generation": generation }).to_string(),
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::Window>().ok())
+            .find(|window| window.title().as_deref() == Some("Значение ячейки · text"))
+            .unwrap();
+        let content = window.content().unwrap();
+        let scroll = content
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        let view = scroll.child().unwrap().downcast::<gtk::TextView>().unwrap();
+        assert!(!view.is_editable());
+        let buffer = view.buffer();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            expected
+        );
+        let preceding = scroll.prev_sibling().unwrap();
+        let button = preceding.clone().downcast::<gtk::Button>().ok();
+        assert_eq!(button.is_some(), can_load);
+        let note = if button.is_some() {
+            preceding.prev_sibling().unwrap()
+        } else {
+            preceding
+        }
+        .downcast::<gtk::Label>()
+        .ok();
+        assert_eq!(
+            note.as_ref()
+                .map(|label| label.text().to_string())
+                .as_deref(),
+            truncated.then_some("Показана только загруженная часть значения")
+        );
+        if let Some(button) = button {
+            button.emit_clicked();
+            assert!(!button.is_sensitive());
+            assert!(note.unwrap().text().contains("подключение закрыто"));
+        }
+        window.close();
+    }
+
+    let note = gtk::Label::new(Some("Показана только загруженная часть значения"));
+    let buffer = gtk::TextBuffer::new(None);
+    let load = gtk::Button::with_label("Загрузить из БД");
+    buffer.set_text("loaded portion");
+    load_grid_cell(
+        &ui.runtime,
+        async { Err("Строка больше не найдена".into()) },
+        &note,
+        &buffer,
+        &load,
+    );
+    assert!(!load.is_sensitive());
+    until(|| load.is_sensitive());
+    assert!(note.text().contains("Строка больше не найдена"));
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        "loaded portion"
+    );
+
+    load_grid_cell(
+        &ui.runtime,
+        async {
+            Ok(CellValue::Truncated(
+                "longer\nсерверное значение".to_owned(),
+            ))
+        },
+        &note,
+        &buffer,
+        &load,
+    );
+    until(|| !load.is_visible());
+    assert!(note.text().contains("показано частично"));
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        "longer\nсерверное значение",
+    );
+}
+
 #[test]
 #[ignore = "requires GTK display and local Compose PostgreSQL; uses only a TEMP table"]
 fn application_staged_save_discard_and_paging() {
-    run_application_grid_scenarios(false);
+    run_application_grid_scenarios(GridScenario::Paging);
+}
+
+#[test]
+#[ignore = "requires GTK display and local PostgreSQL"]
+fn application_related_rows_preserve_staged_edits() {
+    run_application_grid_scenarios(GridScenario::Relations);
 }
 
 #[test]
 #[ignore = "requires GTK display and local Compose PostgreSQL; uses only a TEMP table"]
 fn keyboard_table_and_sql_commands() {
-    run_application_grid_scenarios(true);
+    run_application_grid_scenarios(GridScenario::Keyboard);
 }
 
-fn run_application_grid_scenarios(keyboard_only: bool) {
+#[test]
+#[ignore = "requires GTK display and local test PostgreSQL; uses only a TEMP table"]
+fn saved_table_view_round_trip() {
+    run_application_grid_scenarios(GridScenario::SavedViews);
+}
+
+fn first_widget_of_type<T: IsA<gtk::Widget>>(root: &gtk::Widget) -> Option<T> {
+    if let Ok(widget) = root.clone().downcast::<T>() {
+        return Some(widget);
+    }
+    let mut child = root.first_child();
+    while let Some(widget) = child {
+        if let Some(found) = first_widget_of_type(&widget) {
+            return Some(found);
+        }
+        child = widget.next_sibling();
+    }
+    None
+}
+
+fn click_saved_view_action(ui: &Ui, key: &str, action: &str) {
+    let (_, _, page) = find_table_page(ui, key).unwrap();
+    let menu: gtk::MenuButton = named_widget(&page, "saved-table-views")
+        .unwrap()
+        .downcast()
+        .unwrap();
+    menu.popup();
+    let button: gtk::Button = named_widget(menu.popover().unwrap().upcast_ref(), action)
+        .unwrap()
+        .downcast()
+        .unwrap();
+    assert!(button.is_sensitive(), "{action}");
+    button.emit_clicked();
+}
+
+fn check_saved_table_views(ui: &Rc<Ui>, key: &str, object: &DbObject) {
+    let profile = ui.current_profile.borrow().clone().unwrap();
+    let scope = settings::TableViewScope::new(&profile, object);
+    {
+        let mut store = ui.store.borrow_mut();
+        let store = store.as_mut().unwrap();
+        store.unlock_or_create_vault("fixture password").unwrap();
+        store.save_profile(profile, "").unwrap();
+    }
+    let panel = ui.table_filter_panels.borrow()[key].clone();
+    panel.sql_mode.set_active(true);
+    panel.raw.set_text("id <= 4");
+    panel.apply.emit_clicked();
+    until(|| ui.table_data.borrow()[key].rows.len() == 4);
+    let grid = ui.tabulator_grids.borrow()[key].clone();
+    until(|| grid.webview.is_sensitive());
+    handle_tabulator_message(
+        ui,
+        key,
+        r#"{"type":"sort","column":"c0","direction":"desc"}"#,
+    );
+    until(|| {
+        grid.webview.is_sensitive()
+            && ui.table_data.borrow()[key].rows[0][0] == CellValue::Text("4".to_owned())
+    });
+    let chooser = grid.column_chooser().popover().unwrap();
+    let id_check: gtk::CheckButton = first_widget_of_type(chooser.upcast_ref()).unwrap();
+    assert_eq!(id_check.label().as_deref(), Some("id"));
+    id_check.set_active(false);
+    // The form may contain a rejected WHERE. Saving must use the last successful read.
+    panel.raw.set_text("missing_column = 1");
+    panel.apply.emit_clicked();
+    let mut error = None;
+    until(|| {
+        error = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+            .find(|dialog| {
+                dialog.is_visible()
+                    && dialog.text().as_deref() == Some("Не удалось прочитать таблицу")
+            });
+        error.is_some()
+    });
+    error.unwrap().close();
+    click_saved_view_action(ui, key, "save-table-view");
+    let dialog = gtk::Window::list_toplevels()
+        .into_iter()
+        .find(|widget| widget.widget_name() == "save-table-view-dialog")
+        .unwrap();
+    let name: gtk::Entry = named_widget(&dialog, "table-view-name")
+        .unwrap()
+        .downcast()
+        .unwrap();
+    name.set_text("Последние четыре");
+    dialog
+        .downcast::<gtk::Dialog>()
+        .unwrap()
+        .response(gtk::ResponseType::Accept);
+
+    assert!(
+        ui.store
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .saved_table_views(&scope)
+            .next()
+            .is_some()
+    );
+    // A stale page response after close cannot clear a reopened tab's request state.
+    ui.table_more_loading.borrow_mut().insert(key.to_owned());
+    close_table_tab(ui, key);
+    assert!(!ui.table_more_loading.borrow().contains(key));
+    open_table(ui, object.clone(), true);
+    until(|| ui.table_data.borrow().contains_key(key));
+    let grid = ui.tabulator_grids.borrow()[key].clone();
+    until(|| {
+        js(
+            &grid,
+            "Boolean(typeof table !== 'undefined' && table && !updatingData)",
+        ) == true
+            && grid.webview.is_sensitive()
+    });
+
+    let edit = ui.table_edit_states.borrow()[key].clone();
+    edit.pending
+        .borrow_mut()
+        .insert((0, 1), Some("pending".to_owned()));
+    click_saved_view_action(ui, key, "apply-table-view");
+    assert_eq!(edit.pending.borrow()[&(0, 1)].as_deref(), Some("pending"));
+    let error = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+        .find(|dialog| dialog.text().as_deref() == Some("Не удалось применить вид"))
+        .unwrap();
+    error.close();
+    edit.pending.borrow_mut().clear();
+
+    // The JavaScript lock precedes GTK input blocking. Tabulator's own editor must honor it.
+    assert_eq!(
+        js(
+            &grid,
+            "window.dbdeckPrepareViewChange('test'); table.getRow(0).getCell('c1').edit(); Boolean(locked && !editingCell)"
+        ),
+        true
+    );
+    js(&grid, "window.dbdeckSetLocked(false); true");
+
+    // A previously failed page request can leave the WebKit pagination flag set.
+    js(&grid, "loadingMore = true; true");
+    click_saved_view_action(ui, key, "apply-table-view");
+    until(|| grid.webview.is_sensitive() && ui.table_data.borrow()[key].rows.len() == 4);
+    let panel = ui.table_filter_panels.borrow()[key].clone();
+    assert!(panel.sql_mode.is_active());
+    assert_eq!(panel.raw.text(), "id <= 4");
+    assert_eq!(panel.summary.text(), "WHERE id <= 4");
+    assert_eq!(
+        ui.table_data.borrow()[key].rows[0][0],
+        CellValue::Text("4".to_owned())
+    );
+    assert_eq!(grid.hidden_column_names(), ["id"]);
+    assert_eq!(js(&grid, "table.getColumn('c0').isVisible()"), false);
+    assert_eq!(
+        js(
+            &grid,
+            "table.getColumn('c0').getElement().getAttribute('aria-sort')"
+        ),
+        "descending"
+    );
+
+    let mut invalid = ui
+        .store
+        .borrow()
+        .as_ref()
+        .unwrap()
+        .saved_table_views(&scope)
+        .next()
+        .unwrap()
+        .clone();
+    invalid.layout.view.sort.as_mut().unwrap().column = "removed_column".to_owned();
+    ui.store
+        .borrow_mut()
+        .as_mut()
+        .unwrap()
+        .save_table_view(invalid)
+        .unwrap();
+    click_saved_view_action(ui, key, "apply-table-view");
+    until(|| {
+        gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+            .any(|dialog| dialog.text().as_deref() == Some("Не удалось прочитать таблицу"))
+    });
+    assert_eq!(
+        ui.table_view_states.borrow()[key]
+            .sort
+            .as_ref()
+            .unwrap()
+            .column,
+        "id"
+    );
+    assert_eq!(ui.table_data.borrow()[key].rows.len(), 4);
+    assert!(grid.webview.is_sensitive());
+    for dialog in gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+    {
+        dialog.close();
+    }
+    click_saved_view_action(ui, key, "delete-table-view");
+    let confirmation = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+        .find(|dialog| dialog.text().as_deref() == Some("Удалить вид «Последние четыре»?"))
+        .unwrap();
+    confirmation.response(gtk::ResponseType::Yes);
+    assert!(
+        ui.store
+            .borrow()
+            .as_ref()
+            .unwrap()
+            .saved_table_views(&scope)
+            .next()
+            .is_none()
+    );
+}
+
+#[derive(PartialEq, Eq)]
+enum GridScenario {
+    Paging,
+    Keyboard,
+    SavedViews,
+    Relations,
+}
+
+fn run_application_grid_scenarios(scenario: GridScenario) {
+    let keyboard_only = scenario == GridScenario::Keyboard;
     gtk::init().unwrap();
     adw::init().unwrap();
     let runtime = Arc::new(
@@ -64,12 +617,23 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
     );
     let (pool, object) = runtime.block_on(async {
         let options = sqlx::postgres::PgConnectOptions::new()
-            .host("127.0.0.1").port(55432).database("dbdeck_test").username("dbdeck_test")
-            .password(&std::env::var("DBDECK_PG_PASSWORD").expect("set DBDECK_PG_PASSWORD from .env"));
+            .port(55432).database("dbdeck_test").username("dbdeck_test");
+        let options = if let Some(socket) = std::env::var_os("DBDECK_PG_TEST_SOCKET") {
+            options.socket(socket)
+        } else {
+            options.host("127.0.0.1")
+                .password(&std::env::var("DBDECK_PG_PASSWORD").expect("set DBDECK_PG_PASSWORD from .env"))
+        };
         let pool = sqlx::postgres::PgPoolOptions::new().max_connections(1)
             .idle_timeout(None).max_lifetime(None).connect_with(options).await.unwrap();
         sqlx::query("CREATE TEMP TABLE dbdeck_grid_test (id integer PRIMARY KEY, value text NOT NULL)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO dbdeck_grid_test SELECT i, 'original-' || i FROM generate_series(1, 260) i").execute(&pool).await.unwrap();
+        if scenario == GridScenario::Relations {
+            sqlx::query("CREATE TEMP TABLE dbdeck_grid_child (id integer PRIMARY KEY, parent integer REFERENCES dbdeck_grid_test(id))")
+                .execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO dbdeck_grid_child VALUES (10, 1), (20, 2)")
+                .execute(&pool).await.unwrap();
+        }
         let schema: String = sqlx::query_scalar("SELECT pg_my_temp_schema()::regnamespace::text").fetch_one(&pool).await.unwrap();
         (pool, DbObject {schema, name:"dbdeck_grid_test".to_owned(), kind:database::DbObjectKind::Table})
     });
@@ -105,7 +669,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
     *ui.current_profile.borrow_mut() = Some(profile);
     *ui.pool.borrow_mut() = Some(DbPool::PostgreSql(pool.clone()));
     ui.landing.set_visible(false);
-    open_table(&ui, object, true);
+    open_table(&ui, object.clone(), true);
     until(|| ui.table_data.borrow().get(&key).is_some());
     let grid = ui.tabulator_grids.borrow().get(&key).unwrap().clone();
     until(|| {
@@ -114,8 +678,73 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             "Boolean(typeof table !== 'undefined' && table && !updatingData)",
         ) == true
     });
+    if scenario == GridScenario::SavedViews {
+        check_saved_table_views(&ui, &key, &object);
+        ui.window.close();
+        return;
+    }
+    if scenario == GridScenario::Relations {
+        let state = ui.table_edit_states.borrow()[&key].clone();
+        handle_tabulator_message(
+            &ui,
+            &key,
+            r#"{"type":"edit","row":0,"column":"c1","value":"staged"}"#,
+        );
+        assert!(!state.pending.borrow().is_empty());
+
+        js(
+            &grid,
+            "table.getRow(0).getCell('c1').getElement().dispatchEvent(new MouseEvent('contextmenu', {bubbles:true, cancelable:true, button:2, clientX:200, clientY:200})); true",
+        );
+        until(|| js(&grid, "Boolean(document.querySelector('.tabulator-menu'))") == true);
+        assert_eq!(
+            js(
+                &grid,
+                "[...document.querySelectorAll('.tabulator-menu-item')].find(item => item.textContent === 'Связанные строки…').click(); true"
+            ),
+            true
+        );
+        let mut dialog = None;
+        until(|| {
+            dialog = gtk::Window::list_toplevels()
+                .into_iter()
+                .filter_map(|widget| widget.downcast::<gtk::Window>().ok())
+                .find(|window| window.is_visible() && window.widget_name() == "table-relations");
+            dialog.is_some()
+        });
+        let dialog = dialog.unwrap();
+        let status = named_widget(dialog.upcast_ref(), "table-relations-status")
+            .unwrap()
+            .downcast::<gtk::Label>()
+            .unwrap();
+        let show = named_widget(dialog.upcast_ref(), "table-relations-show")
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        until(|| show.is_sensitive() || status.text().starts_with("Не удалось"));
+        assert!(show.is_sensitive(), "{}", status.text());
+        show.emit_clicked();
+        until(|| show.is_sensitive());
+        assert_eq!(status.text(), "Строк: 1");
+        assert_eq!(
+            state.pending.borrow().get(&(0, 1)),
+            Some(&Some("staged".to_owned()))
+        );
+        assert_eq!(
+            ui.tabulator_grids.borrow()[&key].generation(),
+            grid.generation()
+        );
+        dialog.close();
+        ui.window.close();
+        return;
+    }
     println!("CHECKPOINT initial grid ready");
     let initial_panel = ui.table_filter_panels.borrow()[&key].clone();
+    assert!(!initial_panel.toggle.is_active());
+    assert!(!initial_panel.summary.is_visible());
+    layout_snapshot(&ui.window, "target/table-compact-filters.png");
+    initial_panel.toggle.emit_clicked();
+    assert!(initial_panel.toggle.is_active());
     until(|| initial_panel.controls.borrow()[0].column.width() > 0);
     let single_gap = {
         let rows = initial_panel.controls.borrow();
@@ -236,6 +865,10 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         gtk::gdk::Key::s,
         gtk::gdk::ModifierType::CONTROL_MASK
     ));
+    let (window, accept) = edits_preview();
+    assert!(preview_details(&window).contains("Станет: \"saved-inline\""));
+    assert_eq!(read_value(), "original-1");
+    accept.emit_clicked();
     until(|| state.saving.get());
     assert!(
         !grid.webview.is_sensitive(),
@@ -279,6 +912,30 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         "window.dbdeckSetData=window.testDiscardSetData; true",
     );
     assert_eq!(read_value(), "saved-inline");
+    let applied_view = state.loaded_view.borrow().clone().unwrap();
+    let mut failing_view = applied_view.clone();
+    failing_view.raw_condition = Some("missing_column = 1".to_owned());
+    state.loaded_view.replace(Some(failing_view));
+    js(
+        &grid,
+        "table.scrollToRow(199); document.querySelector('.tabulator-tableholder').dispatchEvent(new Event('scroll')); true",
+    );
+    until(|| {
+        ui.status
+            .text()
+            .starts_with("Не удалось загрузить следующую страницу")
+            && js(
+                &grid,
+                "!loadingMore && hasMore && table.getDataCount() === 200",
+            ) == true
+    });
+    state.loaded_view.replace(Some(applied_view));
+    // A failed replacement view can leave draft filters different from the displayed rows.
+    ui.table_view_states
+        .borrow_mut()
+        .get_mut(&key)
+        .unwrap()
+        .raw_condition = Some("missing_column = 1".to_owned());
     js(
         &grid,
         "table.addRange(table.getRow(0).getCell('c1'),table.getRow(1).getCell('c1')); table.scrollToRow(199); document.querySelector('.tabulator-tableholder').dispatchEvent(new Event('scroll')); true",
@@ -295,6 +952,11 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             "!updatingData && table.getDataCount() === 260 && table.getRanges()[0]?.getRows().length === 2",
         ) == true
     });
+    ui.table_view_states
+        .borrow_mut()
+        .get_mut(&key)
+        .unwrap()
+        .raw_condition = None;
     js(
         &grid,
         "table.getColumn('c0').getElement().querySelector('.tabulator-col-sorter').click(); true",
@@ -313,6 +975,16 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         js(
             &grid,
             "!updatingData && table.getColumn('c0').getElement().getAttribute('aria-sort') === 'descending' && table.getRow(0).getData().c0 === '260'",
+        ) == true
+    });
+    js(
+        &grid,
+        "table.scrollToRow(199); document.querySelector('.tabulator-tableholder').dispatchEvent(new Event('scroll')); true",
+    );
+    until(|| {
+        js(
+            &grid,
+            "!updatingData && table.getDataCount() === 260 && table.getRow(200).getData().c0 === '60' && table.getRow(259).getData().c0 === '1'",
         ) == true
     });
     println!("Server sorting and acknowledged arrow directions: passed");
@@ -338,8 +1010,84 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
     );
     until(|| js(&grid, "table.getRows().length === 6 && !updatingData") == true);
     if keyboard_only {
+        shortcuts::palette(&ui);
+        let palette = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<adw::Window>().ok())
+            .find(|window| {
+                window.title().as_deref() == Some("Палитра команд") && window.is_visible()
+            })
+            .unwrap();
+        until(|| palette.is_mapped());
+        let search = named_widget(palette.upcast_ref(), "command-search")
+            .unwrap()
+            .downcast::<gtk::SearchEntry>()
+            .unwrap();
+        let list = named_widget(palette.upcast_ref(), "command-list")
+            .unwrap()
+            .downcast::<gtk::ListBox>()
+            .unwrap();
+        search.set_text("формат");
+        assert!(list.selected_row().is_none());
+        search.set_text("фильтр применить");
+        assert!(list.selected_row().is_some());
+        panel.raw.set_text("WHERE id = 255");
+        search.emit_activate();
+        assert!(!palette.is_visible());
+        until(|| ui.table_data.borrow()[&key].rows.len() == 1);
+        assert_eq!(
+            ui.table_data.borrow()[&key].rows[0][0],
+            CellValue::Text("255".into())
+        );
+
+        // Closing a SQL tab saves drafts, which needs an unlocked vault.
+        ui.store
+            .borrow_mut()
+            .as_mut()
+            .unwrap()
+            .unlock_or_create_vault("synthetic keyboard test key")
+            .unwrap();
         create_sql_tab(&ui, &session_key);
         let sql_id = ui.sql_tabs.borrow().keys().next().unwrap().clone();
+        if let Ok(helper) = std::env::var("DBDECK_POINTER_HELPER") {
+            ui.window.maximize();
+            until(|| ui.window.is_maximized() && ui.window.width() == 1600);
+            let page = ui.sql_tabs.borrow()[&sql_id].page.clone();
+            let split = page
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Paned>()
+                .unwrap();
+            until(|| split.is_mapped() && split.height() > 400);
+            let bounds = split.compute_bounds(&ui.window).unwrap();
+            let start = split
+                .start_child()
+                .unwrap()
+                .compute_bounds(&ui.window)
+                .unwrap();
+            let end = split
+                .end_child()
+                .unwrap()
+                .compute_bounds(&ui.window)
+                .unwrap();
+            let x = bounds.x() + bounds.width() / 2.0;
+            let y = (start.y() + start.height() + end.y()) / 2.0;
+            let before = split.position();
+            let mut process = std::process::Command::new(helper)
+                .args([x.to_string(), y.to_string(), "100".to_owned()])
+                .spawn()
+                .unwrap();
+            until(|| process.try_wait().unwrap().is_some());
+            until(|| split.position() >= before + 80);
+            println!("Real pointer SQL drag: {before} -> {}", split.position());
+            assert_eq!(ui.layout.borrow().sql_position, split.position());
+            ui.layout.borrow().save().unwrap();
+            assert_eq!(ui_layout::Layout::load().sql_position, split.position());
+            layout_snapshot(&ui.window, "target/sql-splitter-dragged.png");
+            ui.window.unmaximize();
+            until(|| !ui.window.is_maximized());
+        }
+
         ui.sql_tabs.borrow()[&sql_id]
             .buffer
             .set_text("SELECT 1 AS keyboard_test");
@@ -380,21 +1128,76 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             gtk::gdk::Key::w,
             gtk::gdk::ModifierType::CONTROL_MASK
         ));
-        assert!(!ui.sql_tabs.borrow().contains_key(&sql_id));
+        assert!(
+            !ui.sql_tabs.borrow().contains_key(&sql_id),
+            "Ctrl+W kept the SQL tab: status={:?}, tab status={:?}",
+            ui.status.text(),
+            ui.sql_tabs
+                .borrow()
+                .get(&sql_id)
+                .map(|tab| tab.status.text())
+        );
         ui.window.close();
         runtime.block_on(pool.close());
         return;
     }
-    let notebook = ensure_session_table_tabs(&ui, &group_key);
-    let page = notebook.nth_page(Some(0)).unwrap();
-    let label = notebook.tab_label(&page).unwrap().parent().unwrap();
-    let action = notebook.action_widget(gtk::PackType::End).unwrap();
+    fn strip_subtitles(widget: &gtk::Widget, found: &mut Vec<String>) {
+        if let Some(label) = widget.downcast_ref::<gtk::Label>()
+            && label.has_css_class("tab-strip-subtitle")
+        {
+            found.push(label.text().to_string());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            strip_subtitles(&current, found);
+            child = current.next_sibling();
+        }
+    }
     until(|| {
-        let tab_bounds = label.compute_bounds(&notebook).unwrap();
-        let action_bounds = action.compute_bounds(&notebook).unwrap();
-        action_bounds.x() - tab_bounds.x() - tab_bounds.width() <= 8.0
+        let mut subtitles = Vec::new();
+        strip_subtitles(ui.tab_strip.row.upcast_ref(), &mut subtitles);
+        subtitles
+            .iter()
+            .any(|text| text == "grid-test / dbdeck_test")
     });
-    until(|| panel.raw.width() > 0);
+    assert!(
+        ui.tab_strip.add_button.is_sensitive(),
+        "new SQL tab button is enabled with an open connection"
+    );
+    // The tab stays left of "+" instead of overlapping it.
+    let tab = ui.tab_strip.row.first_child().expect("strip shows the tab");
+    until(|| tab.width() > 0 && ui.tab_strip.add_button.width() > 0);
+    let tab_bounds = tab.compute_bounds(&ui.tab_strip.root).unwrap();
+    let add_bounds = ui
+        .tab_strip
+        .add_button
+        .compute_bounds(&ui.tab_strip.root)
+        .unwrap();
+    assert!(
+        tab_bounds.x() >= 0.0 && tab_bounds.x() + tab_bounds.width() <= add_bounds.x(),
+        "tab overlaps the new SQL tab button: {tab_bounds:?} vs {add_bounds:?}"
+    );
+    panel.toggle.set_active(true);
+    until(|| panel.raw.is_mapped() && panel.raw.width() > 0);
+    let apply_icon = panel
+        .apply
+        .child()
+        .unwrap()
+        .downcast::<gtk::Image>()
+        .unwrap();
+    let settings = gtk::prelude::WidgetExt::settings(&panel.apply);
+    let animations = settings.property::<bool>("gtk-enable-animations");
+    settings.set_property("gtk-enable-animations", false);
+    panel
+        .apply
+        .set_state_flags(gtk::StateFlags::PRELIGHT, false);
+    assert_eq!(
+        apply_icon.style_context().color(),
+        panel.apply.style_context().color(),
+        "filter icon should use the button foreground on hover"
+    );
+    panel.apply.unset_state_flags(gtk::StateFlags::PRELIGHT);
+    settings.set_property("gtk-enable-animations", animations);
     let raw_bounds = panel.raw.compute_bounds(&ui.window).unwrap();
     let table_bounds = grid.webview.compute_bounds(&ui.window).unwrap();
     assert!(
@@ -428,6 +1231,16 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
     until(|| ui.table_data.borrow()[&key].rows.len() == 3);
     assert!(ui.table_view_states.borrow()[&key].raw_condition.is_none());
     assert_eq!(ui.table_view_states.borrow()[&key].filters.len(), 2);
+    until(|| js(&grid, "table.getRows().length === 3 && !updatingData") == true);
+    assert!(!panel.toggle.is_active());
+    assert!(panel.summary.is_visible());
+    assert!(panel.summary.text().contains(" OR "));
+    layout_snapshot(&ui.window, "target/table-active-filters.png");
+    ui.window.set_default_size(930, 600);
+    until(|| ui.window.width() == 930);
+    layout_snapshot(&ui.window, "target/table-active-filters-narrow.png");
+    ui.window.set_default_size(1280, 820);
+    until(|| ui.window.width() == 1280);
     until(|| js(&grid, "table.getRows().length === 3 && !updatingData") == true);
     for _ in 0..2 {
         panel.add.emit_clicked();
@@ -464,7 +1277,7 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             }
         }
         let first_row = rows[0].row.compute_bounds(&ui.window).unwrap();
-        for action in [&panel.add, &panel.apply, &panel.clear] {
+        for action in [&panel.add, &panel.apply] {
             let bounds = action.compute_bounds(&ui.window).unwrap();
             assert!(
                 (bounds.y() + bounds.height() / 2.0 - first_row.y() - first_row.height() / 2.0)
@@ -498,8 +1311,8 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
             "filters must be above column headers"
         );
         assert!(
-            mode_bounds.y() >= grid_bounds.y() + grid_bounds.height(),
-            "SQL toggle must be in the footer"
+            mode_bounds.y() < grid_bounds.y(),
+            "SQL mode belongs to the filter builder"
         );
         assert!(panel.sql_mode.has_css_class("table-sql-mode"));
     }
@@ -537,6 +1350,10 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         (ThemeMode::CatppuccinMocha, "dbdeck-mocha"),
         (ThemeMode::Dark, "dbdeck-dark"),
         (ThemeMode::TokyoNight, "dbdeck-tokyo-night"),
+        (ThemeMode::GruvboxDark, "dbdeck-gruvbox-dark"),
+        (ThemeMode::Nord, "dbdeck-nord"),
+        (ThemeMode::RosePine, "dbdeck-rose-pine"),
+        (ThemeMode::Noctalia, "dbdeck-noctalia"),
         (ThemeMode::System, "Adwaita"),
         (ThemeMode::CatppuccinMocha, "dbdeck-mocha"),
     ] {
@@ -586,6 +1403,13 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
         gtk::glib::timeout_add_local_once(Duration::from_millis(80), move || rendered.set(true));
         until(|| frame.get());
         layout_snapshot(&ui.window, &format!("target/sql-editor-{}.png", mode.id()));
+        if mode == ThemeMode::Nord {
+            ui.window.set_default_size(930, 600);
+            until(|| ui.window.width() == 930);
+            layout_snapshot(&ui.window, "target/sql-editor-nord-narrow.png");
+            ui.window.set_default_size(1280, 820);
+            until(|| ui.window.width() == 1280);
+        }
         if mode == ThemeMode::System {
             let manager = adw::StyleManager::default();
             manager.set_color_scheme(adw::ColorScheme::ForceLight);
@@ -683,8 +1507,9 @@ fn run_application_grid_scenarios(keyboard_only: bool) {
                 }
                 child = widget.next_sibling();
             }
-            // Six file/result actions, four transaction/session actions and explicit write execution.
-            assert_eq!(actions, 11);
+            // Six file/result actions, Markdown batch, formatting, EXPLAIN, four
+            // transaction/session actions and explicit write execution.
+            assert_eq!(actions, 14);
             let paintable = gtk::WidgetPaintable::new(Some(&content));
             let mut menu_node = None;
             until(|| {
@@ -818,111 +1643,110 @@ fn workspace_controls_layout_and_risk() {
         16,
         "expanding a schema must not enlarge its icon"
     );
-    let notebook = ensure_session_table_tabs(&ui, "layout-test");
-    ui.landing.set_visible(false);
-    ui.table_tabs.set_visible(true);
-    ui.table_tabs.set_visible_child_name("layout-test");
-    let mut labels = Vec::new();
-    for name in ["Table one", "SQL 1", "SQL 2"] {
-        let label = gtk::Label::new(Some(name));
-        notebook.append_page(&gtk::Label::new(Some("content")), Some(&label));
-        labels.push(label);
-    }
-    let add = notebook.action_widget(gtk::PackType::End).unwrap();
-    until(|| add.width() > 0 && notebook.width() > 0 && labels.last().unwrap().width() > 10);
-    let last = labels
-        .last()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .compute_bounds(&notebook)
-        .unwrap();
-    let button = add.compute_bounds(&notebook).unwrap();
-    assert!(
-        button.x() - last.x() - last.width() <= 14.0,
-        "SQL button is separated from tabs: {button:?}, {last:?}"
-    );
-    let image = add
-        .clone()
-        .downcast::<gtk::Button>()
-        .unwrap()
-        .child()
-        .unwrap()
-        .downcast::<gtk::Image>()
-        .unwrap();
-    assert_eq!(image.pixel_size(), 20);
-    assert!(add.has_css_class("circular"));
+    // Tabs live in the header strip now; its "+" must stay inside the window.
+    let add = ui.tab_strip.add_button.clone();
+    until(|| add.width() > 0 && ui.tab_strip.root.width() > 0);
+    let button = add.compute_bounds(&ui.window).unwrap();
     assert!(
         button.height() <= 32.0,
         "SQL button should not enlarge the tab strip: {button:?}"
     );
-    println!(
-        "wide layout: notebook={}, add x={}, last tab right={}",
-        notebook.width(),
-        button.x(),
-        last.x() + last.width()
-    );
     layout_snapshot(&ui.window, "target/workspace-layout-wide.png");
-    for index in 0..16 {
-        notebook.append_page(
-            &gtk::Label::new(Some("content")),
-            Some(&gtk::Label::new(Some(&format!("Long query tab {index}")))),
-        );
+    fn first_paned(widget: &gtk::Widget) -> Option<gtk::Paned> {
+        if let Some(paned) = widget.downcast_ref::<gtk::Paned>() {
+            return Some(paned.clone());
+        }
+        let mut child = widget.first_child();
+        while let Some(current) = child {
+            if let Some(found) = first_paned(&current) {
+                return Some(found);
+            }
+            child = current.next_sibling();
+        }
+        None
     }
-    let body = ui
-        .window
-        .content()
-        .unwrap()
-        .first_child()
-        .unwrap()
-        .next_sibling()
-        .unwrap()
-        .downcast::<gtk::Paned>()
-        .unwrap();
+    let body = first_paned(&ui.window.content().unwrap()).unwrap();
+    assert_eq!(body.orientation(), gtk::Orientation::Horizontal);
     body.set_position(500);
     until(|| {
         let bounds = add.compute_bounds(&ui.window).unwrap();
-        let local = add.compute_bounds(&notebook).unwrap();
-        notebook.compute_bounds(&ui.window).unwrap().x() >= 500.0
-            && bounds.x() + bounds.width() < ui.window.width() as f32
-            && local.x() + local.width() <= notebook.width() as f32
+        bounds.x() + bounds.width() < ui.window.width() as f32
     });
-    println!("sidebar resize: SQL button stays inside workspace");
+    println!("sidebar resize: SQL button stays inside the window");
+    assert!(shortcuts::dispatch(
+        &ui,
+        gtk::gdk::Key::b,
+        gtk::gdk::ModifierType::CONTROL_MASK
+    ));
+    until(|| body.position() <= 60);
+    assert!(ui.connections_nav.is_mapped() && ui.tables_nav.is_mapped());
+    assert_eq!(ui.layout.borrow().sidebar_width, 500);
+    layout_snapshot(&ui.window, "target/workspace-sidebar-collapsed.png");
+    ui.sidebar_toggle.set_active(true);
+    until(|| body.position() == 500);
+    assert!(!ui.layout.borrow().sidebar_collapsed);
     ui.window.set_default_size(930, 600);
     until(|| {
         let bounds = add.compute_bounds(&ui.window).unwrap();
         ui.window.width() == 930 && bounds.x() + bounds.width() <= 930.0
     });
-    println!("real application window resizes to 930px with overflowing tabs");
-    // Reparent the same production notebook into a narrow standalone window.
-    ui.table_tabs.remove(&notebook);
-    let small = gtk::Window::builder()
-        .default_width(420)
-        .default_height(200)
-        .child(&notebook)
-        .build();
-    small.present();
+    println!("real application window resizes to 930px");
+    let workspace = body.end_child().unwrap();
+    fn assert_labels_fit(panel: &gtk::Box, workspace: &gtk::Widget) {
+        let mut child = panel.first_child();
+        let mut labels = 0;
+        while let Some(widget) = child {
+            child = widget.next_sibling();
+            let Ok(label) = widget.downcast::<gtk::Label>() else {
+                continue;
+            };
+            let bounds = label.compute_bounds(workspace).unwrap();
+            assert!(
+                bounds.x() >= 0.0 && bounds.x() + bounds.width() <= workspace.width() as f32 + 1.0,
+                "empty-state label exceeds workspace: {}",
+                label.text()
+            );
+            assert!(
+                label.layout().pixel_size().0 <= label.width(),
+                "empty-state text is clipped (text {}, widget {}): {}",
+                label.layout().pixel_size().0,
+                label.width(),
+                label.text()
+            );
+            labels += 1;
+        }
+        assert!(labels > 0, "empty-state labels must be checked");
+    }
+    assert_labels_fit(&ui.landing, &workspace);
+    ui.landing.set_visible(false);
+    ui.empty_session_hint.set_text(
+        "Рабочая область подключения с длинным названием: development / analytics_reporting_database. Откройте таблицу или создайте SQL-запрос.",
+    );
+    ui.empty_session.set_visible(true);
+    until(|| ui.empty_session_hint.width() > 0 && ui.empty_session_hint.layout().is_wrapped());
+    assert_labels_fit(&ui.empty_session, &workspace);
+    layout_snapshot(&ui.window, "target/workspace-empty-session-narrow.png");
+    ui.empty_session.set_visible(false);
+    ui.landing.set_visible(true);
+    until(|| ui.landing.is_mapped());
+    // Overflowing tabs scroll inside the strip instead of pushing "+" out of the window.
+    for index in 0..16 {
+        ui.tab_strip
+            .row
+            .append(&gtk::Label::new(Some(&format!("Long query tab {index}"))));
+    }
     until(|| {
-        let bounds = add.compute_bounds(&notebook).unwrap();
-        notebook.width() == 420 && bounds.x() + bounds.width() > 350.0
+        let bounds = add.compute_bounds(&ui.window).unwrap();
+        ui.tab_strip.row.width() > ui.tab_strip.scroller.width()
+            && bounds.x() >= 0.0
+            && bounds.x() + bounds.width() <= ui.window.width() as f32
     });
-    let button = add.compute_bounds(&notebook).unwrap();
-    println!(
-        "actual narrow window width={}, notebook min={:?}",
-        small.width(),
-        notebook.measure(gtk::Orientation::Horizontal, -1)
-    );
     assert!(
-        button.x() >= 0.0 && button.x() + button.width() <= notebook.width() as f32,
-        "SQL button clipped: {button:?}, width={}",
-        notebook.width()
+        add.compute_bounds(&ui.tab_strip.root).unwrap().x() + add.width() as f32
+            <= ui.tab_strip.root.width() as f32,
+        "SQL button clipped by the tab strip"
     );
-    println!(
-        "narrow layout: notebook={}, add right={}",
-        notebook.width(),
-        button.x() + button.width()
-    );
-    layout_snapshot(&small, "target/workspace-layout-narrow.png");
+    layout_snapshot(&ui.window, "target/workspace-layout-narrow.png");
     let buffer = sourceview5::Buffer::new(None);
     let indicator = gtk::Label::new(None);
     for (text, expected) in [
@@ -945,18 +1769,6 @@ fn workspace_controls_layout_and_risk() {
         "risk should match selected executable SQL"
     );
 
-    show_connection_form(&ui, None);
-    let form = gtk::Window::list_toplevels()
-        .into_iter()
-        .filter_map(|widget| widget.downcast::<adw::Window>().ok())
-        .find(|window| window.title().as_deref() == Some("Новое подключение"))
-        .unwrap();
-    until(|| form.is_mapped());
-    let default = gtk::prelude::GtkWindowExt::default_widget(&form)
-        .unwrap()
-        .downcast::<gtk::Button>()
-        .unwrap();
-    assert_eq!(default.label().as_deref(), Some("Сохранить"));
     fn check_form_entries(widget: &gtk::Widget) {
         if let Some(entry) = widget.downcast_ref::<gtk::Entry>() {
             assert!(entry.activates_default());
@@ -970,8 +1782,63 @@ fn workspace_controls_layout_and_risk() {
             child = current.next_sibling();
         }
     }
-    check_form_entries(form.upcast_ref());
-    form.close();
+    let profile = ConnectionProfile {
+        id: "layout-test".into(),
+        name: "layout-test".into(),
+        kind: DatabaseKind::PostgreSql,
+        host: "127.0.0.1".into(),
+        port: 5432,
+        database: String::new(),
+        username: "postgres".into(),
+        environment: EnvironmentTag::Local,
+        color: "#4f8fe8".into(),
+        read_only: false,
+        tls_mode: TlsMode::VerifyFull,
+        password_saved: false,
+        gopass_entry: None,
+        tls_files: Default::default(),
+        native_tools_dir: None,
+    };
+    for (existing, title, screenshot) in [
+        (None, "Новое подключение", "target/connection-new.png"),
+        (
+            Some(profile),
+            "Изменить подключение",
+            "target/connection-edit.png",
+        ),
+    ] {
+        show_connection_form(&ui, existing);
+        let form = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<adw::Window>().ok())
+            .find(|window| window.title().as_deref() == Some(title))
+            .unwrap();
+        let default = gtk::prelude::GtkWindowExt::default_widget(&form)
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        until(|| form.is_mapped() && default.width() > 0);
+        assert_eq!(default.label().as_deref(), Some("Сохранить"));
+        let scroll = form
+            .content()
+            .unwrap()
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        for (axis, adjustment) in [
+            ("width", scroll.hadjustment()),
+            ("height", scroll.vadjustment()),
+        ] {
+            assert!(
+                adjustment.upper() - adjustment.page_size() <= 1.0,
+                "{title}: initial {axis} clips the form ({} of {})",
+                adjustment.page_size(),
+                adjustment.upper()
+            );
+        }
+        check_form_entries(form.upcast_ref());
+        layout_snapshot(&form, screenshot);
+        form.close();
+    }
     assert!(shortcuts::dispatch(
         &ui,
         gtk::gdk::Key::question,
@@ -985,8 +1852,19 @@ fn workspace_controls_layout_and_risk() {
     until(|| help.is_mapped());
     layout_snapshot(&help, "target/keyboard-shortcuts.png");
     help.close();
-    small.close();
+    ui.sidebar_toggle.set_active(false);
     ui.window.close();
+    let saved = ui_layout::Layout::load();
+    assert!(saved.sidebar_collapsed);
+    assert_eq!(saved.sidebar_width, 500);
+    let reopened = build_window(&app, ui.runtime.clone());
+    until(|| reopened.window.is_mapped());
+    assert!(!reopened.sidebar_toggle.is_active());
+    assert!(reopened.connections_nav.is_mapped());
+    reopened.sidebar_toggle.set_active(true);
+    let restored_body = first_paned(&reopened.window.content().unwrap()).unwrap();
+    until(|| restored_body.position() == 500);
+    reopened.window.close();
 }
 
 pub(super) fn named_widget(root: &gtk::Widget, name: &str) -> Option<gtk::Widget> {
@@ -1292,6 +2170,7 @@ fn sql_result_staging_and_delete() {
         )
         .unwrap();
     save_table_edits(&ui, &key);
+    edits_preview().1.emit_clicked();
     until(|| !ui.table_edit_states.borrow()[&key].saving.get());
     assert!(
         ui.table_edit_states.borrow()[&key]
@@ -1341,6 +2220,7 @@ fn sql_result_staging_and_delete() {
     // A changed editor must not be executed by Save/refresh.
     buffer.set_text("DELETE FROM dbdeck_sql_edit_test");
     save_table_edits(&ui, &key);
+    edits_preview().1.emit_clicked();
     until(|| {
         ui.table_data
             .borrow()
@@ -1412,6 +2292,7 @@ fn sql_result_staging_and_delete() {
             .is_empty()
     });
     save_table_edits(&ui, &key);
+    edits_preview().1.emit_clicked();
     until(|| {
         ui.table_data
             .borrow()
@@ -1676,12 +2557,6 @@ fn sql_result_staging_and_delete() {
     until(|| !menu.popover().unwrap().is_mapped());
     let editor = ui.sql_tabs.borrow()[&id].editor.clone();
     editor.grab_focus();
-    assert!(
-        ui.sql_tabs.borrow()[&id]
-            .completion_provider
-            .suggestions("sel", false)
-            .contains(&"SELECT".to_owned())
-    );
     buffer.set_text("SEL");
     buffer.place_cursor(&buffer.end_iter());
     editor.completion().emit_show();
@@ -1913,7 +2788,7 @@ fn sql_editor_assistance_and_connected_icon() {
     ui.profile_status
         .borrow_mut()
         .insert(profile.id.clone(), ProfileStatus::Connected);
-    let pool = {
+    let lazy_pool = || {
         let _guard = runtime.enter();
         sqlx::postgres::PgPoolOptions::new()
             .acquire_timeout(Duration::from_millis(200))
@@ -1923,6 +2798,7 @@ fn sql_editor_assistance_and_connected_icon() {
                     .port(9),
             )
     };
+    let pool = lazy_pool();
     let session = profile_session_key(&profile);
     ui.sessions.borrow_mut().insert(
         session.clone(),
@@ -1950,7 +2826,7 @@ fn sql_editor_assistance_and_connected_icon() {
         None
     }
     let image = connected_image(ui.profiles.upcast_ref()).unwrap();
-    assert_eq!(image.pixel_size(), 22);
+    assert_eq!(image.pixel_size(), 18);
     for mode in [
         ThemeMode::CatppuccinMocha,
         ThemeMode::TokyoNight,
@@ -1967,11 +2843,39 @@ fn sql_editor_assistance_and_connected_icon() {
     // Simulate catalog arrival without any server access or scan delay.
     handle_event(
         &ui,
-        Event::SqlCompletionsLoaded(id.clone(), Ok(vec!["sample_records".into(), "name".into()])),
+        Event::SqlCompletionsLoaded(
+            id.clone(),
+            DbPool::PostgreSql(pool.clone()),
+            Ok(database::SqlCompletionCatalog {
+                search_path: vec!["public".into()],
+                namespaces: [
+                    (
+                        "public".into(),
+                        [
+                            ("sample_records".into(), vec!["name".into()]),
+                            ("Display Items".into(), vec!["item_name".into()]),
+                        ]
+                        .into(),
+                    ),
+                    (
+                        "audit".into(),
+                        [("sample_records".into(), vec!["event".into()])].into(),
+                    ),
+                ]
+                .into(),
+            }),
+        ),
+    );
+    // A reply from a replaced pool must leave the current catalog intact.
+    handle_event(
+        &ui,
+        Event::SqlCompletionsLoaded(
+            id.clone(),
+            DbPool::PostgreSql(lazy_pool()),
+            Ok(Default::default()),
+        ),
     );
     let provider = ui.sql_tabs.borrow()[&id].completion_provider.clone();
-    assert_eq!(provider.suggestions("sel", false)[0], "SELECT");
-    assert_eq!(provider.suggestions("sam", false)[0], "sample_records");
     let buffer = ui.sql_tabs.borrow()[&id].buffer.clone();
     buffer.set_text("SELEC * FROM sample_records");
     let tag = buffer
@@ -2001,6 +2905,80 @@ fn sql_editor_assistance_and_connected_icon() {
         editor.has_focus(),
         "SQL editor must have focus for automatic completion"
     );
+    let popover = ui.sql_tabs.borrow()[&id].actions_menu.popover().unwrap();
+    let format_button = named_widget(popover.upcast_ref(), "sql-format")
+        .unwrap()
+        .downcast::<gtk::Button>()
+        .unwrap();
+    let unformatted = "SELECT  'Имя',2 FROM records WHERE id=1";
+    let formatted = "SELECT 'Имя',\n    2\nFROM records\nWHERE id=1";
+    let editor_text = || buffer.text(&buffer.start_iter(), &buffer.end_iter(), true);
+    let offset_of =
+        |text: &str, word: &str| text[..text.find(word).unwrap()].chars().count() as i32;
+    buffer.set_text(unformatted);
+    buffer.select_range(
+        &buffer.end_iter(),
+        &buffer.iter_at_offset(offset_of(unformatted, "WHERE")),
+    );
+    format_button.emit_clicked();
+    assert_eq!(editor_text(), formatted);
+    let (start, end) = buffer.selection_bounds().unwrap();
+    assert_eq!(buffer.text(&start, &end, true), "WHERE id=1");
+    assert_eq!(buffer.cursor_position(), buffer.char_count());
+    buffer.undo();
+    assert_eq!(editor_text(), unformatted);
+
+    assert!(shortcuts::dispatch(
+        &ui,
+        gtk::gdk::Key::F,
+        gtk::gdk::ModifierType::CONTROL_MASK | gtk::gdk::ModifierType::SHIFT_MASK,
+    ));
+    assert_eq!(editor_text(), formatted);
+    buffer.undo();
+    assert_eq!(editor_text(), unformatted);
+
+    let projection_end = buffer.iter_at_offset(offset_of(unformatted, ",") + 1);
+    buffer.select_range(&buffer.start_iter(), &projection_end);
+    format_button.emit_clicked();
+    let (start, end) = buffer.selection_bounds().unwrap();
+    assert_eq!(buffer.text(&start, &end, true), "SELECT 'Имя',");
+    assert_eq!(buffer.cursor_position(), 0);
+    buffer.undo();
+    assert_eq!(editor_text(), unformatted);
+
+    shortcuts::palette(&ui);
+    let palette = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<adw::Window>().ok())
+        .find(|window| window.title().as_deref() == Some("Палитра команд"))
+        .unwrap();
+    until(|| palette.is_mapped());
+    let search = named_widget(palette.upcast_ref(), "command-search")
+        .unwrap()
+        .downcast::<gtk::SearchEntry>()
+        .unwrap();
+    let commands = named_widget(palette.upcast_ref(), "command-list")
+        .unwrap()
+        .downcast::<gtk::ListBox>()
+        .unwrap();
+    search.set_text("Форматировать SQL");
+    until(|| {
+        commands.selected_row().is_some_and(|row| {
+            row.child()
+                .and_then(|child| child.first_child())
+                .and_then(|label| label.downcast::<gtk::Label>().ok())
+                .is_some_and(|label| label.text() == "Форматировать SQL")
+        })
+    });
+    search.emit_activate();
+    assert_eq!(editor_text(), formatted);
+    until(|| !palette.is_mapped() && ui.window.is_active());
+    editor.grab_focus();
+
+    buffer.set_text("SELECT  id FROM");
+    assert!(sql_editor::format_buffer(&editor, sql_editor::Dialect::PostgreSql).is_err());
+    assert_eq!(editor_text(), "SELECT  id FROM");
+
     buffer.set_text("");
     buffer.insert_at_cursor("s");
     buffer.insert_at_cursor("e");
@@ -2068,6 +3046,57 @@ fn sql_editor_assistance_and_connected_icon() {
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
         "sel"
     );
+    // Replace only the current identifier, including the suffix to the right
+    // of the caret. A same-named table in another schema supplies no fields.
+    editor.completion().hide();
+    for (text, before_caret, expected) in [
+        (
+            "SELECT r.na$old FROM public.sample_records AS r",
+            "SELECT r.na",
+            "SELECT r.\"name\" FROM public.sample_records AS r",
+        ),
+        (
+            "SELECT * FROM public.sample_records_old",
+            "SELECT * FROM public.sample_records",
+            "SELECT * FROM public.sample_records",
+        ),
+        (
+            "SELECT * FROM public.\"Display I",
+            "SELECT * FROM public.\"Display I",
+            "SELECT * FROM public.\"Display Items\"",
+        ),
+        (
+            "SELECT * FROM public.\"Display Invalid\" AS d",
+            "SELECT * FROM public.\"Display I",
+            "SELECT * FROM public.\"Display Items\" AS d",
+        ),
+    ] {
+        buffer.set_text(text);
+        buffer.place_cursor(&buffer.iter_at_offset(before_caret.len() as i32));
+        editor.completion().emit_show();
+        until(|| editor_completion_context(&editor).is_some());
+        let context = editor_completion_context(&editor).unwrap();
+        let model = gtk::glib::MainContext::default()
+            .block_on(provider.populate_future(&context))
+            .unwrap();
+        assert_eq!(model.n_items(), 1, "{text}");
+        let proposal = model
+            .item(0)
+            .unwrap()
+            .downcast::<sourceview5::CompletionProposal>()
+            .unwrap();
+        sourceview5::prelude::CompletionProviderExt::activate(&provider, &context, &proposal);
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            expected
+        );
+        buffer.undo();
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            text
+        );
+        editor.completion().hide();
+    }
     // Context-sensitive suppression inside comments and string literals.
     for text in ["-- sel", "/* sel */", "SELECT 'sel'", "SELECT sel"] {
         buffer.set_text(text);
@@ -2094,6 +3123,229 @@ fn sql_editor_assistance_and_connected_icon() {
     assert!(connected_image(ui.profiles.upcast_ref()).is_none());
     ui.window.close();
     runtime.block_on(pool.close());
+}
+
+#[test]
+#[ignore = "requires isolated GTK display, synthetic workspace only"]
+fn command_palette_tracks_context_and_keyboard_selection() {
+    gtk::init().unwrap();
+    adw::init().unwrap();
+    let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let app = adw::Application::builder()
+        .application_id("io.github.dbdeck.palette-test")
+        .build();
+    app.register(None::<&gtk::gio::Cancellable>).unwrap();
+    let ui = build_window(&app, runtime.clone());
+    until(|| ui.window.is_mapped());
+
+    let open_palette = || {
+        shortcuts::palette(&ui);
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|widget| widget.downcast::<adw::Window>().ok())
+            .find(|window| {
+                window.title().as_deref() == Some("Палитра команд") && window.is_visible()
+            })
+            .unwrap();
+        until(|| window.is_mapped());
+        let search = named_widget(window.upcast_ref(), "command-search")
+            .unwrap()
+            .downcast::<gtk::SearchEntry>()
+            .unwrap();
+        let list = named_widget(window.upcast_ref(), "command-list")
+            .unwrap()
+            .downcast::<gtk::ListBox>()
+            .unwrap();
+        (window, search, list)
+    };
+    let selected = |list: &gtk::ListBox| {
+        list.selected_row().map(|row| {
+            row.child()
+                .unwrap()
+                .first_child()
+                .unwrap()
+                .downcast::<gtk::Label>()
+                .unwrap()
+                .text()
+        })
+    };
+    let (palette, search, list) = open_palette();
+    let ctrl = gtk::gdk::ModifierType::CONTROL_MASK;
+    let shift = gtk::gdk::ModifierType::SHIFT_MASK;
+    search.set_text("форматировать");
+    assert_eq!(selected(&list), None);
+    search.emit_activate();
+    assert!(palette.is_visible());
+    search.set_text("SQL новая");
+    assert_eq!(selected(&list), None);
+    search.set_text("Настройки");
+    assert_eq!(selected(&list).as_deref(), Some("Настройки"));
+    search.emit_activate();
+    until(|| ui.preferences.is_mapped());
+    ui.preferences.set_visible(false);
+
+    let profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+        "id": "palette", "name": "Palette test", "kind": "postgre_sql", "host": "localhost",
+        "port": 5432, "database": "palette", "username": "local",
+        "environment": "local", "color": "#ffffff", "read_only": true, "tls_mode": "disabled"
+    }))
+    .unwrap();
+    let session = profile_session_key(&profile);
+    let new_pool = || {
+        let _guard = runtime.enter();
+        DbPool::PostgreSql(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy_with(sqlx::postgres::PgConnectOptions::new().socket("/nonexistent")),
+        )
+    };
+    ui.sessions
+        .borrow_mut()
+        .insert(session.clone(), (profile.clone(), new_pool()));
+    *ui.current_profile.borrow_mut() = Some(profile.clone());
+    create_sql_tab(&ui, &session);
+    let id = ui.sql_tabs.borrow().keys().next().unwrap().clone();
+    let (buffer, run_button, stop_button, grid) = {
+        let tabs = ui.sql_tabs.borrow();
+        let tab = &tabs[&id];
+        (
+            tab.buffer.clone(),
+            tab.run_button.clone(),
+            tab.stop_button.clone(),
+            tab.tabulator.clone(),
+        )
+    };
+    ui.landing.set_visible(false);
+    buffer.set_text("  \n");
+    let (palette, search, list) = open_palette();
+    search.set_text("выполнить sql");
+    assert_eq!(selected(&list), None);
+    palette.close();
+    buffer.set_text("SELECT  1");
+
+    let (palette, search, list) = open_palette();
+    for unavailable in [
+        "применить фильтр",
+        "импорт",
+        "с правом записи",
+        "остановить sql",
+        "фокус результат",
+    ] {
+        search.set_text(unavailable);
+        assert_eq!(selected(&list), None, "{unavailable}");
+    }
+    search.set_text("SQL формат");
+    assert_eq!(selected(&list).as_deref(), Some("Форматировать SQL"));
+    let shortcut = gtk::accelerator_get_label(gtk::gdk::Key::f, ctrl | shift);
+    search.set_text(&shortcut);
+    assert_eq!(selected(&list).as_deref(), Some("Форматировать SQL"));
+    search.set_text("sql");
+    let first = list.selected_row().unwrap().index();
+    let focus = gtk::prelude::RootExt::focus(&palette).unwrap();
+    let controllers = search.observe_controllers();
+    let keys = (0..controllers.n_items())
+        .filter_map(|n| {
+            controllers
+                .item(n)?
+                .downcast::<gtk::EventControllerKey>()
+                .ok()
+        })
+        .find(|keys| keys.propagation_phase() == gtk::PropagationPhase::Capture)
+        .unwrap();
+    let press = |key: gtk::gdk::Key| {
+        keys.emit_by_name::<bool>(
+            "key-pressed",
+            &[&key, &0u32, &gtk::gdk::ModifierType::LOCK_MASK],
+        )
+    };
+    assert!(press(gtk::gdk::Key::Down));
+    assert!(list.selected_row().unwrap().index() > first);
+    assert_eq!(
+        gtk::prelude::RootExt::focus(&palette).as_ref(),
+        Some(&focus)
+    );
+    assert!(press(gtk::gdk::Key::Up));
+    assert_eq!(list.selected_row().unwrap().index(), first);
+    search.set_text("SQL формат");
+    search.emit_activate();
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        "SELECT 1"
+    );
+
+    ui.sql_tabs.borrow()[&id]
+        .result_stack
+        .set_visible_child_name("data");
+    until(|| grid.webview.is_mapped() && ui.window.is_active());
+    assert!(grid.webview.grab_focus());
+    // Observe the existing WebKit bridge entry point with a synthetic edit.
+    until(|| js(&grid, "typeof window.dbdeckFinishEdit === 'function'") == true);
+    assert_eq!(
+        js(
+            &grid,
+            "window.dbdeckFinishEdit = action => window.paletteEdit = action; true"
+        ),
+        true
+    );
+    let edit = ui.table_edit_states.borrow()[&format!("sql::{id}")].clone();
+    edit.grid_editing.set(true);
+    update_table_edit_controls(&edit, None);
+    let (_, search, list) = open_palette();
+    for unavailable in ["выполнить sql", "сбросить sql-сессию", "ручной режим"]
+    {
+        search.set_text(unavailable);
+        assert_eq!(selected(&list), None, "{unavailable}");
+    }
+    search.set_text("сохранить");
+    assert_eq!(
+        selected(&list).as_deref(),
+        Some("Сохранить изменения результата SQL")
+    );
+    search.emit_activate();
+    until(|| js(&grid, "window.paletteEdit ?? null") == "save");
+    until(|| ui.window.is_active());
+    assert!(grid.webview.grab_focus());
+    let (_, search, list) = open_palette();
+    search.set_text("отменить результат");
+    assert_eq!(
+        selected(&list).as_deref(),
+        Some("Отменить правки результата SQL")
+    );
+    search.emit_activate();
+    until(|| js(&grid, "window.paletteEdit ?? null") == "discard");
+    edit.grid_editing.set(false);
+    update_table_edit_controls(&edit, None);
+
+    stop_button.set_sensitive(true);
+    run_button.set_sensitive(false);
+    let (palette, search, list) = open_palette();
+    search.set_text("остановить");
+    assert_eq!(selected(&list).as_deref(), Some("Остановить SQL-запрос"));
+    stop_button.set_sensitive(false);
+    run_button.set_sensitive(true);
+    search.emit_activate();
+    assert!(!palette.is_visible());
+    assert!(ui.status.text().contains("Команда больше недоступна"));
+    buffer.set_text("SELECT  1");
+    for replace_pool in [true, false] {
+        let (palette, search, list) = open_palette();
+        search.set_text("формат sql");
+        assert_eq!(selected(&list).as_deref(), Some("Форматировать SQL"));
+        if replace_pool {
+            ui.sessions
+                .borrow_mut()
+                .insert(session.clone(), (profile.clone(), new_pool()));
+        } else {
+            replace_tab_session(&ui, &id);
+        }
+        search.emit_activate();
+        assert!(!palette.is_visible());
+        assert_eq!(
+            buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+            "SELECT  1"
+        );
+    }
+    close_sql_tab(&ui, &id);
+    ui.window.close();
 }
 
 #[test]
@@ -2327,11 +3579,28 @@ fn postgres_server_browser_navigation_and_icons() {
     assert!(!ui.session_tabs.is_visible());
     ui.landing.set_visible(false);
     show_table_catalog(&ui);
+    /// Tree rows may be wrapped with a hover action in a `tree-row-line` box.
+    fn row_button(widget: &gtk::Widget) -> Option<gtk::Button> {
+        if let Some(button) = widget.downcast_ref::<gtk::Button>() {
+            return Some(button.clone());
+        }
+        if widget.has_css_class("tree-row-line") {
+            return widget.first_child().and_downcast::<gtk::Button>();
+        }
+        None
+    }
+    /// The children box that follows a tree row (after its wrapper, if any).
+    fn row_children(button: &gtk::Button) -> Option<gtk::Widget> {
+        match button.parent() {
+            Some(line) if line.has_css_class("tree-row-line") => line.next_sibling(),
+            _ => button.next_sibling(),
+        }
+    }
     fn database_button(ui: &Ui, database: &str) -> Option<gtk::Button> {
         let mut child = ui.objects.first_child();
         while let Some(widget) = child {
             child = widget.next_sibling();
-            if let Ok(button) = widget.downcast::<gtk::Button>() {
+            if let Some(button) = row_button(&widget) {
                 if button.tooltip_text().as_deref()
                     == Some(format!("Открыть базу {database}").as_str())
                 {
@@ -2361,7 +3630,7 @@ fn postgres_server_browser_navigation_and_icons() {
         let mut child = parent.first_child();
         while let Some(widget) = child {
             child = widget.next_sibling();
-            if let Ok(button) = widget.downcast::<gtk::Button>() {
+            if let Some(button) = row_button(&widget) {
                 if contains_text(button.upcast_ref(), name) {
                     return button;
                 }
@@ -2388,7 +3657,11 @@ fn postgres_server_browser_navigation_and_icons() {
             .any(|(_, o)| o.schema == "crm" && o.name == "events")
     });
     assert_eq!(ui.sessions.borrow().len(), 2);
-    assert_eq!(ui.session_tabs.n_pages(), 1);
+    assert_eq!(
+        ui.session_tabs.n_pages(),
+        0,
+        "a database opens without a schema tab"
+    );
     assert!(
         database_button(&ui, "dbdeck_test")
             .unwrap()
@@ -2400,42 +3673,40 @@ fn postgres_server_browser_navigation_and_icons() {
     );
     assert!(!contains_text(ui.objects.upcast_ref(), "← Все базы данных"));
     let crm = schema_button(
-        &database_button(&ui, "dbdeck_test")
-            .unwrap()
-            .next_sibling()
-            .unwrap(),
+        &row_children(&database_button(&ui, "dbdeck_test").unwrap()).unwrap(),
         "crm",
     );
     crm.emit_clicked();
-    assert!(crm.next_sibling().unwrap().is_visible());
+    assert!(row_children(&crm).unwrap().is_visible());
     database_button(&ui, "postgres").unwrap().emit_clicked();
     until(|| {
         ui.current_profile
             .borrow()
             .as_ref()
             .is_some_and(|p| p.database == "postgres")
-            && database_button(&ui, "postgres").is_some_and(|b| {
-                b.next_sibling()
-                    .is_some_and(|w| contains_text(&w, "public"))
-            })
+            && database_button(&ui, "postgres")
+                .is_some_and(|b| row_children(&b).is_some_and(|w| contains_text(&w, "public")))
     });
     assert_eq!(ui.sessions.borrow().len(), 3);
-    assert_eq!(ui.session_tabs.n_pages(), 2);
+    assert_eq!(
+        ui.session_tabs.n_pages(),
+        1,
+        "only the explicitly chosen crm schema has a tab"
+    );
     let postgres = database_button(&ui, "postgres").unwrap();
     assert!(postgres.has_css_class("database-tree-row-active"));
     let test_db = database_button(&ui, "dbdeck_test").unwrap();
     assert!(!test_db.has_css_class("database-tree-row-active"));
-    assert!(test_db.next_sibling().unwrap().is_visible());
+    assert!(row_children(&test_db).unwrap().is_visible());
     assert!(
-        schema_button(&test_db.next_sibling().unwrap(), "crm")
-            .next_sibling()
+        row_children(&schema_button(&row_children(&test_db).unwrap(), "crm"))
             .unwrap()
             .is_visible(),
         "schema expansion is remembered"
     );
-    let public = schema_button(&postgres.next_sibling().unwrap(), "public");
+    let public = schema_button(&row_children(&postgres).unwrap(), "public");
     assert!(contains_text(
-        &public.next_sibling().unwrap(),
+        &row_children(&public).unwrap(),
         "Нет таблиц и представлений"
     ));
     layout_snapshot(&ui.window, "target/postgres-inline-tree.png");
@@ -2476,7 +3747,8 @@ fn postgres_server_browser_navigation_and_icons() {
         actual.data.rows,
         [vec![CellValue::Text("dbdeck_test".into())]]
     );
-    until(|| ui.active_header.is_visible() && ui.active_header.width() > 0);
+    // The connection is shown in the status bar block, not in a header above the tabs.
+    until(|| ui.connection_block.root.is_visible() && ui.connection_block.root.width() > 0);
     let grid = ui.tabulator_grids.borrow().values().next().unwrap().clone();
     until(|| {
         js(
@@ -2497,10 +3769,7 @@ fn postgres_server_browser_navigation_and_icons() {
     );
     assert!(!ui.sessions.borrow().contains_key(&closed_key));
     assert!(!contains_text(
-        &database_button(&ui, "dbdeck_test")
-            .unwrap()
-            .next_sibling()
-            .unwrap(),
+        &row_children(&database_button(&ui, "dbdeck_test").unwrap()).unwrap(),
         "crm"
     ));
     database_button(&ui, "dbdeck_test").unwrap().emit_clicked();

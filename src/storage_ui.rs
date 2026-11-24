@@ -98,13 +98,32 @@ fn update(ui: &Ui) {
     }
 }
 pub(super) fn unlocked(ui: &Rc<Ui>) {
+    if matches!(
+        app_instance::AppInstance::current(),
+        app_instance::AppInstance::Dev
+    ) {
+        seed_dev_profiles(ui);
+    }
     *ui.sql_queries_directory.borrow_mut() = ui
         .store
         .borrow()
         .as_ref()
         .and_then(|s| s.sql_queries_directory());
+    sync_system_schemas(ui);
     refresh_profiles(ui);
     update(ui);
+}
+
+/// Shows the stored "system schemas" choice without saving it again.
+pub(super) fn sync_system_schemas(ui: &Ui) {
+    let show = ui
+        .store
+        .borrow()
+        .as_ref()
+        .is_some_and(SettingsStore::show_system_schemas);
+    ui.system_schemas_syncing.set(true);
+    ui.system_schemas_toggle.set_active(show);
+    ui.system_schemas_syncing.set(false);
 }
 pub(super) fn auto_unlock<F: FnOnce() + 'static>(ui: &Rc<Ui>, after: F) {
     if ui.unlock_busy.get() {
@@ -295,5 +314,75 @@ pub(super) fn import_finished(ui: &Rc<Ui>, result: Result<ConnectionProfile, Str
             );
         }
         Err(error) => show_error_dialog(ui, "Импорт из gopass не выполнен", &error),
+    }
+}
+
+/// Dev instance only: an empty list gets the local Compose databases from compose.yaml.
+fn seed_dev_profiles(ui: &Rc<Ui>) {
+    let mut store = ui.store.borrow_mut();
+    let Some(store) = store.as_mut() else { return };
+    if !store.profiles.is_empty() {
+        return;
+    }
+    let dotenv = std::fs::read_to_string(".env").unwrap_or_default();
+    let secret = |name: &str| {
+        std::env::var(name).ok().or_else(|| {
+            dotenv.lines().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().trim_matches('"').to_owned())
+            })
+        })
+    };
+    let seeds = [
+        (
+            "dev-postgres",
+            "local-postgres",
+            "postgre_sql",
+            55432,
+            "#42b8b0",
+            "DBDECK_PG_PASSWORD",
+        ),
+        (
+            "dev-mariadb",
+            "local-mariadb",
+            "maria_db",
+            53306,
+            "#55b879",
+            "DBDECK_MARIADB_PASSWORD",
+        ),
+        (
+            "dev-mysql",
+            "local-mysql",
+            "my_sql",
+            53307,
+            "#4f8fe8",
+            "DBDECK_MYSQL_PASSWORD",
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (id, name, kind, port, color, variable) in seeds {
+        let Some(password) = secret(variable).filter(|p| !p.is_empty()) else {
+            missing.push(variable);
+            continue;
+        };
+        let profile: Result<ConnectionProfile, _> = serde_json::from_value(serde_json::json!({
+            "id": id, "name": name, "kind": kind, "host": "127.0.0.1", "port": port,
+            "database": "dbdeck_test", "username": "dbdeck_test", "environment": "local",
+            "color": color, "read_only": false, "tls_mode": "disabled"
+        }));
+        if let Ok(profile) = profile
+            && let Err(ProfileSaveError::Secret(error) | ProfileSaveError::Settings(error)) =
+                store.save_profile(profile, &password)
+        {
+            ui.status
+                .set_text(&format!("Тестовое подключение {name}: {error}"));
+            return;
+        }
+    }
+    if !missing.is_empty() {
+        ui.status.set_text(&format!(
+            "Нет паролей тестовых БД: {}. Запускайте из корня репозитория с .env",
+            missing.join(", ")
+        ));
     }
 }

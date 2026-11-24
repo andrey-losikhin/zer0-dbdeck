@@ -1,7 +1,12 @@
-use std::{cell::RefCell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashSet,
+    rc::Rc,
+};
 
 use relm4::gtk;
 use serde::Serialize;
+use uuid::Uuid;
 use webkit6::prelude::*;
 use webkit6::{UserContentManager, WebView};
 
@@ -28,8 +33,10 @@ pub struct GridRow {
 
 #[derive(Clone, Serialize)]
 struct GridPayload {
+    generation: Uuid,
     row_actions: bool,
     columns: Vec<GridColumn>,
+    hidden_columns: Vec<usize>,
     rows: Vec<GridRow>,
     server_sort: bool,
 }
@@ -41,14 +48,71 @@ pub struct TabulatorGrid {
 }
 
 struct GridState {
+    generation: Cell<Option<Uuid>>,
     ready: RefCell<bool>,
     pending: RefCell<Option<String>>,
     pending_sort: RefCell<Option<String>>,
     pending_theme: RefCell<Option<String>>,
+    column_chooser: RefCell<Option<Rc<ColumnChooser>>>,
+    view_change: RefCell<Option<ViewChange>>,
+}
+
+struct ViewChange {
+    request: Uuid,
+    completed: Box<dyn FnOnce(bool)>,
+}
+
+impl GridState {
+    fn finish_view_change(&self, request: Uuid, ready: bool) {
+        let action = self
+            .view_change
+            .borrow_mut()
+            .take_if(|action| action.request == request);
+        if let Some(action) = action {
+            (action.completed)(ready);
+        }
+    }
+}
+
+struct ColumnChooser {
+    button: gtk::MenuButton,
+    list: gtk::Box,
+    show_all: gtk::Button,
+    columns: RefCell<Vec<gtk::CheckButton>>,
+    hidden_titles: RefCell<HashSet<String>>,
+    resetting: Cell<bool>,
+}
+
+impl ColumnChooser {
+    fn hidden_columns(&self) -> Vec<usize> {
+        self.columns
+            .borrow()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, check)| (!check.is_active()).then_some(index))
+            .collect()
+    }
+
+    fn update_controls(&self) {
+        let columns = self.columns.borrow();
+        let visible = columns.iter().filter(|check| check.is_active()).count();
+        for check in columns.iter() {
+            check.set_sensitive(visible > 1 || !check.is_active());
+        }
+        self.button.set_sensitive(columns.len() > 1);
+        self.show_all.set_sensitive(visible < columns.len());
+    }
 }
 
 impl TabulatorGrid {
-    pub fn new<F>(on_message: F) -> Self
+    pub fn new<F>(cell_preview: bool, on_message: F) -> Self
+    where
+        F: Fn(String) + 'static,
+    {
+        Self::with_relations(cell_preview, false, on_message)
+    }
+
+    pub fn with_relations<F>(cell_preview: bool, row_relations: bool, on_message: F) -> Self
     where
         F: Fn(String) + 'static,
     {
@@ -60,6 +124,16 @@ impl TabulatorGrid {
             .vexpand(true)
             .build();
         let weak_view = webview.downgrade();
+        let state = Rc::new(GridState {
+            generation: Cell::new(None),
+            ready: RefCell::new(false),
+            pending: RefCell::new(None),
+            pending_sort: RefCell::new(None),
+            pending_theme: RefCell::new(None),
+            column_chooser: RefCell::new(None),
+            view_change: RefCell::new(None),
+        });
+        let message_state = Rc::downgrade(&state);
         manager.connect_script_message_received(Some("dbdeck"), move |_, value| {
             let Some(json) = value.to_json(0) else { return };
             let json = json.to_string();
@@ -67,6 +141,15 @@ impl TabulatorGrid {
                 return;
             };
             match message.get("type").and_then(serde_json::Value::as_str) {
+                Some("viewChangeReady") => {
+                    if let Some(state) = message_state.upgrade()
+                        && let Some(request) = message["request"]
+                            .as_str()
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                    {
+                        state.finish_view_change(request, message["ready"].as_bool() == Some(true));
+                    }
+                }
                 Some("clipboardCopy") => {
                     if let (Some(view), Some(text)) = (
                         weak_view.upgrade(),
@@ -104,15 +187,8 @@ impl TabulatorGrid {
             }
         });
 
-        let state = Rc::new(GridState {
-            ready: RefCell::new(false),
-            pending: RefCell::new(None),
-            pending_sort: RefCell::new(None),
-            pending_theme: RefCell::new(None),
-        });
         let load_state = state.clone();
-        let load_view = webview.clone();
-        webview.connect_load_changed(move |_, event| {
+        webview.connect_load_changed(move |load_view, event| {
             if event == webkit6::LoadEvent::Finished {
                 *load_state.ready.borrow_mut() = true;
                 if let Some(script) = load_state.pending_theme.borrow_mut().take() {
@@ -133,6 +209,9 @@ impl TabulatorGrid {
                         |_| {},
                     );
                 }
+                if let Some(chooser) = load_state.column_chooser.borrow().as_ref() {
+                    Self::send_column_visibility(load_view, &load_state, chooser);
+                }
                 if let Some(script) = load_state.pending_sort.borrow_mut().take() {
                     load_view.evaluate_javascript(
                         &script,
@@ -144,8 +223,151 @@ impl TabulatorGrid {
                 }
             }
         });
-        webview.load_html(&page_html(), Some("file:///"));
+        webview.load_html(&page_html(cell_preview, row_relations), Some("file:///"));
         Self { webview, state }
+    }
+
+    pub fn column_chooser(&self) -> gtk::MenuButton {
+        if let Some(chooser) = self.state.column_chooser.borrow().as_ref() {
+            return chooser.button.clone();
+        }
+        let button = gtk::MenuButton::builder()
+            .label("Столбцы")
+            .tooltip_text("Выбрать видимые столбцы таблицы")
+            .valign(gtk::Align::Center)
+            .sensitive(false)
+            .build();
+        let list = gtk::Box::new(gtk::Orientation::Vertical, 2);
+        let scroll = gtk::ScrolledWindow::builder()
+            .hscrollbar_policy(gtk::PolicyType::Never)
+            .propagate_natural_height(true)
+            .max_content_height(280)
+            .child(&list)
+            .build();
+        let show_all = gtk::Button::with_label("Показать все");
+        show_all.add_css_class("flat");
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 4);
+        content.append(&scroll);
+        content.append(&show_all);
+        let popover = gtk::Popover::new();
+        popover.set_child(Some(&content));
+        button.set_popover(Some(&popover));
+        let chooser = Rc::new(ColumnChooser {
+            button: button.clone(),
+            list,
+            show_all,
+            columns: RefCell::new(Vec::new()),
+            hidden_titles: RefCell::new(HashSet::new()),
+            resetting: Cell::new(false),
+        });
+        let weak_chooser = Rc::downgrade(&chooser);
+        let weak_state = Rc::downgrade(&self.state);
+        let weak_view = self.webview.downgrade();
+        chooser.show_all.connect_clicked(move |_| {
+            if let (Some(chooser), Some(state), Some(view)) = (
+                weak_chooser.upgrade(),
+                weak_state.upgrade(),
+                weak_view.upgrade(),
+            ) {
+                chooser.hidden_titles.borrow_mut().clear();
+                chooser.resetting.set(true);
+                for check in chooser.columns.borrow().iter() {
+                    check.set_active(true);
+                }
+                chooser.resetting.set(false);
+                chooser.update_controls();
+                Self::send_column_visibility(&view, &state, &chooser);
+            }
+        });
+        *self.state.column_chooser.borrow_mut() = Some(chooser);
+        button
+    }
+
+    pub fn hidden_column_names(&self) -> Vec<String> {
+        let chooser = self.state.column_chooser.borrow();
+        let Some(chooser) = chooser.as_ref() else {
+            return Vec::new();
+        };
+        chooser
+            .columns
+            .borrow()
+            .iter()
+            .filter(|check| !check.is_active())
+            .filter_map(|check| check.label().map(|label| label.to_string()))
+            .collect()
+    }
+
+    /// Set the visibility used by the next grid payload, without updating the old rows.
+    pub fn restore_column_visibility(&self, hidden: Vec<String>) {
+        let chooser = self.state.column_chooser.borrow();
+        let Some(chooser) = chooser.as_ref() else {
+            return;
+        };
+        *chooser.hidden_titles.borrow_mut() = hidden.into_iter().collect();
+        for check in chooser.columns.borrow_mut().drain(..) {
+            chooser.list.remove(&check);
+        }
+    }
+
+    fn configure_column_chooser(&self, chooser: &Rc<ColumnChooser>, titles: &[String]) {
+        let mut columns = chooser.columns.borrow_mut();
+        if columns.len() == titles.len()
+            && columns
+                .iter()
+                .zip(titles)
+                .all(|(check, title)| check.label().as_deref() == Some(title.as_str()))
+        {
+            return;
+        }
+        for check in columns.drain(..) {
+            chooser.list.remove(&check);
+        }
+        let hidden_titles = chooser.hidden_titles.borrow();
+        let needs_visible_column = titles.iter().all(|title| hidden_titles.contains(title));
+        for (index, title) in titles.iter().enumerate() {
+            let check = gtk::CheckButton::with_label(title);
+            check
+                .set_active(!hidden_titles.contains(title) || (needs_visible_column && index == 0));
+            let weak_chooser = Rc::downgrade(chooser);
+            let weak_state = Rc::downgrade(&self.state);
+            let weak_view = self.webview.downgrade();
+            let title = title.clone();
+            check.connect_toggled(move |check| {
+                if let (Some(chooser), Some(state), Some(view)) = (
+                    weak_chooser.upgrade(),
+                    weak_state.upgrade(),
+                    weak_view.upgrade(),
+                ) && !chooser.resetting.get()
+                {
+                    if check.is_active() {
+                        chooser.hidden_titles.borrow_mut().remove(&title);
+                    } else {
+                        chooser.hidden_titles.borrow_mut().insert(title.clone());
+                    }
+                    chooser.update_controls();
+                    Self::send_column_visibility(&view, &state, &chooser);
+                }
+            });
+            chooser.list.append(&check);
+            columns.push(check);
+        }
+        drop(columns);
+        chooser.update_controls();
+    }
+
+    fn send_column_visibility(view: &WebView, state: &GridState, chooser: &ColumnChooser) {
+        if *state.ready.borrow()
+            && let Some(generation) = state.generation.get()
+        {
+            let hidden = serde_json::to_string(&chooser.hidden_columns()).unwrap();
+            view.evaluate_javascript(
+                &format!("window.dbdeckSetHiddenColumns({hidden}, \"{generation}\");"),
+                None,
+                None,
+                None::<&gtk::gio::Cancellable>,
+                |_| {},
+            );
+        }
     }
 
     pub fn set_theme(&self, css: &str) {
@@ -176,9 +398,21 @@ impl TabulatorGrid {
         read_only_columns: &[String],
         blocked_cells: &[(usize, usize)],
     ) {
+        let generation = Uuid::new_v4();
+        let hidden_columns =
+            self.state
+                .column_chooser
+                .borrow()
+                .as_ref()
+                .map_or_else(Vec::new, |chooser| {
+                    self.configure_column_chooser(chooser, columns);
+                    chooser.hidden_columns()
+                });
         let payload = GridPayload {
+            generation,
             row_actions: editable,
             server_sort,
+            hidden_columns,
             columns: columns
                 .iter()
                 .enumerate()
@@ -203,6 +437,7 @@ impl TabulatorGrid {
         let Ok(json) = serde_json::to_string(&payload) else {
             return;
         };
+        self.state.generation.set(Some(generation));
         let script = format!("window.dbdeckSetData({json}, {has_more});");
         if *self.state.ready.borrow() {
             self.webview.evaluate_javascript(
@@ -215,6 +450,20 @@ impl TabulatorGrid {
         } else {
             *self.state.pending.borrow_mut() = Some(script);
         }
+    }
+
+    pub fn generation(&self) -> Option<Uuid> {
+        self.state.generation.get()
+    }
+
+    pub fn reset_page_request(&self) {
+        self.webview.evaluate_javascript(
+            "window.dbdeckResetPageRequest();",
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            |_| {},
+        );
     }
 
     pub fn set_sort(&self, sort: Option<(usize, bool)>) {
@@ -268,6 +517,33 @@ impl TabulatorGrid {
         );
     }
 
+    /// Wait for earlier edit messages from the WebView before locking GTK input.
+    pub fn prepare_view_change(&self, completed: impl FnOnce(bool) + 'static) {
+        if !self.webview.is_sensitive() || self.state.view_change.borrow().is_some() {
+            completed(false);
+            return;
+        }
+        let request = Uuid::new_v4();
+        self.state.view_change.replace(Some(ViewChange {
+            request,
+            completed: Box::new(completed),
+        }));
+        let weak_state = Rc::downgrade(&self.state);
+        self.webview.evaluate_javascript(
+            &format!("window.dbdeckPrepareViewChange(\"{request}\");"),
+            None,
+            None,
+            None::<&gtk::gio::Cancellable>,
+            move |result| {
+                if result.is_err()
+                    && let Some(state) = weak_state.upgrade()
+                {
+                    state.finish_view_change(request, false);
+                }
+            },
+        );
+    }
+
     pub fn append_data(
         &self,
         start_index: usize,
@@ -275,6 +551,7 @@ impl TabulatorGrid {
         has_more: bool,
         blocked_cells: &[(usize, usize)],
     ) {
+        let blocked_cells: HashSet<_> = blocked_cells.iter().copied().collect();
         let rows = rows
             .iter()
             .enumerate()
@@ -304,7 +581,7 @@ impl TabulatorGrid {
     }
 }
 
-fn page_html() -> String {
+fn page_html(cell_preview: bool, row_relations: bool) -> String {
     let colors = crate::theme::grid_css(crate::theme::load_mode());
     format!(
         r##"<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>{TABULATOR_CSS}
@@ -312,6 +589,8 @@ fn page_html() -> String {
 {colors}
 </style><script>{TABULATOR_JS}</script></head><body><div id="grid"></div><script>
 {GRID_LOGIC_JS}
+const cellPreview = {cell_preview};
+const rowRelations = {row_relations};
 {GRID_JS}
 </script></body></html>"##
     )
@@ -332,7 +611,7 @@ mod tests {
 
     #[test]
     fn embedded_grid_is_local_and_shares_production_assets() {
-        let html = page_html();
+        let html = page_html(true, true);
         assert!(html.contains(GRID_JS));
         assert!(html.contains(TABULATOR_JS));
         assert!(!html.contains("<script src="));
@@ -342,7 +621,7 @@ mod tests {
     #[test]
     #[ignore = "exports the exact production HTML for GTK/WebKit integration tests"]
     fn export_grid_html() {
-        std::fs::write("target/grid-test.html", page_html()).unwrap();
+        std::fs::write("target/grid-test.html", page_html(true, true)).unwrap();
     }
     #[test]
     #[ignore = "requires GTK display; tests production Rust bridge and WebKitGTK"]
@@ -358,7 +637,7 @@ mod tests {
         let callback_result = result.clone();
         let callback_edits = edits.clone();
         let callback_loop = loop_.clone();
-        let grid = TabulatorGrid::new(move |message| {
+        let grid = TabulatorGrid::new(true, move |message| {
             let message: serde_json::Value = serde_json::from_str(&message).unwrap();
             match message["type"].as_str() {
                 Some("ready") => {
@@ -376,6 +655,32 @@ mod tests {
                         );
                 }
                 Some("edit") => callback_edits.borrow_mut().push(message),
+                Some("viewCell") => {
+                    assert_eq!(message["row"], 1);
+                    assert_eq!(message["column"], "c1");
+                    assert_eq!(
+                        message["generation"],
+                        callback_grid
+                            .borrow()
+                            .as_ref()
+                            .unwrap()
+                            .generation()
+                            .unwrap()
+                            .to_string()
+                    );
+                    callback_grid
+                        .borrow()
+                        .as_ref()
+                        .unwrap()
+                        .webview
+                        .evaluate_javascript(
+                            "window.dbdeckPreviewReceived = true;",
+                            None,
+                            None,
+                            None::<&gtk::gio::Cancellable>,
+                            |_| {},
+                        );
+                }
                 Some("testSnapshot") => {
                     let view = callback_grid.borrow().as_ref().unwrap().webview.clone();
                     let weak = view.downgrade();
@@ -438,6 +743,59 @@ mod tests {
                         &[],
                     );
                 }
+                Some("testColumns") => {
+                    let shared = callback_grid.borrow();
+                    let grid = shared.as_ref().unwrap();
+                    let chooser = grid.state.column_chooser.borrow();
+                    let chooser = chooser.as_ref().unwrap();
+                    let popup = chooser.button.popover().unwrap();
+                    match message["action"].as_str().unwrap() {
+                        "hide" => {
+                            chooser.button.popup();
+                            assert!(popup.is_visible());
+                            let check = chooser.columns.borrow()[2].clone();
+                            check.set_active(false);
+                            chooser.button.popdown();
+                        }
+                        "reload" => grid.set_data(
+                            &["Column 2".into(), "Column 0".into(), "new".into()],
+                            &[vec![Some("hidden".into()), Some("visible".into()), None]],
+                            true,
+                            false,
+                            true,
+                            &["Column 0".into()],
+                            &[],
+                        ),
+                        "fallback" | "missing" => {
+                            let title = if message["action"] == "fallback" {
+                                "Column 2"
+                            } else {
+                                "Column 0"
+                            };
+                            grid.set_data(
+                                &[title.into()],
+                                &vec![vec![Some(title.into())]; 2],
+                                false,
+                                false,
+                                true,
+                                &[],
+                                &[],
+                            );
+                            assert!(grid.hidden_column_names().is_empty());
+                        }
+                        "last" => {
+                            let (other, last) = {
+                                let columns = chooser.columns.borrow();
+                                (columns[2].clone(), columns[1].clone())
+                            };
+                            other.set_active(false);
+                            assert!(!last.is_sensitive());
+                            assert!(last.is_active());
+                        }
+                        "showAll" => chooser.show_all.emit_clicked(),
+                        _ => unreachable!(),
+                    }
+                }
                 Some("testResult") => {
                     *callback_result.borrow_mut() = Some(message);
                     callback_loop.quit();
@@ -449,10 +807,13 @@ mod tests {
             .unwrap()
             .set_enable_write_console_messages_to_stdout(true);
         *shared.borrow_mut() = Some(grid.clone());
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        content.append(&grid.webview);
+        content.append(&grid.column_chooser());
         let window = gtk::Window::builder()
             .default_width(1000)
             .default_height(600)
-            .child(&grid.webview)
+            .child(&content)
             .build();
         window.present();
         grid.set_data(

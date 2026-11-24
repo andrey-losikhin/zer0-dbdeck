@@ -3,9 +3,10 @@ mod csv_import;
 #[path = "query_edit.rs"]
 mod query_edit;
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use futures_util::{StreamExt, TryStreamExt};
+use serde::{Deserialize, Serialize};
 use sqlx::{
     Column, Connection, Executor, Row, TypeInfo, ValueRef, mysql::MySqlPoolOptions,
     postgres::PgPoolOptions,
@@ -15,17 +16,22 @@ use crate::db_error::{DbError, DbErrorKind, classify};
 use crate::settings::{ConnectionProfile, DatabaseKind, TlsMode};
 
 pub const MAX_TABLE_ROWS: usize = 200;
-/// Bound the client snapshot/DOM and OFFSET depth; use filters or streaming export beyond this.
+/// Bound the client snapshot/DOM; use filters or streaming export beyond this.
 pub const MAX_BROWSE_ROWS: usize = 10_000;
 pub const MAX_PREVIEW_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TABLE_COLUMNS: usize = 64;
 pub const MAX_CATALOG_OBJECTS: usize = 1_000;
 pub const MAX_CELL_CHARS: usize = 1_024;
+#[path = "database_relations.rs"]
+mod relations;
+pub use relations::ForeignKeyLink;
+
 const MAX_BINARY_BYTES: usize = (MAX_CELL_CHARS - 2) / 2;
+pub const MAX_CELL_DETAIL_CHARS: usize = 16_384;
 pub const MAX_QUERY_ROWS: usize = 1_000;
 const MAX_QUERY_COLUMNS: usize = 128;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DbObject {
     pub schema: String,
     pub name: String,
@@ -57,6 +63,7 @@ type QueryCandidate = (query_edit::Source, DbObject, Vec<DbColumn>);
 struct DbColumn {
     name: String,
     data_type: String,
+    key_type: String,
     binary: bool,
     primary_key: bool,
     generated: bool,
@@ -64,7 +71,7 @@ struct DbColumn {
     udt_name: String,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterOperator {
     Equal,
     NotEqual,
@@ -82,14 +89,14 @@ pub enum FilterOperator {
     IsNotNull,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FilterLogic {
     #[default]
     And,
     Or,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableFilter {
     pub column: String,
     pub logic: FilterLogic,
@@ -97,10 +104,17 @@ pub struct TableFilter {
     pub value: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableSort {
     pub column: String,
     pub descending: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableViewState {
+    pub filters: Vec<TableFilter>,
+    pub raw_condition: Option<String>,
+    pub sort: Option<TableSort>,
 }
 
 #[derive(Clone, Debug)]
@@ -110,16 +124,55 @@ pub struct TableCatalog {
     pub truncated: bool,
 }
 
+/// Schema → relation → columns in database order.
+#[derive(Debug, Default)]
+pub struct SqlCompletionCatalog {
+    pub namespaces: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    pub search_path: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CellDetailKeyColumn {
+    pub name: String,
+    pub key_type: String,
+}
+
+impl From<&DbColumn> for CellDetailKeyColumn {
+    fn from(column: &DbColumn) -> Self {
+        Self {
+            name: column.name.clone(),
+            key_type: column.key_type.clone(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct TableData {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<CellValue>>,
     pub primary_key: Vec<String>,
+    pub cell_detail_key_columns: Vec<CellDetailKeyColumn>,
     pub truncated: bool,
     pub truncated_columns: bool,
 }
 
 impl TableData {
+    pub fn cell_detail_key(&self, row: &[CellValue]) -> Option<Vec<(CellDetailKeyColumn, String)>> {
+        if self.cell_detail_key_columns.is_empty() {
+            return None;
+        }
+        self.cell_detail_key_columns
+            .iter()
+            .map(|key| {
+                let index = self.columns.iter().position(|column| column == &key.name)?;
+                match row.get(index)? {
+                    CellValue::Text(value) => Some((key.clone(), value.clone())),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
     pub fn trim_preview(&mut self, max_rows: usize) -> bool {
         let mut bytes = 0usize;
         let keep = self
@@ -229,6 +282,21 @@ fn truncate_cell(value: String) -> CellValue {
 pub enum DbPool {
     PostgreSql(sqlx::PgPool),
     MySql(sqlx::MySqlPool),
+}
+
+impl DbPool {
+    pub fn same_pool(&self, other: &Self) -> bool {
+        // SQLx pool clones share the same immutable PoolOptions allocation.
+        match (self, other) {
+            (Self::PostgreSql(left), Self::PostgreSql(right)) => {
+                std::ptr::eq(left.options(), right.options())
+            }
+            (Self::MySql(left), Self::MySql(right)) => {
+                std::ptr::eq(left.options(), right.options())
+            }
+            _ => false,
+        }
+    }
 }
 
 impl std::fmt::Debug for DbPool {
@@ -605,70 +673,79 @@ impl DbPool {
         Some((object, keys, blocked))
     }
 
-    pub async fn list_sql_completions(
-        &self,
-        profile: &ConnectionProfile,
-    ) -> Result<Vec<String>, String> {
-        let mut words = Vec::new();
-        match self {
+    pub async fn list_sql_completions(&self) -> Result<SqlCompletionCatalog, String> {
+        let (rows, search_path): (Vec<(String, String, String)>, _) = async { match self {
             Self::PostgreSql(pool) => {
-                let rows = sqlx::query(
-                    "SELECT table_name, column_name FROM information_schema.columns \
+                let rows = sqlx::query_as(
+                    "SELECT table_schema, table_name, column_name FROM information_schema.columns \
                      WHERE table_schema NOT IN ('information_schema', 'pg_catalog') \
-                       AND table_schema NOT LIKE 'pg_toast%' \
-                       AND table_schema NOT LIKE 'pg_temp_%' \
+                       AND table_schema NOT LIKE 'pg\\_toast%' \
+                       AND table_schema NOT LIKE 'pg\\_temp\\_%' \
                      ORDER BY table_schema, table_name, ordinal_position LIMIT 20000",
                 )
                 .fetch_all(pool)
-                .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
-                for row in rows {
-                    if let Ok(value) = row.try_get::<String, _>("table_name") {
-                        words.push(value);
-                    }
-                    if let Ok(value) = row.try_get::<String, _>("column_name") {
-                        words.push(value);
-                    }
-                }
+                .await?;
+                let path = sqlx::query_scalar("SELECT pg_catalog.current_schemas(false)::text[]")
+                    .fetch_one(pool)
+                    .await?;
+                Ok((rows, path))
             }
             Self::MySql(pool) => {
-                let rows = sqlx::query(
-                    "SELECT table_name, column_name FROM information_schema.columns \
+                let rows = sqlx::query_as(
+                    "SELECT CAST(table_schema AS CHAR), CAST(table_name AS CHAR), CAST(column_name AS CHAR) \
+                     FROM information_schema.columns \
                      WHERE table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
-                       AND (? = '' OR table_schema = ?) \
-                     ORDER BY table_schema, table_name, ordinal_position LIMIT 20000",
+                     ORDER BY (table_schema = DATABASE()) DESC, table_schema, table_name, ordinal_position LIMIT 20000",
                 )
-                .bind(profile.database.trim())
-                .bind(profile.database.trim())
                 .fetch_all(pool)
-                .await
-                .map_err(|error| format_database_error(&error.to_string()))?;
-                for row in rows {
-                    if let Ok(value) = row.try_get::<String, _>("table_name") {
-                        words.push(value);
-                    }
-                    if let Ok(value) = row.try_get::<String, _>("column_name") {
-                        words.push(value);
-                    }
-                }
+                .await?;
+                let database: Option<String> = sqlx::query_scalar("SELECT CAST(DATABASE() AS CHAR)")
+                    .fetch_one(pool)
+                    .await?;
+                Ok::<_, sqlx::Error>((rows, database.into_iter().collect()))
             }
+        } }.await
+        .map_err(|error| format_database_error(&error.to_string()))?;
+        let mut catalog = SqlCompletionCatalog {
+            search_path,
+            ..Default::default()
+        };
+        for (schema, relation, column) in rows {
+            catalog
+                .namespaces
+                .entry(schema)
+                .or_default()
+                .entry(relation)
+                .or_default()
+                .push(column);
         }
-        words.sort_unstable();
-        words.dedup();
-        Ok(words)
+        Ok(catalog)
     }
 
+    /// Catalog without system schemas; see `list_tables_with_system`.
     pub async fn list_tables(&self, profile: &ConnectionProfile) -> Result<TableCatalog, DbError> {
+        self.list_tables_with_system(profile, false).await
+    }
+
+    /// `include_system` toggles the engine's internal schemas; the filter set
+    /// must stay in sync with `is_system_schema`.
+    pub async fn list_tables_with_system(
+        &self,
+        profile: &ConnectionProfile,
+        include_system: bool,
+    ) -> Result<TableCatalog, DbError> {
         match self {
             Self::PostgreSql(pool) => {
                 let schemas = sqlx::query_scalar::<_, String>(
                     "SELECT schema_name FROM information_schema.schemata \
-                     WHERE schema_name NOT LIKE 'pg_toast%' \
-                       AND schema_name NOT LIKE 'pg_temp_%' \
+                     WHERE ($1 OR (schema_name NOT IN ('information_schema', 'pg_catalog') \
+                                   AND schema_name NOT LIKE 'pg\\_toast%' \
+                                   AND schema_name NOT LIKE 'pg\\_temp\\_%')) \
                      ORDER BY CASE WHEN schema_name = 'public' THEN 0 \
                                    WHEN schema_name IN ('information_schema', 'pg_catalog') THEN 2 \
                                    ELSE 1 END, schema_name",
                 )
+                .bind(include_system)
                 .fetch_all(pool)
                 .await
                 .map_err(|error| db_error(&error))?;
@@ -676,13 +753,15 @@ impl DbPool {
                     "SELECT table_schema AS table_schema, table_name AS table_name, table_type AS object_type \
                      FROM information_schema.tables \
                      WHERE table_type IN ('BASE TABLE', 'VIEW') \
-                       AND table_schema NOT LIKE 'pg_toast%' \
-                       AND table_schema NOT LIKE 'pg_temp_%' \
+                       AND ($1 OR (table_schema NOT IN ('information_schema', 'pg_catalog') \
+                                   AND table_schema NOT LIKE 'pg\\_toast%' \
+                                   AND table_schema NOT LIKE 'pg\\_temp\\_%')) \
                      ORDER BY CASE WHEN table_schema = 'public' THEN 0 \
                                    WHEN table_schema IN ('information_schema', 'pg_catalog') THEN 2 \
                                    ELSE 1 END, table_schema, table_name LIMIT {}",
                     MAX_CATALOG_OBJECTS + 1
                 ))
+                .bind(include_system)
                 .fetch_all(pool)
                 .await
                 .map_err(|error| db_error(&error))?;
@@ -713,10 +792,11 @@ impl DbPool {
             Self::MySql(pool) => {
                 let schemas = sqlx::query_scalar::<_, String>(
                     "SELECT CAST(schema_name AS CHAR) FROM information_schema.schemata \
-                     WHERE schema_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+                     WHERE (? OR schema_name NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')) \
                        AND (? = '' OR schema_name = ?) \
                      ORDER BY schema_name",
                 )
+                .bind(include_system)
                 .bind(profile.database.trim())
                 .bind(profile.database.trim())
                 .fetch_all(pool)
@@ -728,11 +808,12 @@ impl DbPool {
                             CAST(table_type AS CHAR) AS object_type \
                      FROM information_schema.tables \
                      WHERE table_type IN ('BASE TABLE', 'VIEW') \
-                       AND table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys') \
+                       AND (? OR table_schema NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')) \
                        AND (? = '' OR table_schema = ?) \
                      ORDER BY table_schema, table_name LIMIT {}",
                     MAX_CATALOG_OBJECTS + 1
                 ))
+                .bind(include_system)
                 .bind(profile.database.trim())
                 .bind(profile.database.trim())
                 .fetch_all(pool)
@@ -788,15 +869,53 @@ impl DbPool {
         sort: Option<&TableSort>,
         offset: usize,
     ) -> Result<TableData, DbError> {
+        self.read_table_slice(
+            object,
+            filters,
+            raw_condition,
+            sort,
+            PageStart::Offset(offset),
+        )
+        .await
+    }
+
+    pub async fn read_next_table_page(
+        &self,
+        object: &DbObject,
+        view: &TableViewState,
+        current: &TableData,
+    ) -> Result<TableData, DbError> {
+        self.read_table_slice(
+            object,
+            &view.filters,
+            view.raw_condition.as_deref(),
+            view.sort.as_ref(),
+            PageStart::After(current),
+        )
+        .await
+    }
+
+    async fn read_table_slice(
+        &self,
+        object: &DbObject,
+        filters: &[TableFilter],
+        raw_condition: Option<&str>,
+        sort: Option<&TableSort>,
+        start: PageStart<'_>,
+    ) -> Result<TableData, DbError> {
         let condition = raw_condition.map(validate_raw_condition).transpose()?;
         match self {
             Self::PostgreSql(pool) => {
                 let all_columns = table_columns_pg(pool, object).await?;
-                let primary_key: Vec<String> = all_columns
+                let key_columns = all_columns
                     .iter()
                     .filter(|column| column.primary_key)
-                    .map(|column| column.name.clone())
-                    .collect();
+                    .map(CellDetailKeyColumn::from)
+                    .collect::<Vec<_>>();
+                let primary_key = key_columns
+                    .iter()
+                    .map(|key| key.name.clone())
+                    .collect::<Vec<_>>();
                 let (column_info, truncated_columns) = limit_columns(all_columns);
                 let columns = column_info
                     .iter()
@@ -806,19 +925,11 @@ impl DbPool {
                     .iter()
                     .enumerate()
                     .flat_map(|(index, column)| {
-                        let identifier = quote_pg_identifier(&column.name);
-                        let (text, length) = if column.binary {
-                            (
-                                format!("('0x' || ENCODE(SUBSTRING({identifier} FROM 1 FOR {MAX_BINARY_BYTES}), 'hex'))"),
-                                format!("OCTET_LENGTH({identifier})"),
-                            )
-                        } else {
-                            let text = format!("CAST({identifier} AS TEXT)");
-                            (format!("LEFT({text}, {MAX_CELL_CHARS})"), format!("CHAR_LENGTH({text})"))
-                        };
+                        let (value, truncated) =
+                            cell_preview_projection(column, SqlDialect::PostgreSql, MAX_CELL_CHARS);
                         [
-                            format!("{text} AS \"v{index}\""),
-                            format!("({identifier} IS NOT NULL AND {length} > {}) AS \"t{index}\"", if column.binary { MAX_BINARY_BYTES } else { MAX_CELL_CHARS }),
+                            format!("{value} AS \"v{index}\""),
+                            format!("{truncated} AS \"t{index}\""),
                         ]
                     })
                     .collect::<Vec<_>>()
@@ -828,31 +939,51 @@ impl DbPool {
                     quote_pg_identifier(&object.schema),
                     quote_pg_identifier(&object.name)
                 );
-                let (where_clause, binds) = build_view_where_clause(
+                let mut predicate = build_view_where_clause(
                     filters,
                     condition.as_deref(),
                     &column_info,
                     SqlDialect::PostgreSql,
                 )?;
                 let order_clause = build_stable_order_clause(
+                    &table,
                     sort,
                     &column_info,
                     &primary_key,
                     SqlDialect::PostgreSql,
                 )?;
-                let sql = format!(
-                    "SELECT {selection} FROM {table}{where_clause}{order_clause} LIMIT {} OFFSET {offset}",
-                    MAX_TABLE_ROWS + 1,
-                );
-                let mut query = sqlx::query(&sql);
-                for value in binds {
-                    query = query.bind(value);
-                }
+                let mut cursor = start.cursor(
+                    &column_info,
+                    &key_columns,
+                    sort,
+                    SqlDialect::PostgreSql,
+                    predicate.1.len() + 1,
+                )?;
                 let rows = {
                     let mut transaction = pool
                         .begin_with("START TRANSACTION READ ONLY")
                         .await
                         .map_err(|error| db_error(&error))?;
+                    let mut only = "";
+                    if cursor.is_some() {
+                        match table_key_scope_pg(&mut transaction, object).await? {
+                            // An inherited child's key can overlap the parent's key.
+                            None => cursor = None,
+                            // A child can be attached after the catalog check.
+                            Some(false) => only = "ONLY ",
+                            Some(true) => {}
+                        }
+                    }
+                    let offset = start.apply(&mut predicate, cursor);
+                    let (where_clause, binds) = predicate;
+                    let sql = format!(
+                        "SELECT {selection} FROM {only}{table}{where_clause}{order_clause} LIMIT {}{offset}",
+                        MAX_TABLE_ROWS + 1,
+                    );
+                    let mut query = sqlx::query(&sql);
+                    for value in binds {
+                        query = query.bind(value);
+                    }
                     let result = query.fetch_all(&mut *transaction).await;
                     transaction
                         .rollback()
@@ -864,7 +995,7 @@ impl DbPool {
                 Ok(to_table_data(
                     columns,
                     rows,
-                    primary_key,
+                    key_columns,
                     truncated_columns,
                     |row, index| match row.try_get::<Option<String>, _>(index * 2) {
                         Ok(Some(value)) => match row.try_get::<bool, _>(index * 2 + 1) {
@@ -879,11 +1010,15 @@ impl DbPool {
             }
             Self::MySql(pool) => {
                 let all_columns = table_columns_mysql(pool, object).await?;
-                let primary_key: Vec<String> = all_columns
+                let key_columns = all_columns
                     .iter()
                     .filter(|column| column.primary_key)
-                    .map(|column| column.name.clone())
-                    .collect();
+                    .map(CellDetailKeyColumn::from)
+                    .collect::<Vec<_>>();
+                let primary_key = key_columns
+                    .iter()
+                    .map(|key| key.name.clone())
+                    .collect::<Vec<_>>();
                 let (column_info, truncated_columns) = limit_columns(all_columns);
                 let columns = column_info
                     .iter()
@@ -893,19 +1028,11 @@ impl DbPool {
                     .iter()
                     .enumerate()
                     .flat_map(|(index, column)| {
-                        let identifier = quote_mysql_identifier(&column.name);
-                        let (text, length) = if column.binary {
-                            (
-                                format!("CONCAT('0x', HEX(SUBSTRING({identifier}, 1, {MAX_BINARY_BYTES})))"),
-                                format!("OCTET_LENGTH({identifier})"),
-                            )
-                        } else {
-                            let text = format!("CAST({identifier} AS CHAR)");
-                            (format!("LEFT({text}, {MAX_CELL_CHARS})"), format!("CHAR_LENGTH({text})"))
-                        };
+                        let (value, truncated) =
+                            cell_preview_projection(column, SqlDialect::MySql, MAX_CELL_CHARS);
                         [
-                            format!("{text} AS `v{index}`"),
-                            format!("({identifier} IS NOT NULL AND {length} > {}) AS `t{index}`", if column.binary { MAX_BINARY_BYTES } else { MAX_CELL_CHARS }),
+                            format!("{value} AS `v{index}`"),
+                            format!("{truncated} AS `t{index}`"),
                         ]
                     })
                     .collect::<Vec<_>>()
@@ -915,16 +1042,30 @@ impl DbPool {
                     quote_mysql_identifier(&object.schema),
                     quote_mysql_identifier(&object.name)
                 );
-                let (where_clause, binds) = build_view_where_clause(
+                let mut predicate = build_view_where_clause(
                     filters,
                     condition.as_deref(),
                     &column_info,
                     SqlDialect::MySql,
                 )?;
-                let order_clause =
-                    build_stable_order_clause(sort, &column_info, &primary_key, SqlDialect::MySql)?;
+                let order_clause = build_stable_order_clause(
+                    &table,
+                    sort,
+                    &column_info,
+                    &primary_key,
+                    SqlDialect::MySql,
+                )?;
+                let cursor = start.cursor(
+                    &column_info,
+                    &key_columns,
+                    sort,
+                    SqlDialect::MySql,
+                    predicate.1.len() + 1,
+                )?;
+                let offset = start.apply(&mut predicate, cursor);
+                let (where_clause, binds) = predicate;
                 let sql = format!(
-                    "SELECT {selection} FROM {table}{where_clause}{order_clause} LIMIT {} OFFSET {offset}",
+                    "SELECT {selection} FROM {table}{where_clause}{order_clause} LIMIT {}{offset}",
                     MAX_TABLE_ROWS + 1,
                 );
                 let mut query = sqlx::query(&sql);
@@ -947,7 +1088,7 @@ impl DbPool {
                 Ok(to_table_data(
                     columns,
                     rows,
-                    primary_key,
+                    key_columns,
                     truncated_columns,
                     |row, index| match row.try_get::<Option<String>, _>(index * 2) {
                         Ok(Some(value)) => match row.try_get::<bool, _>(index * 2 + 1) {
@@ -959,6 +1100,102 @@ impl DbPool {
                         Err(error) => CellValue::DecodeError(error.to_string()),
                     },
                 ))
+            }
+        }
+    }
+
+    pub async fn read_table_cell(
+        &self,
+        object: &DbObject,
+        column: &str,
+        primary_key: &[(CellDetailKeyColumn, String)],
+    ) -> Result<CellValue, DbError> {
+        if object.kind != DbObjectKind::Table || primary_key.is_empty() {
+            return Err("Для загрузки значения нужен первичный ключ таблицы".into());
+        }
+
+        match self {
+            Self::PostgreSql(pool) => {
+                let table = format!(
+                    "{}.{}",
+                    quote_pg_identifier(&object.schema),
+                    quote_pg_identifier(&object.name)
+                );
+                let mut transaction = pool
+                    .begin_with("START TRANSACTION READ ONLY")
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                // Take the table's metadata lock before validating the snapshot's key.
+                sqlx::query(&format!("SELECT 1 FROM {table} LIMIT 0"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                // An ordinary parent's key does not constrain rows in inherited tables.
+                let partitioned = table_key_scope_pg(&mut transaction, object).await?;
+                let Some(partitioned) = partitioned else {
+                    return Err("Первичный ключ не определяет строку для всего объекта".into());
+                };
+                // Attaching an inheritance child can race with the metadata check.
+                let from = if partitioned {
+                    table
+                } else {
+                    format!("ONLY {table}")
+                };
+                let columns = table_columns_pg(&mut *transaction, object).await?;
+                let (target, keys) = cell_detail_columns(&columns, column, primary_key)?;
+                let (value, truncated) =
+                    cell_preview_projection(target, SqlDialect::PostgreSql, MAX_CELL_DETAIL_CHARS);
+                let predicates = cell_key_predicates(&keys, SqlDialect::PostgreSql);
+                let sql =
+                    format!("SELECT {value}, {truncated} FROM {from} WHERE {predicates} LIMIT 2");
+                let mut query = sqlx::query_as::<_, (Option<String>, bool)>(&sql);
+                for (_, value) in primary_key {
+                    query = query.bind(value);
+                }
+                let result = query.fetch_all(&mut *transaction).await;
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                cell_detail_result(result.map_err(|error| db_error(&error))?)
+            }
+            Self::MySql(pool) => {
+                let table = format!(
+                    "{}.{}",
+                    quote_mysql_identifier(&object.schema),
+                    quote_mysql_identifier(&object.name)
+                );
+                let mut transaction = pool
+                    .begin_with("START TRANSACTION READ ONLY")
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                sqlx::query(&format!("SELECT 1 FROM {table} LIMIT 0"))
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                if !mysql_is_base_table(&mut transaction, object).await? {
+                    return Err("Объект больше не является обычной таблицей".into());
+                }
+                let columns = table_columns_mysql(&mut *transaction, object).await?;
+                let (target, keys) = cell_detail_columns(&columns, column, primary_key)?;
+                let (value, truncated) =
+                    cell_preview_projection(target, SqlDialect::MySql, MAX_CELL_DETAIL_CHARS);
+                let predicates = cell_key_predicates(&keys, SqlDialect::MySql);
+                let sql =
+                    format!("SELECT {value}, {truncated} FROM {table} WHERE {predicates} LIMIT 2");
+                let mut query = sqlx::query_as::<_, (Option<String>, bool)>(&sql);
+                for (key, (_, value)) in keys.iter().zip(primary_key) {
+                    query = query.bind(value);
+                    if !key.binary {
+                        query = query.bind(value);
+                    }
+                }
+                let result = query.fetch_all(&mut *transaction).await;
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|error| db_error(&error))?;
+                cell_detail_result(result.map_err(|error| db_error(&error))?)
             }
         }
     }
@@ -1455,6 +1692,26 @@ fn looks_like_row_query(sql: &str) -> bool {
         .any(|prefix| statement.starts_with(prefix))
 }
 
+// Some(true) is a declaratively partitioned table, Some(false) a plain table.
+// An ordinary inheritance parent has no key that covers all returned rows.
+async fn table_key_scope_pg(
+    connection: &mut sqlx::PgConnection,
+    object: &DbObject,
+) -> Result<Option<bool>, DbError> {
+    sqlx::query_scalar(
+        "SELECT c.relkind = 'p'
+         FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = $1 AND c.relname = $2
+           AND (c.relkind = 'p' OR (c.relkind = 'r' AND NOT EXISTS
+               (SELECT 1 FROM pg_catalog.pg_inherits i WHERE i.inhparent = c.oid)))",
+    )
+    .bind(&object.schema)
+    .bind(&object.name)
+    .fetch_optional(connection)
+    .await
+    .map_err(|error| db_error(&error))
+}
+
 async fn table_columns_pg<'e, E: Executor<'e, Database = sqlx::Postgres>>(
     pool: E,
     object: &DbObject,
@@ -1462,6 +1719,9 @@ async fn table_columns_pg<'e, E: Executor<'e, Database = sqlx::Postgres>>(
     sqlx::query(
         "SELECT c.column_name AS column_name, c.data_type AS data_type, \
                 c.udt_schema AS udt_schema, c.udt_name AS udt_name, \
+                pg_catalog.json_build_array(c.udt_schema, c.udt_name, c.domain_schema, c.domain_name, \
+                    c.collation_schema, c.collation_name, c.character_maximum_length, \
+                    c.numeric_precision, c.numeric_scale, c.datetime_precision, c.interval_type)::text AS key_type, \
                 (c.is_identity <> 'NO' OR c.is_generated <> 'NEVER') AS is_generated, \
                 EXISTS (SELECT 1 FROM information_schema.table_constraints tc \
                         JOIN information_schema.key_column_usage kcu \
@@ -1504,6 +1764,7 @@ async fn table_columns_pg<'e, E: Executor<'e, Database = sqlx::Postgres>>(
         Ok(DbColumn {
             name,
             data_type: data_type.clone(),
+            key_type: row.try_get("key_type").map_err(|error| error.to_string())?,
             binary: data_type.eq_ignore_ascii_case("bytea"),
             primary_key,
             generated,
@@ -1540,6 +1801,7 @@ async fn table_columns_mysql<'e, E: Executor<'e, Database = sqlx::MySql>>(
         "SELECT CAST(column_name AS CHAR) AS column_name, \
                 CAST(data_type AS CHAR) AS data_type, \
                 CAST(character_set_name AS CHAR) AS character_set_name, \
+                CONCAT(CAST(column_type AS CHAR), ' / ', COALESCE(CAST(collation_name AS CHAR), '')) AS key_type, \
                 CAST(extra AS CHAR) LIKE '%GENERATED%' OR CAST(extra AS CHAR) LIKE '%auto_increment%' AS is_generated, \
                 CAST(column_key AS CHAR) = 'PRI' AS is_primary_key \
          FROM information_schema.columns \
@@ -1571,6 +1833,7 @@ async fn table_columns_mysql<'e, E: Executor<'e, Database = sqlx::MySql>>(
         Ok(DbColumn {
             name,
             data_type: data_type.clone(),
+            key_type: row.try_get("key_type").map_err(|error| error.to_string())?,
             binary: is_mysql_binary_type(&data_type, character_set.as_deref()),
             primary_key,
             generated,
@@ -1584,7 +1847,7 @@ async fn table_columns_mysql<'e, E: Executor<'e, Database = sqlx::MySql>>(
 fn to_table_data<R, F>(
     columns: Vec<String>,
     mut rows: Vec<R>,
-    primary_key: Vec<String>,
+    cell_detail_key_columns: Vec<CellDetailKeyColumn>,
     truncated_columns: bool,
     cell: F,
 ) -> TableData
@@ -1600,7 +1863,11 @@ where
     TableData {
         columns,
         rows,
-        primary_key,
+        primary_key: cell_detail_key_columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect(),
+        cell_detail_key_columns,
         truncated,
         truncated_columns,
     }
@@ -1651,11 +1918,11 @@ fn table_catalog(
     })
 }
 
-fn quote_pg_identifier(identifier: &str) -> String {
+pub(crate) fn quote_pg_identifier(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
-fn quote_mysql_identifier(identifier: &str) -> String {
+pub(crate) fn quote_mysql_identifier(identifier: &str) -> String {
     format!("`{}`", identifier.replace('`', "``"))
 }
 
@@ -1663,6 +1930,257 @@ fn quote_mysql_identifier(identifier: &str) -> String {
 enum SqlDialect {
     PostgreSql,
     MySql,
+}
+
+impl SqlDialect {
+    fn quote(self, name: &str) -> String {
+        match self {
+            Self::PostgreSql => quote_pg_identifier(name),
+            Self::MySql => quote_mysql_identifier(name),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PageStart<'a> {
+    Offset(usize),
+    After(&'a TableData),
+}
+
+impl<'a> PageStart<'a> {
+    /// Add an indexable key range when the preview has the full, native sort key.
+    /// The fallback preserves the established ordering for other sorts and keys.
+    fn cursor(
+        self,
+        columns: &[DbColumn],
+        keys: &[CellDetailKeyColumn],
+        sort: Option<&TableSort>,
+        dialect: SqlDialect,
+        parameter_index: usize,
+    ) -> Result<Option<(String, &'a str)>, DbError> {
+        let Self::After(current) = self else {
+            return Ok(None);
+        };
+        if keys != current.cell_detail_key_columns {
+            return Err("Первичный ключ изменился. Обновите таблицу".into());
+        }
+        let [key] = keys else {
+            return Ok(None);
+        };
+        if sort.is_some_and(|sort| sort.column != key.name) {
+            return Ok(None);
+        }
+        let Some(column_index) = current.columns.iter().position(|name| *name == key.name) else {
+            return Ok(None);
+        };
+        let Some(column) = columns.iter().find(|column| column.name == key.name) else {
+            return Ok(None);
+        };
+        let Some(key_cast) = page_key_cast(column, dialect) else {
+            return Ok(None);
+        };
+        let Some(CellValue::Text(value)) =
+            current.rows.last().and_then(|row| row.get(column_index))
+        else {
+            return Ok(None);
+        };
+        let (identifier, parameter) = match dialect {
+            SqlDialect::PostgreSql => (
+                quote_pg_identifier(&key.name),
+                pg_typed_parameter(&format!("${parameter_index}"), key_cast),
+            ),
+            SqlDialect::MySql => (
+                quote_mysql_identifier(&key.name),
+                format!("CAST(? AS {key_cast})"),
+            ),
+        };
+        let operator = if sort.is_some_and(|sort| sort.descending) {
+            "<"
+        } else {
+            ">"
+        };
+        let range = format!("{identifier} {operator} {parameter}");
+        Ok(Some((range, value)))
+    }
+
+    fn apply(
+        self,
+        predicate: &mut (String, Vec<String>),
+        cursor: Option<(String, &str)>,
+    ) -> String {
+        let Some((range, value)) = cursor else {
+            let offset = match self {
+                Self::Offset(offset) => offset,
+                Self::After(current) => current.rows.len(),
+            };
+            return if offset == 0 {
+                String::new()
+            } else {
+                format!(" OFFSET {offset}")
+            };
+        };
+        let (where_clause, binds) = predicate;
+        binds.push(value.to_owned());
+        *where_clause = match where_clause.strip_prefix(" WHERE ") {
+            Some(expression) => format!(" WHERE ({expression}) AND {range}"),
+            None => format!(" WHERE {range}"),
+        };
+        String::new()
+    }
+}
+
+fn page_key_cast(column: &DbColumn, dialect: SqlDialect) -> Option<&'static str> {
+    match (dialect, column.data_type.as_str()) {
+        (SqlDialect::PostgreSql, "smallint") => Some("pg_catalog.int2"),
+        (SqlDialect::PostgreSql, "integer") => Some("pg_catalog.int4"),
+        (SqlDialect::PostgreSql, "bigint") => Some("pg_catalog.int8"),
+        (SqlDialect::PostgreSql, "uuid") if column.udt_schema == "pg_catalog" => {
+            Some("pg_catalog.uuid")
+        }
+        (SqlDialect::MySql, "tinyint" | "smallint" | "mediumint" | "int" | "bigint") => Some(
+            if column
+                .key_type
+                .split_ascii_whitespace()
+                .any(|part| part == "unsigned")
+            {
+                "UNSIGNED"
+            } else {
+                "SIGNED"
+            },
+        ),
+        _ => None,
+    }
+}
+
+fn cell_preview_projection(
+    column: &DbColumn,
+    dialect: SqlDialect,
+    max_chars: usize,
+) -> (String, String) {
+    let name = dialect.quote(&column.name);
+    cell_preview_projection_sql(column, &name, dialect, max_chars)
+}
+
+fn cell_preview_projection_sql(
+    column: &DbColumn,
+    name: &str,
+    dialect: SqlDialect,
+    max_chars: usize,
+) -> (String, String) {
+    if column.binary {
+        let max_bytes = (max_chars - 2) / 2;
+        let value = match dialect {
+            SqlDialect::PostgreSql => {
+                format!("('0x' || ENCODE(SUBSTRING({name} FROM 1 FOR {max_bytes}), 'hex'))")
+            }
+            SqlDialect::MySql => {
+                format!("CONCAT('0x', HEX(SUBSTRING({name}, 1, {max_bytes})))")
+            }
+        };
+        return (
+            value,
+            format!("({name} IS NOT NULL AND OCTET_LENGTH({name}) > {max_bytes})"),
+        );
+    }
+
+    let ty = match dialect {
+        SqlDialect::PostgreSql => "TEXT",
+        SqlDialect::MySql => "CHAR",
+    };
+    let text = format!("CAST({name} AS {ty})");
+    (
+        format!("LEFT({text}, {max_chars})"),
+        format!("({name} IS NOT NULL AND CHAR_LENGTH({text}) > {max_chars})"),
+    )
+}
+
+fn cell_detail_columns<'a>(
+    columns: &'a [DbColumn],
+    column: &str,
+    primary_key: &[(CellDetailKeyColumn, String)],
+) -> Result<(&'a DbColumn, Vec<&'a DbColumn>), DbError> {
+    let keys = cell_detail_keys(columns, primary_key)?;
+    let target = columns
+        .iter()
+        .find(|candidate| candidate.name == column)
+        .ok_or_else(|| DbError::from("Столбец больше не существует. Обновите таблицу"))?;
+    Ok((target, keys))
+}
+
+fn cell_detail_keys<'a>(
+    columns: &'a [DbColumn],
+    primary_key: &[(CellDetailKeyColumn, String)],
+) -> Result<Vec<&'a DbColumn>, DbError> {
+    let keys = columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .collect::<Vec<_>>();
+    if keys.len() != primary_key.len()
+        || keys
+            .iter()
+            .zip(primary_key)
+            .any(|(current, (original, _))| {
+                current.name != original.name || current.key_type != original.key_type
+            })
+    {
+        return Err("Первичный ключ изменился. Обновите таблицу".into());
+    }
+    if keys.iter().zip(primary_key).any(|(key, (_, value))| {
+        key.binary
+            && !value.strip_prefix("0x").is_some_and(|hex| {
+                hex.len().is_multiple_of(2) && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    }) {
+        return Err("Не удалось прочитать бинарный первичный ключ".into());
+    }
+    Ok(keys)
+}
+
+fn cell_key_predicates(keys: &[&DbColumn], dialect: SqlDialect) -> String {
+    keys.iter()
+        .enumerate()
+        .map(|(index, key)| {
+            let name = dialect.quote(&key.name);
+            match dialect {
+                SqlDialect::PostgreSql => {
+                    let bind = format!("CAST(${} AS TEXT)", index + 1);
+                    if key.binary {
+                        return format!("{name} = DECODE(SUBSTRING({bind} FROM 3), 'hex')");
+                    }
+                    let schema = dialect.quote(&key.udt_schema);
+                    let ty = dialect.quote(&key.udt_name);
+                    format!(
+                        "{name} = CAST({bind} AS {schema}.{ty}) AND CAST({name} AS TEXT) COLLATE \"C\" = {bind} COLLATE \"C\""
+                    )
+                }
+                SqlDialect::MySql if key.binary => {
+                    format!("{name} = UNHEX(SUBSTRING(?, 3))")
+                }
+                // Check the exact representation in addition to the native comparison.
+                SqlDialect::MySql => format!(
+                    "{name} = ? AND CAST(CAST({name} AS CHAR) AS BINARY) = CAST(? AS BINARY)"
+                ),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" AND ")
+}
+
+fn cell_detail_result(mut rows: Vec<(Option<String>, bool)>) -> Result<CellValue, DbError> {
+    if rows.len() != 1 {
+        return Err(if rows.is_empty() {
+            "Строка больше не найдена. Обновите таблицу"
+        } else {
+            "По первичному ключу найдено несколько строк. Обновите таблицу"
+        }
+        .into());
+    }
+    let (value, truncated) = rows.pop().expect("exactly one row");
+    Ok(match value {
+        Some(value) if truncated => CellValue::Truncated(value),
+        Some(value) => CellValue::Text(value),
+        None => CellValue::Null,
+    })
 }
 
 // Keep the fragment inside one parenthesized expression in both SQL dialects.
@@ -1906,55 +2424,39 @@ fn pg_typed_parameter(parameter: &str, type_name: &str) -> String {
     format!("CAST(CAST({parameter} AS TEXT) AS {type_name})")
 }
 
-fn build_order_clause(
-    sort: Option<&TableSort>,
-    columns: &[DbColumn],
-    dialect: SqlDialect,
-) -> Result<String, String> {
-    let Some(sort) = sort else {
-        return Ok(String::new());
-    };
-    let column = columns
-        .iter()
-        .find(|column| column.name == sort.column)
-        .ok_or_else(|| format!("Столбец «{}» больше не существует", sort.column))?;
-    let identifier = match dialect {
-        SqlDialect::PostgreSql => quote_pg_identifier(&column.name),
-        SqlDialect::MySql => quote_mysql_identifier(&column.name),
-    };
-    Ok(format!(
-        " ORDER BY {identifier} {}",
-        if sort.descending { "DESC" } else { "ASC" }
-    ))
-}
-
 fn build_stable_order_clause(
+    table: &str,
     sort: Option<&TableSort>,
     columns: &[DbColumn],
     primary_key: &[String],
     dialect: SqlDialect,
 ) -> Result<String, String> {
-    let mut order = build_order_clause(sort, columns, dialect)?;
-    let tie_breakers = primary_key
-        .iter()
-        .filter(|key| !sort.is_some_and(|sort| sort.column == **key))
-        .map(|key| {
-            let identifier = match dialect {
-                SqlDialect::PostgreSql => quote_pg_identifier(key),
-                SqlDialect::MySql => quote_mysql_identifier(key),
-            };
-            format!("{identifier} ASC")
-        })
-        .collect::<Vec<_>>();
-    if !tie_breakers.is_empty() {
-        if order.is_empty() {
-            order.push_str(" ORDER BY ");
-        } else {
-            order.push_str(", ");
+    // Qualify input columns so names like v0 do not resolve to preview aliases.
+    let qualified = |name: &str| {
+        let identifier = match dialect {
+            SqlDialect::PostgreSql => quote_pg_identifier(name),
+            SqlDialect::MySql => quote_mysql_identifier(name),
+        };
+        format!("{table}.{identifier}")
+    };
+    let mut terms = Vec::new();
+    if let Some(sort) = sort {
+        if !columns.iter().any(|column| column.name == sort.column) {
+            return Err(format!("Столбец «{}» больше не существует", sort.column));
         }
-        order.push_str(&tie_breakers.join(", "));
+        let direction = if sort.descending { "DESC" } else { "ASC" };
+        terms.push(format!("{} {direction}", qualified(&sort.column)));
     }
-    Ok(order)
+    terms.extend(
+        primary_key
+            .iter()
+            .filter(|key| !sort.is_some_and(|sort| sort.column == **key))
+            .map(|key| format!("{} ASC", qualified(key))),
+    );
+    if terms.is_empty() {
+        return Ok(String::new());
+    }
+    Ok(format!(" ORDER BY {}", terms.join(", ")))
 }
 
 fn pg_comparison_cast(data_type: &str) -> Option<&'static str> {
@@ -2006,6 +2508,67 @@ fn format_database_error(error: &str) -> String {
         "Не удалось подключиться: проверьте адрес, порт и доступность сервера".to_owned()
     } else {
         error.to_owned()
+    }
+}
+
+/// Mirrors the SQL filters in `list_tables_with_system`.
+pub fn is_system_schema(kind: DatabaseKind, name: &str) -> bool {
+    match kind {
+        DatabaseKind::PostgreSql => {
+            matches!(name, "information_schema" | "pg_catalog")
+                || name.starts_with("pg_toast")
+                || name.starts_with("pg_temp_")
+        }
+        DatabaseKind::MySql | DatabaseKind::MariaDb => {
+            matches!(
+                name,
+                "information_schema" | "mysql" | "sys" | "performance_schema"
+            )
+        }
+    }
+}
+
+#[cfg(test)]
+mod system_schema_tests {
+    use super::is_system_schema;
+    use crate::settings::DatabaseKind;
+
+    #[test]
+    fn postgres_system_schemas_are_detected() {
+        for name in [
+            "information_schema",
+            "pg_catalog",
+            "pg_toast",
+            "pg_temp_3",
+            "pg_toast_temp_3",
+        ] {
+            assert!(is_system_schema(DatabaseKind::PostgreSql, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn postgres_user_schemas_are_not_system() {
+        for name in ["public", "mysql", "sys", "app", "pgx", "my_pg_temp_1"] {
+            assert!(!is_system_schema(DatabaseKind::PostgreSql, name), "{name}");
+        }
+    }
+
+    #[test]
+    fn mysql_and_mariadb_system_schemas_are_detected() {
+        for kind in [DatabaseKind::MySql, DatabaseKind::MariaDb] {
+            for name in ["information_schema", "mysql", "sys", "performance_schema"] {
+                assert!(is_system_schema(kind, name), "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn mysql_user_schemas_are_not_system() {
+        for kind in [DatabaseKind::MySql, DatabaseKind::MariaDb] {
+            for name in ["app", "public", "pg_catalog", "pg_toast", "MySQL_data"] {
+                assert!(!is_system_schema(kind, name), "{name}");
+            }
+        }
     }
 }
 
@@ -2103,6 +2666,7 @@ mod tests {
             .map(|i| DbColumn {
                 name: i.to_string(),
                 data_type: "integer".to_owned(),
+                key_type: "integer".to_owned(),
                 binary: false,
                 primary_key: false,
                 generated: false,
@@ -2118,6 +2682,7 @@ mod tests {
             .map(|i| DbColumn {
                 name: i.to_string(),
                 data_type: "integer".to_owned(),
+                key_type: "integer".to_owned(),
                 binary: false,
                 primary_key: false,
                 generated: false,
@@ -2368,6 +2933,7 @@ fn execute_on_connection_mode<'a>(
                 columns,
                 rows,
                 primary_key,
+                cell_detail_key_columns: Vec::new(),
                 truncated,
                 truncated_columns,
             }),
@@ -2867,6 +3433,7 @@ mod preview_budget_tests {
             columns: vec!["value".into()],
             rows: vec![vec![CellValue::Null]; MAX_BROWSE_ROWS + 1],
             primary_key: vec![],
+            cell_detail_key_columns: Vec::new(),
             truncated: true,
             truncated_columns: false,
         };

@@ -104,6 +104,7 @@ pub(super) fn render(ui: &Rc<Ui>) {
             .collect()
     };
     clear_box(&ui.objects);
+    ui.object_search_branches.borrow_mut().clear();
     ui.table_list_items.borrow_mut().clear();
     ui.selected_table_button.borrow_mut().take();
     ui.objects.set_sensitive(true);
@@ -153,15 +154,24 @@ pub(super) fn render(ui: &Rc<Ui>) {
         let children = gtk::Box::new(gtk::Orientation::Vertical, 0);
         children.set_margin_start(16);
         children.set_visible(expanded);
+        let catalog_loaded = catalog.is_some();
         if let Some(catalog) = catalog {
             append_schema_tree(ui, &children, &selected, catalog);
         } else {
-            children.append(&loading_row("Загрузка схем…"));
+            let hint = gtk::Label::new(Some("Нажмите базу, чтобы загрузить её объекты"));
+            hint.set_wrap(true);
+            hint.set_xalign(0.0);
+            hint.add_css_class("dim-label");
+            children.append(&hint);
         }
+        let user_expanded = Rc::new(Cell::new(expanded));
+        let expanded_for_toggle = user_expanded.clone();
         let sql_target = selected.clone();
         let weak = Rc::downgrade(ui);
         let source = source_pool.clone();
         let children_toggle = children.clone();
+        let disclosure_for_toggle = disclosure.clone();
+        let icon_for_toggle = icon.clone();
         button.connect_clicked(move |_| {
             let Some(ui) = weak.upgrade() else { return };
             let now_expanded = {
@@ -170,10 +180,11 @@ pub(super) fn render(ui: &Rc<Ui>) {
                 *expanded = !*expanded;
                 *expanded
             };
+            expanded_for_toggle.set(now_expanded);
             children_toggle.set_visible(now_expanded);
-            disclosure.set_text(if now_expanded { "▾" } else { "▸" });
+            disclosure_for_toggle.set_text(if now_expanded { "▾" } else { "▸" });
             set_penpot_icon(
-                &icon,
+                &icon_for_toggle,
                 if now_expanded {
                     "database-open"
                 } else {
@@ -182,13 +193,19 @@ pub(super) fn render(ui: &Rc<Ui>) {
                 false,
             );
             if let Some(pool) = source.clone() {
+                if !catalog_loaded && now_expanded {
+                    clear_box(&children_toggle);
+                    children_toggle.append(&loading_row("Загрузка схем…"));
+                }
                 open_database_session(&ui, selected.clone(), pool, &selected.database);
             }
+            apply_table_list_filter(&ui);
         });
         let sql_button = tree_sql_button(&sql_target.database);
         let weak = Rc::downgrade(ui);
         let source = source_pool.clone();
         let target = sql_target;
+        let database_name = target.database.clone();
         sql_button.connect_clicked(move |_| {
             let (Some(ui), Some(pool)) = (weak.upgrade(), source.clone()) else {
                 return;
@@ -199,7 +216,20 @@ pub(super) fn render(ui: &Rc<Ui>) {
                 .insert(profile_session_key(&target), true);
             with_database_session(&ui, target.clone(), pool, create_sql_tab);
         });
-        ui.objects.append(&tree_line(&button, &sql_button));
+        let line = tree_line(&button, &sql_button);
+        ui.objects.append(&line);
+        ui.object_search_branches
+            .borrow_mut()
+            .push(object_search::Branch {
+                name: database_name,
+                line,
+                children: children.clone(),
+                disclosure,
+                icon,
+                open_icon: "database-open",
+                closed_icon: "database-closed",
+                expanded: user_expanded,
+            });
         ui.objects.append(&children);
     }
     apply_table_list_filter(ui);
