@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=DBDeck
+Comment=Browse and edit PostgreSQL and MySQL/MariaDB databases
+Comment[ru]=Просмотр и редактирование баз данных PostgreSQL и MySQL/MariaDB
+Exec=zer0-dbdeck
+Icon=io.github.andrey-losikhin.zer0-dbdeck
+Terminal=false
+Categories=Development;Database;
+Keywords=SQL;PostgreSQL;MySQL;MariaDB;

@@ -1,8 +1,10 @@
 //! An SQL tab owns its connection. Session state is never returned to a shared pool.
 use crate::database::{
-    DbPool, QueryConnection, QueryResult, configure_pg_connection, execute_on_connection_controlled,
+    DbPool, QueryConnection, QueryResult, configure_pg_connection,
+    execute_on_connection_controlled, stream_query_csv,
 };
 use crate::db_error::{DbError, DbErrorKind, classify};
+use crate::transfer::Cancellation;
 use sqlparser::{
     dialect::{MySqlDialect, PostgreSqlDialect},
     keywords::Keyword,
@@ -126,13 +128,79 @@ impl SqlSession {
             ..Self::with_profile(pool, profile)
         }
     }
-    pub fn for_estimated_plan(&self) -> Self {
+    pub fn isolated_read_only(&self) -> Self {
         // Starting a read-only transaction must leave the editor's connection alone.
         Self {
             read_only: true,
             schema: self.schema.clone(),
             ..Self::new(self.pool.clone())
         }
+    }
+    pub fn validate_csv_query(&self, sql: &str) -> Result<(), String> {
+        let mysql = matches!(self.pool, DbPool::MySql(_));
+        let policy = statement_policy(sql, mysql)?;
+        validate_read_only(sql_risk(sql, mysql), &policy)
+    }
+
+    pub async fn export_csv(
+        &self,
+        sql: &str,
+        timeout_seconds: u64,
+        file: &mut std::fs::File,
+        cancel: &Cancellation,
+        progress: impl FnMut(usize) + Send,
+    ) -> Result<usize, String> {
+        use futures_util::future::{Either, select};
+
+        self.validate_csv_query(sql)?;
+        let session = self.isolated_read_only();
+        let mut inner = Inner::default();
+        let export = async {
+            session
+                .connect(&mut inner)
+                .await
+                .map_err(|e| e.to_string())?;
+            let connection = inner.connection.as_mut().unwrap();
+            let begin = match connection {
+                Connection::PostgreSql(_) => "BEGIN READ ONLY",
+                Connection::MySql(_) => "START TRANSACTION READ ONLY",
+            };
+            connection.command(begin).await.map_err(|e| e.to_string())?;
+            if matches!(connection, Connection::PostgreSql(_)) {
+                let settings = format!(
+                    "SET LOCAL statement_timeout = '{}s'; SET LOCAL bytea_output = 'hex'",
+                    timeout_seconds
+                );
+                connection
+                    .command(&settings)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            let rows = stream_query_csv(connection.query_connection(), sql, file, progress).await?;
+            connection
+                .command("ROLLBACK")
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(rows)
+        };
+        let timeout = async {
+            if timeout_seconds == 0 {
+                std::future::pending::<()>().await;
+            }
+            tokio::time::sleep(Duration::from_secs(timeout_seconds)).await;
+        };
+        // Stop covers connection acquisition, preparation and the wait for the first row.
+        let stop = select(Box::pin(cancel.cancelled()), Box::pin(timeout));
+        let reason = match select(Box::pin(stop), Box::pin(export)).await {
+            Either::Right((result, _)) => return result,
+            Either::Left((Either::Left(_), _)) => "Экспорт отменён",
+            Either::Left((Either::Right(_), _)) => "Превышено время выполнения SQL",
+        };
+        // Keep the detached connection alive while cancelling its server query.
+        if inner.connection.is_some() {
+            let _ = tokio::time::timeout(Duration::from_secs(2), session.cancel_backend()).await;
+        }
+        Err(reason.into())
     }
     pub fn requires_write_approval(&self, sql: &str, state: TransactionState) -> bool {
         self.production
@@ -417,20 +485,9 @@ impl SqlSession {
         let mysql = matches!(self.pool, DbPool::MySql(_));
         let mut inner = self.inner.lock().await;
         let policy = statement_policy(sql, mysql)?;
-        let risk = crate::sql_risk::analyze(
-            sql,
-            if mysql {
-                crate::sql_risk::Dialect::MySql
-            } else {
-                crate::sql_risk::Dialect::PostgreSql
-            },
-        );
-        if self.read_only
-            && (risk != crate::sql_risk::SqlRisk::ReadOnly
-                || policy.managed_unsafe
-                || policy.statements != 1)
-        {
-            return Err("Только чтение: разрешён один читающий запрос. Управление сессией, запись и неизвестные команды запрещены.".into());
+        let risk = sql_risk(sql, mysql);
+        if self.read_only {
+            validate_read_only(risk, &policy)?;
         }
         if self.requires_write_approval(sql, inner.state) && !write_approved {
             return Err("PROD: запись требует подтверждения целевой БД для этой операции".into());
@@ -807,6 +864,27 @@ struct Policy {
     transaction_control: bool,
     final_pending: Option<bool>,
 }
+fn sql_risk(sql: &str, mysql: bool) -> crate::sql_risk::SqlRisk {
+    use crate::sql_risk::{Dialect, analyze};
+    let dialect = if mysql {
+        Dialect::MySql
+    } else {
+        Dialect::PostgreSql
+    };
+    analyze(sql, dialect)
+}
+
+fn validate_read_only(risk: crate::sql_risk::SqlRisk, policy: &Policy) -> Result<(), String> {
+    if policy.statements == 1
+        && !policy.managed_unsafe
+        && risk == crate::sql_risk::SqlRisk::ReadOnly
+    {
+        Ok(())
+    } else {
+        Err("Только чтение: разрешён один читающий запрос. Управление сессией, запись и неизвестные команды запрещены.".into())
+    }
+}
+
 fn statement_policy(sql: &str, mysql: bool) -> Result<Policy, String> {
     let dialect: &dyn sqlparser::dialect::Dialect = if mysql {
         &MySqlDialect {}
@@ -978,7 +1056,7 @@ mod integration_tests {
             sql: &str,
         ) -> Result<QueryResult, DbError> {
             let plan = EstimatedPlan::new(kind, sql).unwrap();
-            let session = editor.for_estimated_plan();
+            let session = editor.isolated_read_only();
             let result = session.execute_with_timeout(plan.sql(), 5).await;
             session.close().await;
             result
@@ -1233,4 +1311,4 @@ mod integration_tests {
 
 #[cfg(test)]
 #[path = "../tests/support/postgres_idle_eof.rs"]
-mod postgres_idle_eof;
+pub(crate) mod postgres_idle_eof;

@@ -2066,9 +2066,26 @@ fn create_sql_tab_in_group(ui: &Rc<Ui>, requested_group: &str) {
     let directory_button =
         sql_menu_action(&menu, &popover, "Папка запросов…", "folder-open-symbolic");
     menu.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
-    let export_button =
-        sql_menu_action(&menu, &popover, "Экспорт CSV…", "document-save-as-symbolic");
+    let export_button = sql_menu_action(
+        &menu,
+        &popover,
+        "Экспорт предпросмотра в CSV…",
+        "document-save-as-symbolic",
+    );
     export_button.set_sensitive(false);
+    let full_export_button = sql_menu_action(
+        &menu,
+        &popover,
+        "Выполнить запрос и сохранить полный CSV…",
+        "folder-download-symbolic",
+    );
+    let owner = Rc::downgrade(ui);
+    let full_export_id = id.clone();
+    full_export_button.connect_clicked(move |_| {
+        if let Some(ui) = owner.upgrade() {
+            confirm_full_sql_csv_export(&ui, &full_export_id);
+        }
+    });
     let batch_button = sql_menu_action(
         &menu,
         &popover,
@@ -2616,18 +2633,12 @@ fn run_sql_tab_policy(
         .borrow()
         .get(&session_key)
         .map(|(_, pool)| pool.clone())
-        .zip(ui.sql_tabs.borrow().get(id).map(|tab| {
-            let text = tab
-                .buffer
-                .text(&tab.buffer.start_iter(), &tab.buffer.end_iter(), true);
-            let selected = tab
-                .buffer
-                .selection_bounds()
-                .map(|(start, end)| tab.buffer.text(&start, &end, true).to_string());
-            selected
-                .filter(|selection| !selection.trim().is_empty())
-                .unwrap_or_else(|| text.to_string())
-        }))
+        .zip(
+            ui.sql_tabs
+                .borrow()
+                .get(id)
+                .map(|tab| sql_editor_text(&tab.buffer)),
+        )
     else {
         return;
     };
@@ -2718,7 +2729,7 @@ fn run_sql_tab_policy(
         return;
     }
     let session = if explain {
-        let session = tab.session.for_estimated_plan();
+        let session = tab.session.isolated_read_only();
         tab.running_plan = Some(session.clone());
         session
     } else {
@@ -3581,6 +3592,123 @@ fn rename_sql_tab(ui: &Rc<Ui>, id: &str) {
     });
     dialogs::install(&dialog);
     dialog.present();
+}
+
+fn sql_editor_text(buffer: &sourceview5::Buffer) -> String {
+    buffer
+        .selection_bounds()
+        .map(|(start, end)| buffer.text(&start, &end, true).to_string())
+        .filter(|selection| !selection.trim().is_empty())
+        .unwrap_or_else(|| {
+            buffer
+                .text(&buffer.start_iter(), &buffer.end_iter(), true)
+                .to_string()
+        })
+}
+
+fn confirm_full_sql_csv_export(ui: &Rc<Ui>, id: &str) {
+    let Some((session, sql, timeout)) = ui.sql_tabs.borrow().get(id).map(|tab| {
+        (
+            tab.session.clone(),
+            sql_editor_text(&tab.buffer),
+            tab.timeout.value_as_int() as u64,
+        )
+    }) else {
+        return;
+    };
+    if let Err(error) = session.validate_csv_query(&sql) {
+        show_error_dialog(ui, "Не удалось запустить полный экспорт CSV", &error);
+        return;
+    }
+    let dialog = gtk::MessageDialog::builder()
+        .transient_for(&ui.window)
+        .modal(true)
+        .message_type(gtk::MessageType::Question)
+        .text("Выполнить запрос для полного CSV?")
+        .secondary_text("Будет выполнен выделенный SQL или весь текст редактора в отдельной транзакции только для чтения. Временные таблицы и несохранённые изменения SQL-сессии недоступны.")
+        .build();
+    dialog.add_button("Отмена", gtk::ResponseType::Cancel);
+    dialog.add_button("Выбрать файл…", gtk::ResponseType::Accept);
+    let weak = Rc::downgrade(ui);
+    dialog.connect_response(move |dialog, response| {
+        dialog.close();
+        if response == gtk::ResponseType::Accept
+            && let Some(ui) = weak.upgrade()
+        {
+            choose_full_sql_csv_export(&ui, session.clone(), sql.clone(), timeout);
+        }
+    });
+    dialog.present();
+}
+
+fn choose_full_sql_csv_export(
+    ui: &Rc<Ui>,
+    session: sql_session::SqlSession,
+    sql: String,
+    timeout: u64,
+) {
+    let title = "Экспорт полного результата SQL в CSV";
+    let chooser = dialogs::file_chooser(
+        Some(title),
+        Some(&ui.window),
+        gtk::FileChooserAction::Save,
+        Some("Сохранить CSV"),
+        Some("Отмена"),
+    );
+    configure_csv_chooser(ui, &chooser);
+    chooser.set_current_name("query-result-full.csv");
+    let weak = Rc::downgrade(ui);
+    chooser.connect_response(move |dialog, response| {
+        if response == gtk::ResponseType::Accept
+            && let (Some(ui), Some(path)) =
+                (weak.upgrade(), dialog.file().and_then(|file| file.path()))
+            && let Some(cancel) = start_transfer(&ui, title, &path)
+        {
+            remember_csv_directory(&ui, &path);
+            ui.status.set_text("Выполняю запрос для полного CSV…");
+            let sender = ui.sender.clone();
+            let session = session.clone();
+            let sql = sql.clone();
+            let runtime = ui.runtime.clone();
+            let guard = ui.activity.start();
+            ui.runtime.spawn_blocking(move || {
+                let _guard = guard;
+                let result = runtime.block_on(write_full_sql_csv(
+                    &path,
+                    &session,
+                    &sql,
+                    timeout,
+                    &cancel,
+                    |count| {
+                        let _ = sender.send(Event::ExportProgress(count));
+                    },
+                ));
+                let event = match result {
+                    Ok(rows) => Event::CsvExported(rows, Ok(())),
+                    Err(error) => Event::CsvExported(0, Err(error)),
+                };
+                let _ = sender.send(event);
+            });
+        }
+        dialog.destroy();
+    });
+    chooser.show();
+}
+
+async fn write_full_sql_csv(
+    path: &std::path::Path,
+    session: &sql_session::SqlSession,
+    sql: &str,
+    timeout: u64,
+    cancel: &transfer::Cancellation,
+    progress: impl FnMut(usize) + Send,
+) -> Result<usize, String> {
+    let mut output = output_file::AtomicOutput::new(path)?;
+    let rows = session
+        .export_csv(sql, timeout, &mut output.file, cancel, progress)
+        .await?;
+    output.commit(cancel)?;
+    Ok(rows)
 }
 
 fn choose_sql_csv_export(ui: &Rc<Ui>, id: &str) {
@@ -7605,40 +7733,79 @@ fn show_grid_cell(ui: &Rc<Ui>, table_key: &str, row: usize, column: usize) {
         && object.kind == database::DbObjectKind::Table
         && let Some(key) = data.cell_detail_key(cells)
     {
-        let load = gtk::Button::with_label("Загрузить из БД");
-        load.set_halign(gtk::Align::Center);
-        content.append(&load);
+        let navigation = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        navigation.set_halign(gtk::Align::Center);
+        let previous = gtk::Button::with_label("Предыдущая");
+        previous.set_visible(false);
+        let next = gtk::Button::with_label("Загрузить из БД");
+        navigation.append(&previous);
+        navigation.append(&next);
+        content.append(&navigation);
         let table_key = table_key.to_owned();
         let snapshot = Arc::downgrade(data);
         let owner = Rc::downgrade(ui);
         let column = name.clone();
-        load.connect_clicked(move |button| {
-            let pool = owner.upgrade().and_then(|ui| {
-                let tables = ui.table_data.borrow();
-                let current = tables.get(&table_key)?;
-                if !std::ptr::eq(snapshot.as_ptr(), Arc::as_ptr(current)) {
-                    return None;
+        let page = Rc::new(Cell::new(None::<usize>));
+        let request_page = Rc::new({
+            let previous = previous.downgrade();
+            let next = next.downgrade();
+            let page = page.clone();
+            let view = view.downgrade();
+            move |requested_page| {
+                let (Some(previous), Some(next), Some(view)) =
+                    (previous.upgrade(), next.upgrade(), view.upgrade())
+                else {
+                    return;
+                };
+                let pool = owner.upgrade().and_then(|ui| {
+                    let tables = ui.table_data.borrow();
+                    let current = tables.get(&table_key)?;
+                    if !std::ptr::eq(snapshot.as_ptr(), Arc::as_ptr(current)) {
+                        return None;
+                    }
+                    let profiles = ui.table_profiles.borrow();
+                    let session_key = profile_session_key(profiles.get(&table_key)?);
+                    ui.sessions
+                        .borrow()
+                        .get(&session_key)
+                        .map(|(_, pool)| (ui.runtime.clone(), pool.clone()))
+                });
+                let Some((runtime, pool)) = pool else {
+                    note.set_text("Данные таблицы изменились или подключение закрыто");
+                    previous.set_sensitive(false);
+                    next.set_sensitive(false);
+                    return;
+                };
+                let (object, column, key) = (object.clone(), column.clone(), key.clone());
+                load_grid_cell(
+                    &runtime,
+                    async move {
+                        pool.read_table_cell(&object, &column, &key, requested_page)
+                            .await
+                    },
+                    &note,
+                    &view,
+                    (&previous, &next),
+                    &page,
+                    requested_page,
+                );
+            }
+        });
+        next.connect_clicked({
+            let request_page = request_page.clone();
+            let page = page.clone();
+            move |button| {
+                if button.is_sensitive() {
+                    request_page(page.get().map_or(0, |page| page + 1));
                 }
-                let profiles = ui.table_profiles.borrow();
-                let session_key = profile_session_key(profiles.get(&table_key)?);
-                ui.sessions
-                    .borrow()
-                    .get(&session_key)
-                    .map(|(_, pool)| (ui.runtime.clone(), pool.clone()))
-            });
-            let Some((runtime, pool)) = pool else {
-                note.set_text("Данные таблицы изменились или подключение закрыто");
-                button.set_sensitive(false);
-                return;
-            };
-            let (object, column, key) = (object.clone(), column.clone(), key.clone());
-            load_grid_cell(
-                &runtime,
-                async move { pool.read_table_cell(&object, &column, &key).await },
-                &note,
-                &buffer,
-                button,
-            );
+            }
+        });
+        previous.connect_clicked(move |button| {
+            if button.is_sensitive()
+                && let Some(page) = page.get().and_then(|page| page.checked_sub(1))
+            {
+                request_page(page);
+            }
         });
     }
     content.append(
@@ -7656,42 +7823,72 @@ fn load_grid_cell(
     runtime: &tokio::runtime::Runtime,
     read: impl std::future::Future<Output = Result<CellValue, db_error::DbError>> + Send + 'static,
     note: &gtk::Label,
-    buffer: &gtk::TextBuffer,
-    button: &gtk::Button,
+    view: &gtk::TextView,
+    (previous, next): (&gtk::Button, &gtk::Button),
+    page: &Rc<Cell<Option<usize>>>,
+    requested_page: usize,
 ) {
-    button.set_sensitive(false);
+    let previous_enabled = previous.is_sensitive();
+    let next_enabled = next.is_sensitive();
+    previous.set_sensitive(false);
+    next.set_sensitive(false);
     note.set_text("Загрузка значения из БД…");
     let worker = runtime
         .spawn(async move { tokio::time::timeout(std::time::Duration::from_secs(15), read).await });
-    let (note, buffer, button) = (note.downgrade(), buffer.downgrade(), button.downgrade());
+    let (note, view, previous, next) = (
+        note.downgrade(),
+        view.downgrade(),
+        previous.downgrade(),
+        next.downgrade(),
+    );
+    let page = page.clone();
     gtk::glib::MainContext::default().spawn_local(async move {
         let result = worker.await;
-        let (Some(note), Some(buffer), Some(button)) =
-            (note.upgrade(), buffer.upgrade(), button.upgrade())
-        else {
+        let (Some(note), Some(view), Some(previous), Some(next)) = (
+            note.upgrade(),
+            view.upgrade(),
+            previous.upgrade(),
+            next.upgrade(),
+        ) else {
             return;
         };
-        let limit = database::MAX_CELL_DETAIL_CHARS;
-        let (text, status) = match result {
-            Ok(Ok(Ok(CellValue::Text(text)))) => (Some(text), "Текущее значение из БД".to_owned()),
-            Ok(Ok(Ok(CellValue::Truncated(text)))) => (
-                Some(text),
-                format!("Текущее значение из БД показано частично · предел {limit} символов"),
-            ),
-            Ok(Ok(Ok(CellValue::Null))) => {
-                (Some("NULL".to_owned()), "Значение SQL NULL".to_owned())
+        let buffer = view.buffer();
+        let has_next = matches!(&result, Ok(Ok(Ok(CellValue::Truncated(_)))));
+        let status = match result {
+            Ok(Ok(Ok(CellValue::Text(text) | CellValue::Truncated(text)))) => {
+                page.set(Some(requested_page));
+                buffer.set_text(&text.replace('\0', "␀"));
+                buffer.place_cursor(&buffer.start_iter());
+                view.scroll_to_mark(&buffer.get_insert(), 0.0, true, 0.0, 0.0);
+                let paged = requested_page > 0 || has_next;
+                previous.set_visible(paged);
+                next.set_visible(paged);
+                previous.set_sensitive(requested_page > 0);
+                next.set_sensitive(has_next);
+                next.set_label("Следующая");
+                if paged {
+                    format!("Текущее значение из БД · страница {}", requested_page + 1)
+                } else {
+                    "Текущее значение из БД".to_owned()
+                }
             }
-            Ok(Ok(Err(error))) => (None, format!("Не удалось загрузить значение: {error}")),
-            Ok(Err(_)) => (None, "Истекло время ожидания загрузки значения".to_owned()),
-            _ => (None, "Не удалось загрузить значение".to_owned()),
+            Ok(Ok(Ok(CellValue::Null))) => {
+                page.set(Some(0));
+                buffer.set_text("NULL");
+                previous.set_visible(false);
+                next.set_visible(false);
+                "Значение SQL NULL".to_owned()
+            }
+            error => {
+                previous.set_sensitive(previous_enabled);
+                next.set_sensitive(next_enabled);
+                match error {
+                    Ok(Ok(Err(error))) => format!("Не удалось загрузить значение: {error}"),
+                    Ok(Err(_)) => "Истекло время ожидания загрузки значения".to_owned(),
+                    _ => "Не удалось загрузить значение".to_owned(),
+                }
+            }
         };
-        if let Some(text) = text {
-            buffer.set_text(&text.replace('\0', "␀"));
-            buffer.place_cursor(&buffer.start_iter());
-            button.set_visible(false);
-        } else {
-            button.set_sensitive(true);
-        }
         note.set_text(&status);
     });
 }

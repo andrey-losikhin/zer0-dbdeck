@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 pub struct Cancellation {
     state: AtomicU8,
     flag: AtomicBool,
+    notify: tokio::sync::Notify,
 }
 impl Cancellation {
     pub fn new() -> Self {
@@ -15,6 +16,11 @@ impl Cancellation {
     pub fn is_cancelled(&self) -> bool {
         self.state.load(Ordering::Acquire) == 1
     }
+    pub async fn cancelled(&self) {
+        if !self.is_cancelled() {
+            self.notify.notified().await;
+        }
+    }
     /// False means publication already started; the UI must not promise cancellation.
     pub fn request(&self) -> bool {
         if self
@@ -23,6 +29,7 @@ impl Cancellation {
             .is_ok()
         {
             self.flag.store(true, Ordering::Release);
+            self.notify.notify_one();
             true
         } else {
             false

@@ -83,6 +83,114 @@ fn million_row_csv_streams_and_cancel_preserves_file() {
 }
 
 #[test]
+#[ignore = "requires PostgreSQL, MariaDB and MySQL on the Compose ports; no persistent writes"]
+fn full_sql_csv_streams_and_preserves_destination() {
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let root = std::env::temp_dir().join(format!("dbdeck-full-sql-csv-{}", Uuid::new_v4()));
+    fs::create_dir(&root).unwrap();
+    let destination = root.join("query.csv");
+    runtime.block_on(async {
+        for (kind, port, password_key, postgres) in [
+            (DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD", true),
+            (DatabaseKind::MariaDb, 53306, "DBDECK_MARIADB_PASSWORD", false),
+            (DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD", false),
+        ] {
+            eprintln!("Full SQL CSV: {kind:?}");
+            let profile = ConnectionProfile {
+                id: "sql-csv".into(),
+                name: "test".into(),
+                kind,
+                host: "127.0.0.1".into(),
+                port,
+                database: "dbdeck_test".into(),
+                username: "dbdeck_test".into(),
+                environment: EnvironmentTag::Local,
+                color: "#ffffff".into(),
+                read_only: false,
+                tls_mode: TlsMode::Disabled,
+                password_saved: false,
+                gopass_entry: None,
+                tls_files: Default::default(),
+                native_tools_dir: None,
+            };
+            let password = std::env::var(password_key).unwrap();
+            let pool = DbPool::connect(&profile, &password).await.unwrap();
+            let session = sql_session::SqlSession::with_profile_and_schema(
+                pool, &profile, postgres.then(|| "pg_catalog".to_owned()),
+            );
+            let binary = if postgres { "decode('616200ff', 'hex')" } else { "UNHEX('616200ff')" };
+            let read_only = if postgres {
+                "current_schema() || ':' || current_setting('transaction_read_only')"
+            } else {
+                "DATABASE()"
+            };
+            let query = format!("SELECT REPEAT('я', 1500) AS payload, {binary} AS bytes, NULL AS nil, '' AS empty_text, '=1' AS formula, {read_only} AS context; -- export");
+            let rows = write_full_sql_csv(&destination, &session, &query, 5, &transfer::Cancellation::new(), |_| {}).await.unwrap();
+            assert_eq!(rows, 1);
+            let context = if postgres { "pg_catalog:on" } else { "dbdeck_test" };
+            assert_eq!(
+                fs::read_to_string(&destination).unwrap(),
+                format!("\"payload\",\"bytes\",\"nil\",\"empty_text\",\"formula\",\"context\"\n\"{}\",\"0x616200ff\",\\N,\"\",\"'=1\",\"{context}\"\n", "я".repeat(1500))
+            );
+            let projection = (0..130)
+                .map(|index| format!("{index} AS c{index}"))
+                .collect::<Vec<_>>().join(", ");
+            let query = format!("WITH d AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) SELECT {projection} FROM d a CROSS JOIN d b CROSS JOIN d c CROSS JOIN d e");
+            let rows = write_full_sql_csv(&destination, &session, &query, 5, &transfer::Cancellation::new(), |_| {}).await.unwrap();
+            assert_eq!(rows, 1296);
+            let mut written = std::io::BufReader::new(fs::File::open(&destination).unwrap()).lines();
+            assert!(written.next().unwrap().unwrap().ends_with(",\"c129\""));
+            assert!(written.next().unwrap().unwrap().ends_with(",\"129\""));
+            assert_eq!(written.count(), 1295);
+            let show = if postgres { "SHOW server_version" } else { "SHOW VARIABLES LIKE 'version'" };
+            let rows = write_full_sql_csv(&destination, &session, show, 5, &transfer::Cancellation::new(), |_| {}).await.unwrap();
+            assert_eq!(rows, 1);
+            let rows = write_full_sql_csv(&destination, &session, "SELECT 1 AS empty_result WHERE 1 = 0", 5, &transfer::Cancellation::new(), |_| {}).await.unwrap();
+            assert_eq!(rows, 0);
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "\"empty_result\"\n");
+
+            for sql in [
+                "SELECT 1; SELECT 2",
+                "DELETE FROM dbdeck_should_not_exist",
+                "SELECT * FROM dbdeck_should_not_exist",
+                "SELECT (SELECT 1 UNION ALL SELECT 2) AS invalid_scalar",
+            ] {
+                assert!(write_full_sql_csv(&destination, &session, sql, 5, &transfer::Cancellation::new(), |_| {}).await.is_err(), "{sql}");
+                assert_eq!(fs::read_to_string(&destination).unwrap(), "\"empty_result\"\n");
+            }
+
+            let temp = if postgres { "CREATE TEMP TABLE" } else { "CREATE TEMPORARY TABLE" };
+            session.execute(&format!("{temp} editor_only_export_test (id INT)")).await.unwrap();
+            assert!(write_full_sql_csv(&destination, &session, "SELECT * FROM editor_only_export_test", 5, &transfer::Cancellation::new(), |_| {}).await.is_err());
+            assert!(session.execute("SELECT * FROM editor_only_export_test").await.is_ok());
+
+            let slow = if postgres { "SELECT 1 FROM pg_sleep(8)" } else { "SELECT SLEEP(8)" };
+            let cancel = Arc::new(transfer::Cancellation::new());
+            let stopper = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                stopper.request();
+            });
+            let started = std::time::Instant::now();
+            let error = write_full_sql_csv(&destination, &session, slow, 0, &cancel, |_| {}).await.unwrap_err();
+            assert!(error.contains("отменён"), "{error}");
+            assert!(started.elapsed().as_secs() < 5);
+            let error = write_full_sql_csv(&destination, &session, slow, 1, &transfer::Cancellation::new(), |_| {}).await.unwrap_err();
+            assert!(error.contains("время выполнения") || error.contains("statement timeout"), "{error}");
+            let cancel = transfer::Cancellation::new();
+            let query = "WITH d AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5 UNION ALL SELECT 6) SELECT REPEAT('x', 128) FROM d a CROSS JOIN d b CROSS JOIN d c CROSS JOIN d e CROSS JOIN d f CROSS JOIN d g";
+            let error = write_full_sql_csv(&destination, &session, query, 5, &cancel, |_| {
+                cancel.request();
+            }).await.unwrap_err();
+            assert!(error.contains("отменён"), "{error}");
+            assert_eq!(fs::read_to_string(&destination).unwrap(), "\"empty_result\"\n");
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 1);
+        }
+    });
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 #[ignore = "requires Compose databases/native dump tools; read-only backups, no restore"]
 fn native_schema_and_full_backups_postgres_mariadb_mysql() {
     let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -392,6 +500,41 @@ fn sql_save_csv_and_backup_ui_handlers() {
         fs::read_to_string(root.join("saved.sql")).unwrap(),
         "SELECT 1 AS saved_query"
     );
+    let buffer = ui.sql_tabs.borrow()[&id].buffer.clone();
+    buffer.set_text("SELECT 42 AS selected;\nSELECT 99 AS other;");
+    buffer.select_range(&buffer.start_iter(), &buffer.iter_at_offset(22));
+    let menu = ui.sql_tabs.borrow()[&id].actions_menu.popover().unwrap();
+    let mut action = menu.child().unwrap().first_child();
+    loop {
+        let widget = action.expect("full CSV action in SQL menu");
+        if let Some(button) = widget.downcast_ref::<gtk::Button>()
+            && button.child().is_some_and(|child| {
+                child
+                    .last_child()
+                    .and_downcast::<gtk::Label>()
+                    .is_some_and(|label| label.text() == "Выполнить запрос и сохранить полный CSV…")
+            })
+        {
+            button.emit_clicked();
+            break;
+        }
+        action = widget.next_sibling();
+    }
+    let confirmation = gtk::Window::list_toplevels()
+        .into_iter()
+        .filter_map(|widget| widget.downcast::<gtk::MessageDialog>().ok())
+        .find(|dialog| dialog.text().as_deref() == Some("Выполнить запрос для полного CSV?"))
+        .unwrap();
+    buffer.set_text("SELECT 0 AS changed_after_click");
+    confirmation.response(gtk::ResponseType::Accept);
+    accept("Экспорт полного результата SQL в CSV", &root, "full.csv");
+    until(|| ui.transfer_cancel.borrow().is_none());
+    assert_eq!(
+        fs::read_to_string(root.join("full.csv")).unwrap(),
+        "\"selected\"\n\"42\"\n"
+    );
+    assert!(ui.sql_tabs.borrow()[&id].result.is_none());
+
     ui.sql_tabs.borrow_mut().get_mut(&id).unwrap().result = Some(Arc::new(TableData {
         columns: vec!["value".into()],
         rows: vec![vec![CellValue::Text("shown".into())]],

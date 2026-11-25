@@ -296,7 +296,12 @@ fn cell_preview_preserves_multiline_text_and_indicates_truncation() {
             expected
         );
         let preceding = scroll.prev_sibling().unwrap();
-        let button = preceding.clone().downcast::<gtk::Button>().ok();
+        let button = preceding
+            .clone()
+            .downcast::<gtk::Box>()
+            .ok()
+            .and_then(|navigation| navigation.last_child())
+            .and_then(|button| button.downcast::<gtk::Button>().ok());
         assert_eq!(button.is_some(), can_load);
         let note = if button.is_some() {
             preceding.prev_sibling().unwrap()
@@ -320,18 +325,23 @@ fn cell_preview_preserves_multiline_text_and_indicates_truncation() {
     }
 
     let note = gtk::Label::new(Some("Показана только загруженная часть значения"));
-    let buffer = gtk::TextBuffer::new(None);
-    let load = gtk::Button::with_label("Загрузить из БД");
+    let view = gtk::TextView::new();
+    let buffer = view.buffer();
+    let previous = gtk::Button::with_label("Предыдущая");
+    let next = gtk::Button::with_label("Загрузить из БД");
+    let page = Rc::new(Cell::new(None));
     buffer.set_text("loaded portion");
     load_grid_cell(
         &ui.runtime,
         async { Err("Строка больше не найдена".into()) },
         &note,
-        &buffer,
-        &load,
+        &view,
+        (&previous, &next),
+        &page,
+        0,
     );
-    assert!(!load.is_sensitive());
-    until(|| load.is_sensitive());
+    assert!(!next.is_sensitive());
+    until(|| next.is_sensitive());
     assert!(note.text().contains("Строка больше не найдена"));
     assert_eq!(
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
@@ -346,15 +356,60 @@ fn cell_preview_preserves_multiline_text_and_indicates_truncation() {
             ))
         },
         &note,
-        &buffer,
-        &load,
+        &view,
+        (&previous, &next),
+        &page,
+        0,
     );
-    until(|| !load.is_visible());
-    assert!(note.text().contains("показано частично"));
+    until(|| page.get() == Some(0));
+    assert!(note.text().contains("страница 1"));
+    assert!(!previous.is_sensitive());
+    assert!(next.is_visible() && next.is_sensitive());
     assert_eq!(
         buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
         "longer\nсерверное значение",
     );
+
+    load_grid_cell(
+        &ui.runtime,
+        async { Ok(CellValue::Text("Последняя часть".into())) },
+        &note,
+        &view,
+        (&previous, &next),
+        &page,
+        1,
+    );
+    until(|| page.get() == Some(1));
+    assert!(note.text().contains("страница 2"));
+    assert!(previous.is_sensitive());
+    assert!(!next.is_sensitive());
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        "Последняя часть",
+    );
+
+    load_grid_cell(
+        &ui.runtime,
+        async { Err("Сбой чтения".into()) },
+        &note,
+        &view,
+        (&previous, &next),
+        &page,
+        0,
+    );
+    until(|| previous.is_sensitive());
+    assert_eq!(page.get(), Some(1));
+    assert!(!next.is_sensitive());
+    assert_eq!(
+        buffer.text(&buffer.start_iter(), &buffer.end_iter(), true),
+        "Последняя часть",
+    );
+}
+
+#[test]
+#[ignore = "requires GTK display and local PostgreSQL; uses only a TEMP table"]
+fn cell_preview_navigates_database_pages() {
+    run_application_grid_scenarios(GridScenario::CellPreview);
 }
 
 #[test]
@@ -602,6 +657,7 @@ enum GridScenario {
     Keyboard,
     SavedViews,
     Relations,
+    CellPreview,
 }
 
 fn run_application_grid_scenarios(scenario: GridScenario) {
@@ -628,6 +684,10 @@ fn run_application_grid_scenarios(scenario: GridScenario) {
             .idle_timeout(None).max_lifetime(None).connect_with(options).await.unwrap();
         sqlx::query("CREATE TEMP TABLE dbdeck_grid_test (id integer PRIMARY KEY, value text NOT NULL)").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO dbdeck_grid_test SELECT i, 'original-' || i FROM generate_series(1, 260) i").execute(&pool).await.unwrap();
+        if scenario == GridScenario::CellPreview {
+            sqlx::query("UPDATE dbdeck_grid_test SET value = REPEAT('ю', 16384) || REPEAT('я', 16384) || 'конец' WHERE id = 1")
+                .execute(&pool).await.unwrap();
+        }
         if scenario == GridScenario::Relations {
             sqlx::query("CREATE TEMP TABLE dbdeck_grid_child (id integer PRIMARY KEY, parent integer REFERENCES dbdeck_grid_test(id))")
                 .execute(&pool).await.unwrap();
@@ -678,6 +738,63 @@ fn run_application_grid_scenarios(scenario: GridScenario) {
             "Boolean(typeof table !== 'undefined' && table && !updatingData)",
         ) == true
     });
+    if scenario == GridScenario::CellPreview {
+        let generation = grid.generation().unwrap();
+        handle_tabulator_message(
+            &ui,
+            &key,
+            &serde_json::json!({"type": "viewCell", "row": 0, "column": "c1", "generation": generation}).to_string(),
+        );
+        let window = gtk::Window::list_toplevels()
+            .into_iter()
+            .filter_map(|window| window.downcast::<adw::Window>().ok())
+            .find(|window| window.title().as_deref() == Some("Значение ячейки · value"))
+            .unwrap();
+        let content = window.content().unwrap();
+        let scroll = content
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::ScrolledWindow>()
+            .unwrap();
+        let view = scroll.child().unwrap().downcast::<gtk::TextView>().unwrap();
+        let buffer = view.buffer();
+        let navigation = scroll.prev_sibling().unwrap();
+        let previous = navigation
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let next = navigation
+            .last_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        assert_eq!(next.label().as_deref(), Some("Загрузить из БД"));
+        next.emit_clicked();
+        until(|| buffer.char_count() as usize == database::MAX_CELL_DETAIL_CHARS);
+        assert!(!previous.is_sensitive() && next.is_sensitive());
+        let vertical = scroll.vadjustment();
+        until(|| vertical.upper() > vertical.page_size());
+        vertical.set_value(vertical.upper() - vertical.page_size());
+        assert!(vertical.value() > 0.0);
+        next.emit_clicked();
+        until(|| buffer.start_iter().char() == 'я');
+        // GtkTextView may align the first line just below the top padding.
+        until(|| vertical.value() <= f64::from(view.top_margin()));
+        assert!(previous.is_sensitive() && next.is_sensitive());
+        next.emit_clicked();
+        until(|| buffer.text(&buffer.start_iter(), &buffer.end_iter(), false) == "конец");
+        assert!(previous.is_sensitive() && !next.is_sensitive());
+        previous.emit_clicked();
+        until(|| buffer.start_iter().char() == 'я');
+        assert!(previous.is_sensitive() && next.is_sensitive());
+        previous.emit_clicked();
+        until(|| buffer.start_iter().char() == 'ю');
+        assert!(!previous.is_sensitive() && next.is_sensitive());
+        window.close();
+        ui.window.close();
+        return;
+    }
     if scenario == GridScenario::SavedViews {
         check_saved_table_views(&ui, &key, &object);
         ui.window.close();

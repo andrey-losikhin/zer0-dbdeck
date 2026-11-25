@@ -8,7 +8,7 @@ use std::{collections::BTreeMap, time::Duration};
 use futures_util::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use sqlx::{
-    Column, Connection, Executor, Row, TypeInfo, ValueRef, mysql::MySqlPoolOptions,
+    Column, Connection, Executor, Row, Statement, TypeInfo, ValueRef, mysql::MySqlPoolOptions,
     postgres::PgPoolOptions,
 };
 
@@ -1131,9 +1131,14 @@ impl DbPool {
         object: &DbObject,
         column: &str,
         primary_key: &[(CellDetailKeyColumn, String)],
+        page: usize,
     ) -> Result<CellValue, DbError> {
         if object.kind != DbObjectKind::Table || primary_key.is_empty() {
             return Err("Для загрузки значения нужен первичный ключ таблицы".into());
+        }
+
+        if page >= usize::MAX / MAX_CELL_DETAIL_CHARS {
+            return Err("Номер страницы значения слишком велик".into());
         }
 
         match self {
@@ -1166,7 +1171,7 @@ impl DbPool {
                 let columns = table_columns_pg(&mut *transaction, object).await?;
                 let (target, keys) = cell_detail_columns(&columns, column, primary_key)?;
                 let (value, truncated) =
-                    cell_preview_projection(target, SqlDialect::PostgreSql, MAX_CELL_DETAIL_CHARS);
+                    cell_detail_projection(target, SqlDialect::PostgreSql, page);
                 let predicates = cell_key_predicates(&keys, SqlDialect::PostgreSql);
                 let sql =
                     format!("SELECT {value}, {truncated} FROM {from} WHERE {predicates} LIMIT 2");
@@ -1179,7 +1184,11 @@ impl DbPool {
                     .rollback()
                     .await
                     .map_err(|error| db_error(&error))?;
-                cell_detail_result(result.map_err(|error| db_error(&error))?)
+                cell_detail_result(
+                    result.map_err(|error| db_error(&error))?,
+                    page,
+                    target.binary,
+                )
             }
             Self::MySql(pool) => {
                 let table = format!(
@@ -1200,8 +1209,7 @@ impl DbPool {
                 }
                 let columns = table_columns_mysql(&mut *transaction, object).await?;
                 let (target, keys) = cell_detail_columns(&columns, column, primary_key)?;
-                let (value, truncated) =
-                    cell_preview_projection(target, SqlDialect::MySql, MAX_CELL_DETAIL_CHARS);
+                let (value, truncated) = cell_detail_projection(target, SqlDialect::MySql, page);
                 let predicates = cell_key_predicates(&keys, SqlDialect::MySql);
                 let sql =
                     format!("SELECT {value}, {truncated} FROM {table} WHERE {predicates} LIMIT 2");
@@ -1217,7 +1225,11 @@ impl DbPool {
                     .rollback()
                     .await
                     .map_err(|error| db_error(&error))?;
-                cell_detail_result(result.map_err(|error| db_error(&error))?)
+                cell_detail_result(
+                    result.map_err(|error| db_error(&error))?,
+                    page,
+                    target.binary,
+                )
             }
         }
     }
@@ -1707,6 +1719,108 @@ impl DbPool {
     }
 }
 
+pub(crate) async fn stream_query_csv(
+    connection: QueryConnection<'_>,
+    sql: &str,
+    file: &mut std::fs::File,
+    mut progress: impl FnMut(usize) + Send,
+) -> Result<usize, String> {
+    use std::io::Write;
+
+    let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut count = 0;
+    macro_rules! stream {
+        ($connection:expr, $decode:ident) => {{
+            // Validate one statement on the server and get headers even for an empty result.
+            // Use the text protocol for execution to preserve arbitrary result types.
+            let statement = $connection.prepare(sql).await.map_err(|error| error.to_string())?;
+            let has_parameters = match statement.parameters() {
+                Some(sqlx::Either::Left(types)) => !types.is_empty(),
+                Some(sqlx::Either::Right(count)) => count != 0,
+                None => false,
+            };
+            if has_parameters || statement.columns().is_empty() {
+                return Err("Для CSV нужен запрос с колонками результата и без bind-параметров".into());
+            }
+            let mut rows = sqlx::raw_sql(sql).fetch(&mut *$connection).boxed();
+            let mut values = Vec::with_capacity(statement.columns().len());
+            while let Some(row) = rows.try_next().await.map_err(|error| error.to_string())? {
+                if count == 0 {
+                    let names = row.columns().iter().map(|col| col.name().to_owned()).collect::<Vec<_>>();
+                    crate::write_csv_header(&mut writer, &names)?;
+                }
+                values.clear();
+                for index in 0..row.columns().len() {
+                    values.push($decode(&row, index)?);
+                }
+                crate::write_csv_row(&mut writer, &values)?;
+                count += 1;
+                if count % 10_000 == 0 {
+                    progress(count);
+                }
+                tokio::task::consume_budget().await;
+            }
+            if count == 0 {
+                let names = statement.columns().iter().map(|col| col.name().to_owned()).collect::<Vec<_>>();
+                crate::write_csv_header(&mut writer, &names)?;
+            }
+        }};
+    }
+    match connection {
+        QueryConnection::PostgreSql(connection) => stream!(connection, pg_csv_cell),
+        QueryConnection::MySql(connection) => stream!(connection, mysql_csv_cell),
+    }
+    writer
+        .flush()
+        .map_err(|error| format!("Ошибка записи CSV: {error}"))?;
+    progress(count);
+    Ok(count)
+}
+
+fn pg_csv_cell(row: &sqlx::postgres::PgRow, index: usize) -> Result<CellValue, String> {
+    let value = row
+        .try_get_unchecked::<Option<String>, _>(index)
+        .map_err(|error| error.to_string())?;
+    Ok(match value {
+        Some(value) if row.column(index).type_info().name() == "BYTEA" => {
+            let hex = value.strip_prefix("\\x").ok_or("Ожидался BYTEA в hex")?;
+            CellValue::Text(format!("0x{hex}"))
+        }
+        Some(value) => CellValue::Text(value),
+        None => CellValue::Null,
+    })
+}
+
+fn mysql_csv_cell(row: &sqlx::mysql::MySqlRow, index: usize) -> Result<CellValue, String> {
+    if matches!(
+        row.column(index).type_info().name(),
+        "BINARY"
+            | "VARBINARY"
+            | "TINYBLOB"
+            | "BLOB"
+            | "MEDIUMBLOB"
+            | "LONGBLOB"
+            | "BIT"
+            | "GEOMETRY"
+    ) {
+        use std::fmt::Write;
+        let bytes = row
+            .try_get_unchecked::<Option<&[u8]>, _>(index)
+            .map_err(|error| error.to_string())?;
+        return Ok(bytes.map_or(CellValue::Null, |bytes| {
+            let mut hex = String::with_capacity(2 + bytes.len() * 2);
+            hex.push_str("0x");
+            for byte in bytes {
+                write!(&mut hex, "{byte:02x}").unwrap();
+            }
+            CellValue::Text(hex)
+        }));
+    }
+    row.try_get_unchecked::<Option<String>, _>(index)
+        .map(|value| value.map_or(CellValue::Null, CellValue::Text))
+        .map_err(|error| error.to_string())
+}
+
 fn looks_like_row_query(sql: &str) -> bool {
     let statement = sql.trim_start().to_ascii_lowercase();
     ["select", "with", "values", "show", "describe", "explain"]
@@ -2089,19 +2203,41 @@ fn cell_preview_projection_sql(
     dialect: SqlDialect,
     max_chars: usize,
 ) -> (String, String) {
+    cell_page_projection(column, name, dialect, max_chars, 0)
+}
+
+fn cell_detail_projection(column: &DbColumn, dialect: SqlDialect, page: usize) -> (String, String) {
+    let name = dialect.quote(&column.name);
+    cell_page_projection(column, &name, dialect, MAX_CELL_DETAIL_CHARS, page)
+}
+
+fn cell_page_projection(
+    column: &DbColumn,
+    name: &str,
+    dialect: SqlDialect,
+    max_chars: usize,
+    page: usize,
+) -> (String, String) {
+    let limit = if column.binary {
+        (max_chars - 2) / 2
+    } else {
+        max_chars
+    };
+    let offset = page * limit;
+    let start = offset + 1;
+    let end = offset + limit;
     if column.binary {
-        let max_bytes = (max_chars - 2) / 2;
         let value = match dialect {
             SqlDialect::PostgreSql => {
-                format!("('0x' || ENCODE(SUBSTRING({name} FROM 1 FOR {max_bytes}), 'hex'))")
+                format!("('0x' || ENCODE(SUBSTRING({name} FROM {start} FOR {limit}), 'hex'))")
             }
             SqlDialect::MySql => {
-                format!("CONCAT('0x', HEX(SUBSTRING({name}, 1, {max_bytes})))")
+                format!("CONCAT('0x', HEX(SUBSTRING({name}, {start}, {limit})))")
             }
         };
         return (
             value,
-            format!("({name} IS NOT NULL AND OCTET_LENGTH({name}) > {max_bytes})"),
+            format!("({name} IS NOT NULL AND OCTET_LENGTH({name}) > {end})"),
         );
     }
 
@@ -2110,9 +2246,14 @@ fn cell_preview_projection_sql(
         SqlDialect::MySql => "CHAR",
     };
     let text = format!("CAST({name} AS {ty})");
+    let value = if offset == 0 {
+        format!("LEFT({text}, {limit})")
+    } else {
+        format!("SUBSTRING({text}, {start}, {limit})")
+    };
     (
-        format!("LEFT({text}, {max_chars})"),
-        format!("({name} IS NOT NULL AND CHAR_LENGTH({text}) > {max_chars})"),
+        value,
+        format!("({name} IS NOT NULL AND CHAR_LENGTH({text}) > {end})"),
     )
 }
 
@@ -2188,7 +2329,11 @@ fn cell_key_predicates(keys: &[&DbColumn], dialect: SqlDialect) -> String {
         .join(" AND ")
 }
 
-fn cell_detail_result(mut rows: Vec<(Option<String>, bool)>) -> Result<CellValue, DbError> {
+fn cell_detail_result(
+    mut rows: Vec<(Option<String>, bool)>,
+    page: usize,
+    binary: bool,
+) -> Result<CellValue, DbError> {
     if rows.len() != 1 {
         return Err(if rows.is_empty() {
             "Строка больше не найдена. Обновите таблицу"
@@ -2198,6 +2343,10 @@ fn cell_detail_result(mut rows: Vec<(Option<String>, bool)>) -> Result<CellValue
         .into());
     }
     let (value, truncated) = rows.pop().expect("exactly one row");
+    let empty = if binary { "0x" } else { "" };
+    if page > 0 && value.as_deref().is_none_or(|value| value == empty) {
+        return Err("Эта страница больше недоступна. Откройте значение заново".into());
+    }
     Ok(match value {
         Some(value) if truncated => CellValue::Truncated(value),
         Some(value) => CellValue::Text(value),

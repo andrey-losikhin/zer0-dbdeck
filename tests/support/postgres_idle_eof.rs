@@ -26,8 +26,8 @@ enum Interrupt {
     },
 }
 
-struct Proxy {
-    port: u16,
+pub(crate) struct Proxy {
+    pub(crate) port: u16,
     interrupt: Option<oneshot::Sender<Interrupt>>,
     cut_done: Option<oneshot::Receiver<()>>,
     connections: Arc<AtomicUsize>,
@@ -35,7 +35,7 @@ struct Proxy {
 }
 
 impl Proxy {
-    async fn start(reject_replacement: bool) -> Self {
+    pub(crate) async fn start(reject_replacement: bool) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let (interrupt, command) = oneshot::channel();
@@ -104,6 +104,11 @@ impl Proxy {
         self.cut_done.take().unwrap().await.unwrap();
     }
 
+    pub(crate) async fn cut(&mut self) {
+        self.interrupt(Interrupt::Cut);
+        self.wait_for_cut().await;
+    }
+
     fn accepted(&self) -> usize {
         assert!(!self.task.is_finished(), "proxy stopped unexpectedly");
         self.connections.load(Ordering::Relaxed)
@@ -124,7 +129,7 @@ fn run(test: impl std::future::Future<Output = ()>) {
         .block_on(async { tokio::time::timeout(TEST_TIMEOUT, test).await.unwrap() });
 }
 
-fn session(port: u16) -> SqlSession {
+pub(crate) fn session(port: u16) -> SqlSession {
     let mut session = SqlSession::new(DbPool::PostgreSql(
         PgPoolOptions::new().connect_lazy_with(options(port)),
     ));
@@ -136,7 +141,7 @@ async fn run_sql(session: &SqlSession, sql: &str) -> (Result<QueryResult, DbErro
     session.execute_with_recovery(sql, 10, false).await
 }
 
-async fn mark_idle(session: &SqlSession) {
+pub(crate) async fn mark_idle(session: &SqlSession) {
     session.inner.lock().await.last_activity = Some(Instant::now() - POSTGRES_IDLE_AFTER);
 }
 
@@ -171,8 +176,7 @@ fn postgres_sql_tab_idle_eof_recovers_once() {
         let previous_backend = session.backend_id.load(Ordering::Acquire);
         assert_ne!(previous_backend, 0);
         mark_idle(&session).await;
-        proxy.interrupt(Interrupt::Cut);
-        proxy.wait_for_cut().await;
+        proxy.cut().await;
 
         let sql = "SELECT pg_notify('dbdeck_sql_eof_recovered', 'recovered'), current_schema(), current_setting('lock_timeout')";
         let (result, reconnected) = run_sql(&session, sql).await;

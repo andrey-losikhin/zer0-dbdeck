@@ -2,6 +2,78 @@
 use super::*;
 use grid_app_tests::until;
 
+#[test]
+#[ignore = "requires headless GTK and local PostgreSQL at 127.0.0.1:55432"]
+fn application_postgres_idle_recovery_messages() {
+    use sql_session::postgres_idle_eof::{Proxy, mark_idle, session};
+
+    gtk::init().unwrap();
+    adw::init().unwrap();
+    let runtime = Arc::new(tokio::runtime::Runtime::new().unwrap());
+    let profile: ConnectionProfile = serde_json::from_value(serde_json::json!({
+        "id":"idle-ui", "name":"Idle SQL", "kind":"postgre_sql", "host":"127.0.0.1",
+        "port":55432, "database":"dbdeck_test", "username":"dbdeck_test",
+        "environment":"local", "color":"#ffffff", "read_only":false, "tls_mode":"disabled"
+    }))
+    .unwrap();
+    let password = std::env::var("DBDECK_PG_PASSWORD").unwrap();
+    let pool = runtime
+        .block_on(DbPool::connect(&profile, &password))
+        .unwrap();
+    let app = adw::Application::builder()
+        .application_id("io.github.dbdeck.idle-test")
+        .build();
+    app.register(None::<&gtk::gio::Cancellable>).unwrap();
+    let ui = build_window(&app, runtime.clone());
+    let session_key = profile_session_key(&profile);
+    ui.sessions
+        .borrow_mut()
+        .insert(session_key.clone(), (profile.clone(), pool));
+    *ui.current_profile.borrow_mut() = Some(profile);
+    create_sql_tab(&ui, &session_key);
+    let id = ui.sql_tabs.borrow().keys().next().unwrap().clone();
+
+    for open_transaction in [false, true] {
+        let mut proxy = runtime.block_on(Proxy::start(false));
+        let session = {
+            let _runtime = runtime.enter();
+            session(proxy.port)
+        };
+        ui.sql_tabs.borrow_mut().get_mut(&id).unwrap().session = session.clone();
+        let run = |sql| {
+            ui.sql_tabs.borrow()[&id].buffer.set_text(sql);
+            run_sql_tab(&ui, &id);
+            until(|| ui.sql_tabs.borrow()[&id].run_button.is_sensitive());
+        };
+        run(if open_transaction {
+            "BEGIN; SELECT 1"
+        } else {
+            "SELECT 1"
+        });
+        assert_eq!(session.has_pending_transaction(), open_transaction);
+        assert!(!ui.sql_tabs.borrow()[&id].error_message.is_visible());
+        runtime.block_on(async {
+            mark_idle(&session).await;
+            proxy.cut().await;
+        });
+        run("SELECT 2");
+        let tabs = ui.sql_tabs.borrow();
+        let tab = &tabs[&id];
+        if open_transaction {
+            assert!(tab.error_message.is_visible());
+            let message = tab.error_message.text();
+            assert!(message.contains("Открытая транзакция потеряна"));
+            assert!(message.contains("SQL не отправлен"));
+            assert!(tab.result.is_none());
+        } else {
+            assert!(!tab.error_message.is_visible());
+            assert!(tab.status.text().starts_with("Открыта новая SQL-сессия"));
+            assert_eq!(tab.result.as_ref().unwrap().rows.len(), 1);
+        }
+    }
+    ui.window.close();
+}
+
 fn find(widget: &gtk::Widget, class: &str) -> Option<gtk::Widget> {
     if widget.has_css_class(class) {
         return Some(widget.clone());

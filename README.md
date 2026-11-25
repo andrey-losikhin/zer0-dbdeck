@@ -57,6 +57,21 @@ sudo pacman -S --needed base-devel rust gtk4 libadwaita gtksourceview5 webkitgtk
 If Rust is managed by rustup, use that toolchain instead of installing a second
 system toolchain. `rust-toolchain.toml` selects stable and the development components.
 
+To build and install the package from a source checkout on x86_64, run this as a
+regular user from the repository root:
+
+```sh
+sudo pacman -S --needed base-devel
+mkdir -p target/arch target/makepkg
+PKGDEST="$PWD/target/arch" BUILDDIR="$PWD/target/makepkg" makepkg -si
+```
+
+After installation, open DBDeck from the application menu or run `zer0-dbdeck`.
+The package dependency on Rust can be satisfied by Arch's `rust` or `rustup`.
+The local encrypted vault works with a master password without a Secret Service
+provider. For MySQL backups, install matching MySQL client tools and select
+their directory in the connection settings.
+
 ### Ubuntu 24.04
 
 Install Rust with [rustup](https://rustup.rs/), then install native dependencies:
@@ -144,10 +159,22 @@ can leave a partially applied native import.
 | Table browser | 200-row pages; up to 10,000 cached rows and 32 MiB of model data |
 | SQL preview | Up to 1,000 rows, 128 columns and 32 MiB of model data |
 | Grid cell | Up to 1,024 characters; truncated values cannot be overwritten |
-| Load cell from database | Up to 16,384 characters (8,191 bytes for binary values), for table rows with a complete primary key. SQL results show the query snapshot. |
-| SQL result CSV | The displayed bounded snapshot |
+| Load cell from database | Pages of up to 16,384 characters or 8,191 binary bytes displayed as hex. Available for table rows with a complete primary key. |
+| SQL preview CSV | The displayed bounded snapshot |
+| Full SQL CSV | Streams the result of one read-only query using the SQL tab timeout |
 | Full-table CSV | Streaming export of the complete table |
 | CSV import | UTF-8, up to 1 MiB per record and 1,024 fields; transactional batches |
+
+Choose **Просмотреть значение…** in the cell's context menu, then **Загрузить из БД**
+to read a long value. Use **Предыдущая** and **Следующая** to read through it.
+Each page reads the current value from the database. SQL results show the query snapshot.
+
+From the SQL tab menu, choose **Выполнить запрос и сохранить полный CSV…**
+to run the selected SQL or the entire editor in a separate read-only
+transaction on the tab's database and schema. The export sees committed data.
+Temporary tables and other session-local state belong to the editor connection.
+You can cancel from the transfer panel. The destination is replaced only after
+a successful export.
 
 When a single integer or PostgreSQL UUID primary key uniquely orders the rows,
 the next page starts after the last loaded key. Other orders with a primary key
@@ -170,7 +197,7 @@ local code; SQL files can contain native-client commands and cross-database stat
 ### Portable encrypted storage
 
 Profiles, saved passwords, history and drafts live in the encrypted
-`$XDG_DATA_HOME/zer0/zer0-dbdeck/connections.dbdeck` file (normally under
+`$XDG_DATA_HOME/zer0-dbdeck/connections.dbdeck` file (normally under
 `~/.local/share`). Encryption uses AES-256-GCM and PBKDF2-HMAC-SHA256 with
 600,000 iterations. Auto-unlock can use the desktop keyring or gopass.
 

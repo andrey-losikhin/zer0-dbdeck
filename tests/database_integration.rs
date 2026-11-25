@@ -280,23 +280,24 @@ fn run_case(id: &str, kind: DatabaseKind, port: u16, password_key: &str) {
         let row = typed.rows.iter().find(|row| row[0] == CellValue::Text("4".to_owned())).unwrap();
         let key = typed.cell_detail_key(row).unwrap();
         assert_eq!(
-            pool.read_table_cell(&typed_object, "optional_text", &key)
+            pool.read_table_cell(&typed_object, "optional_text", &key, 0)
                 .await
                 .unwrap(),
             CellValue::Text("длинный-текст-".repeat(120))
         );
-        let binary = pool.read_table_cell(&typed_object, "payload", &key).await.unwrap();
+        let binary = pool.read_table_cell(&typed_object, "payload", &key, 0).await.unwrap();
         assert!(matches!(binary, CellValue::Text(value) if value.eq_ignore_ascii_case("0xdeadbeef")));
         let mut missing = key.clone();
         missing[0].1 = "0".to_owned();
-        assert!(pool.read_table_cell(&typed_object, "optional_text", &missing).await.is_err());
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &missing, 0).await.is_err());
         let mut stale_key = key.clone();
         stale_key[0].0.name = "label".to_owned();
-        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_key).await.is_err());
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_key, 0).await.is_err());
         let mut stale_type = key;
         stale_type[0].0.key_type = "old type".to_owned();
-        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_type).await.is_err());
+        assert!(pool.read_table_cell(&typed_object, "optional_text", &stale_type, 0).await.is_err());
 
+        check_cell_detail_pages(&pool, expected_schema).await;
         if let DbPool::PostgreSql(pool) = &pool {
             check_cell_detail_bounds(pool.connect_options().as_ref().clone()).await;
         }
@@ -359,6 +360,89 @@ async fn check_browse_continuation(pool: &DbPool, object: &DbObject) {
     }
 }
 
+async fn check_cell_detail_pages(pool: &DbPool, schema: &str) {
+    let name = format!("cell_pages_{}", uuid::Uuid::new_v4().simple());
+    let table = format!("{schema}.{name}");
+    let (binary_type, binary_value, json_type, json_value) = match pool {
+        DbPool::PostgreSql(_) => (
+            "BYTEA",
+            "DECODE(CONCAT(REPEAT('ab', 8191), 'cd'), 'hex')",
+            "JSONB",
+            "jsonb_build_object('value', REPEAT('x', 16384))",
+        ),
+        DbPool::MySql(_) => (
+            "BLOB",
+            "UNHEX(CONCAT(REPEAT('ab', 8191), 'cd'))",
+            "JSON",
+            "JSON_OBJECT('value', REPEAT('x', 16384))",
+        ),
+    };
+    relation_fixture_sql(
+        pool,
+        &format!("CREATE TABLE {table} (id INT PRIMARY KEY, body TEXT, bytes {binary_type}, document {json_type})"),
+    )
+    .await;
+    relation_fixture_sql(
+        pool,
+        &format!("INSERT INTO {table} VALUES (1, CONCAT(REPEAT('ю', 16384), 'конец'), {binary_value}, {json_value})"),
+    )
+    .await;
+    let object = DbObject {
+        schema: schema.to_owned(),
+        name,
+        kind: DbObjectKind::Table,
+    };
+    let data = pool.read_table(&object).await.unwrap();
+    let key = data.cell_detail_key(&data.rows[0]).unwrap();
+    let mut results = Vec::new();
+    for (column, page) in [
+        ("body", 0),
+        ("body", 1),
+        ("body", 2),
+        ("bytes", 0),
+        ("bytes", 1),
+        ("document", 0),
+        ("document", 1),
+    ] {
+        results.push(pool.read_table_cell(&object, column, &key, page).await);
+    }
+    relation_fixture_sql(pool, &format!("DROP TABLE {table}")).await;
+
+    let [
+        body_first,
+        body_last,
+        missing,
+        bytes_first,
+        bytes_last,
+        json_first,
+        json_last,
+    ] = results.try_into().unwrap();
+    assert_eq!(
+        body_first.unwrap(),
+        CellValue::Truncated("ю".repeat(database::MAX_CELL_DETAIL_CHARS))
+    );
+    assert_eq!(body_last.unwrap(), CellValue::Text("конец".into()));
+    assert!(missing.unwrap_err().to_string().contains("недоступна"));
+    let CellValue::Truncated(bytes_first) = bytes_first.unwrap() else {
+        panic!("expected a partial binary value");
+    };
+    assert_eq!(
+        bytes_first.to_ascii_lowercase(),
+        format!("0x{}", "ab".repeat(8191))
+    );
+    let CellValue::Text(bytes_last) = bytes_last.unwrap() else {
+        panic!("expected the final binary page");
+    };
+    assert_eq!(bytes_last.to_ascii_lowercase(), "0xcd");
+    let (CellValue::Truncated(json_first), CellValue::Text(json_last)) =
+        (json_first.unwrap(), json_last.unwrap())
+    else {
+        panic!("expected two JSON pages");
+    };
+    let document: serde_json::Value = serde_json::from_str(&(json_first + &json_last)).unwrap();
+    assert_eq!(document["value"], "x".repeat(16384));
+}
+
 async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(1)
@@ -392,14 +476,14 @@ async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
     let mut key = data.cell_detail_key(row).unwrap();
     assert_eq!(
         database
-            .read_table_cell(&object, "body", &key)
+            .read_table_cell(&object, "body", &key, 0)
             .await
             .unwrap(),
         CellValue::Truncated("🦉".repeat(database::MAX_CELL_DETAIL_CHARS)),
     );
     assert_eq!(
         database
-            .read_table_cell(&object, "bytes", &key)
+            .read_table_cell(&object, "bytes", &key, 0)
             .await
             .unwrap(),
         CellValue::Truncated(format!(
@@ -410,7 +494,7 @@ async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
     key[1].1 = "0x1a".to_owned();
     assert_eq!(
         database
-            .read_table_cell(&object, "body", &key)
+            .read_table_cell(&object, "body", &key, 0)
             .await
             .unwrap(),
         CellValue::Null
@@ -421,7 +505,7 @@ async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
         .unwrap();
     assert!(
         database
-            .read_table_cell(&object, "body", &key)
+            .read_table_cell(&object, "body", &key, 0)
             .await
             .is_err()
     );
@@ -442,7 +526,7 @@ async fn check_cell_detail_bounds(options: sqlx::postgres::PgConnectOptions) {
     let key = data.cell_detail_key(&data.rows[0]).unwrap();
     assert_eq!(
         database
-            .read_table_cell(&partitioned, "body", &key)
+            .read_table_cell(&partitioned, "body", &key, 0)
             .await
             .unwrap(),
         CellValue::Text("partition value".to_owned()),

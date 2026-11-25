@@ -18,11 +18,10 @@ contrast tests for every built-in dark palette and for the Noctalia fallback and
 example palettes. Noctalia parsing, fallback and file-reload tests live in
 `src/noctalia.rs` and use temporary directories.
 
-These checks also run in GitHub Actions (`.github/workflows/ci.yml`); database,
-GUI and isolated scenarios do not run there. Clippy correctness lints
-are errors; existing style and
-complexity warnings remain visible. The application and integration test binary
-share some modules, so some module tests execute in both binaries.
+Run these checks locally. The repository does not ship a GitHub Actions workflow.
+Clippy treats correctness lints as errors and reports existing style and
+complexity warnings. The application and integration test binaries share some
+modules, so some module tests execute in both binaries.
 
 Database/GUI tests are marked ignored and must be selected explicitly. A green
 ordinary `cargo test` does not mean those external-environment tests ran.
@@ -74,6 +73,16 @@ G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbd
 ```
 
 Set `DBDECK_STRUCTURE_ENGINE` to `postgres`, `mariadb`, or `mysql` to select one fixture.
+
+### PostgreSQL recovery messages
+
+With local PostgreSQL running on port 55432 and `DBDECK_PG_PASSWORD` exported,
+run the GTK check for automatic session replacement and for losing an open
+transaction. The test closes the SQL tab's connection through a loopback proxy.
+
+```sh
+G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbdeck application_postgres_idle_recovery_messages -- --ignored --test-threads=1
+```
 
 ## Production-policy and streaming checks
 
@@ -152,6 +161,14 @@ and isolated XDG directories:
 ```sh
 G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbdeck production_confirmation_snapshot_and_readonly_ui -- --ignored --test-threads=1
 G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbdeck sql_save_csv_and_backup_ui_handlers -- --ignored --test-threads=1
+```
+
+The full SQL CSV test uses the three Compose databases and writes only temporary
+objects. It checks complete rows and values, empty results, session isolation,
+and preservation of the destination after errors, cancellation, or timeout.
+
+```sh
+cargo test --locked --bin zer0-dbdeck full_sql_csv_streams_and_preserves_destination -- --ignored --test-threads=1
 ```
 
 The background-task scenarios cover bounded history, concurrent SQL and
