@@ -39,6 +39,83 @@ fn postgres_browse_sample_table() {
 }
 
 #[test]
+#[ignore = "requires local PostgreSQL on 127.0.0.1:55432; see README.md"]
+fn postgres_startup_eof_retries_once() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    let password = std::env::var("DBDECK_PG_PASSWORD").expect("set DBDECK_PG_PASSWORD from .env");
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for disconnects in [1, usize::MAX, 0] {
+                let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                let port = listener.local_addr().unwrap().port();
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let proxy_attempts = Arc::clone(&attempts);
+                let proxy = tokio::spawn(async move {
+                    loop {
+                        let (mut client, _) = listener.accept().await.unwrap();
+                        let attempt = proxy_attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                        if attempt <= disconnects {
+                            // Consume the full StartupMessage so closing sends FIN instead of RST.
+                            let length = client.read_u32().await.unwrap() as usize;
+                            assert!((8..=1024).contains(&length));
+                            let mut startup = vec![0; length - 4];
+                            client.read_exact(&mut startup).await.unwrap();
+                            assert_eq!(&startup[..4], &196608_u32.to_be_bytes());
+                            client.shutdown().await.unwrap();
+                        } else {
+                            let mut server =
+                                TcpStream::connect(("127.0.0.1", 55432)).await.unwrap();
+                            tokio::io::copy_bidirectional(&mut client, &mut server)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                });
+
+                let mut profile =
+                    system_catalog_profile(DatabaseKind::PostgreSql, port, "dbdeck_test");
+                if disconnects == 0 {
+                    profile.username = "dbdeck_nonexistent_retry_test_role".into();
+                }
+                let result = DbPool::connect(&profile, &password).await;
+                match disconnects {
+                    1 => {
+                        let DbPool::PostgreSql(pool) =
+                            result.expect("recover after StartupMessage EOF")
+                        else {
+                            panic!("expected a PostgreSQL pool");
+                        };
+                        pool.close().await;
+                    }
+                    0 => assert!(result.unwrap_err().contains("Ошибка аутентификации")),
+                    _ => {
+                        let error = result.unwrap_err();
+                        assert!(error.contains("expected to read 5 bytes"), "{error}");
+                    }
+                }
+                assert_eq!(
+                    attempts.load(Ordering::Relaxed),
+                    if disconnects == 0 { 1 } else { 2 }
+                );
+                assert!(!proxy.is_finished(), "proxy stopped unexpectedly");
+                proxy.abort();
+                assert!(proxy.await.unwrap_err().is_cancelled());
+            }
+        });
+}
+
+#[test]
 #[ignore = "requires docker compose test databases; see README.md"]
 fn mariadb_browse_sample_table() {
     run_case(

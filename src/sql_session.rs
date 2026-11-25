@@ -1,16 +1,25 @@
 //! An SQL tab owns its connection. Session state is never returned to a shared pool.
-use crate::database::{DbPool, QueryConnection, QueryResult, execute_on_connection_controlled};
+use crate::database::{
+    DbPool, QueryConnection, QueryResult, configure_pg_connection, execute_on_connection_controlled,
+};
 use crate::db_error::{DbError, DbErrorKind, classify};
 use sqlparser::{
     dialect::{MySqlDialect, PostgreSqlDialect},
+    keywords::Keyword,
     tokenizer::{Token, Tokenizer},
 };
+use sqlx::Connection as _;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::Duration;
 use tokio::sync::{Mutex, Notify};
+use tokio::time::Instant;
+
+const POSTGRES_IDLE_AFTER: Duration = Duration::from_secs(60);
+const POSTGRES_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const POSTGRES_RECONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TransactionAction {
@@ -64,6 +73,7 @@ impl Connection {
 struct Inner {
     connection: Option<Connection>,
     state: TransactionState,
+    last_activity: Option<Instant>,
 }
 #[derive(Clone)]
 pub struct SqlSession {
@@ -155,47 +165,123 @@ impl SqlSession {
     pub fn schema(&self) -> Option<&str> {
         self.schema.as_deref()
     }
+
+    async fn prepare_postgres(&self, connection: &mut sqlx::PgConnection) -> Result<u64, DbError> {
+        if let Some(schema) = &self.schema {
+            let path = format!("\"{}\"", schema.replace('"', "\"\""));
+            sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
+                .bind(path)
+                .execute(&mut *connection)
+                .await
+                .map_err(|e| raw_error(&e))?;
+        }
+        sqlx::query_scalar::<_, i32>("SELECT pg_catalog.pg_backend_pid()")
+            .fetch_one(connection)
+            .await
+            .map(|id| id as u64)
+            .map_err(|e| raw_error(&e))
+    }
+
     async fn connect(&self, inner: &mut Inner) -> Result<(), DbError> {
         if self.closed.load(Ordering::Acquire) {
             return Err("SQL-сессия закрыта".into());
         }
         if inner.connection.is_none() {
-            inner.connection = Some(match &self.pool {
+            let (connection, id) = match &self.pool {
                 DbPool::PostgreSql(pool) => {
                     let mut connection = pool.acquire().await.map_err(|e| raw_error(&e))?.detach();
-                    if let Some(schema) = &self.schema {
-                        let path = format!("\"{}\"", schema.replace('"', "\"\""));
-                        sqlx::query("SELECT pg_catalog.set_config('search_path', $1, false)")
-                            .bind(path)
-                            .execute(&mut connection)
-                            .await
-                            .map_err(|e| raw_error(&e))?;
-                    }
-                    Connection::PostgreSql(connection)
+                    let id = self.prepare_postgres(&mut connection).await?;
+                    (Connection::PostgreSql(connection), id)
                 }
                 DbPool::MySql(pool) => {
-                    Connection::MySql(pool.acquire().await.map_err(|e| raw_error(&e))?.detach())
-                }
-            });
-        }
-        if self.backend_id.load(Ordering::Acquire) == 0 {
-            let id: u64 = match inner.connection.as_mut().unwrap() {
-                Connection::PostgreSql(c) => {
-                    sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
-                        .fetch_one(c)
+                    let mut connection = pool.acquire().await.map_err(|e| raw_error(&e))?.detach();
+                    let id = sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
+                        .fetch_one(&mut connection)
                         .await
-                        .map(|id| id as u64)
+                        .map_err(|e| raw_error(&e))?;
+                    (Connection::MySql(connection), id)
                 }
-                Connection::MySql(c) => {
-                    sqlx::query_scalar::<_, u64>("SELECT CONNECTION_ID()")
-                        .fetch_one(c)
-                        .await
-                }
-            }
-            .map_err(|e| raw_error(&e))?;
+            };
+            inner.connection = Some(connection);
+            inner.last_activity = Some(Instant::now());
             self.backend_id.store(id, Ordering::Release);
         }
         Ok(())
+    }
+
+    async fn check_idle_postgres(&self, inner: &mut Inner) -> Result<bool, DbError> {
+        let (DbPool::PostgreSql(pool), Some(Connection::PostgreSql(connection))) =
+            (&self.pool, inner.connection.as_mut())
+        else {
+            return Ok(false);
+        };
+        if !inner
+            .last_activity
+            .is_some_and(|last| last.elapsed() >= POSTGRES_IDLE_AFTER)
+        {
+            return Ok(false);
+        }
+        // PostgreSQL Sync/ReadyForQuery also works in an aborted transaction.
+        let cause = match tokio::time::timeout(POSTGRES_PROBE_TIMEOUT, connection.ping()).await {
+            Ok(Ok(())) => {
+                inner.last_activity = Some(Instant::now());
+                return Ok(false);
+            }
+            Ok(Err(error)) => error.to_string(),
+            Err(_) => "сервер не ответил за 5 с".to_owned(),
+        };
+        inner.connection.take();
+        self.backend_id.store(0, Ordering::Release);
+        if inner.state.pending {
+            self.mark_closed(inner);
+            return Err(DbError {
+                kind: DbErrorKind::Disconnected,
+                message: format!(
+                    "Соединение потеряно во время простоя ({cause}). Открытая транзакция потеряна. SQL не отправлен. Переподключитесь вручную."
+                ),
+            });
+        }
+
+        // Acquire can keep opening sockets until its deadline. Connect directly
+        // with the existing pool options to make exactly one replacement attempt.
+        let replacement = tokio::time::timeout(POSTGRES_RECONNECT_TIMEOUT, async {
+            let mut connection = sqlx::PgConnection::connect_with(&pool.connect_options())
+                .await
+                .map_err(|e| raw_error(&e))?;
+            configure_pg_connection(&mut connection)
+                .await
+                .map_err(|e| raw_error(&e))?;
+            let id = self.prepare_postgres(&mut connection).await?;
+            Ok::<_, DbError>((connection, id))
+        })
+        .await
+        .map(|result| result.map_err(|error| error.message))
+        .unwrap_or_else(|_| Err("сервер не ответил за 8 с".to_owned()));
+        match replacement {
+            Ok((connection, id)) => {
+                inner.connection = Some(Connection::PostgreSql(connection));
+                inner.last_activity = Some(Instant::now());
+                self.backend_id.store(id, Ordering::Release);
+                Ok(true)
+            }
+            Err(detail) => {
+                self.mark_closed(inner);
+                Err(DbError {
+                    kind: DbErrorKind::Disconnected,
+                    message: format!(
+                        "Соединение потеряно во время простоя ({cause}). Переподключение не удалось ({detail}). SQL не отправлен. Переподключитесь вручную."
+                    ),
+                })
+            }
+        }
+    }
+
+    fn mark_closed(&self, inner: &mut Inner) {
+        inner.connection.take();
+        inner.state = TransactionState::default();
+        self.backend_id.store(0, Ordering::Release);
+        self.pending.store(false, Ordering::Release);
+        self.closed.store(true, Ordering::Release);
     }
     pub fn request_cancel(&self) {
         self.cancel_requested.store(true, Ordering::Release);
@@ -267,14 +353,14 @@ impl SqlSession {
         )
         .await;
         match result {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                inner.last_activity = Some(Instant::now());
+                Ok(())
+            }
             error => {
                 // The server may have applied COMMIT even when its reply was lost.
                 // Never reuse or retry a connection whose transaction state is unknown.
-                inner.connection.take();
-                inner.state = TransactionState::default();
-                self.pending.store(false, Ordering::Release);
-                self.closed.store(true, Ordering::Release);
+                self.mark_closed(inner);
                 let (kind, cause) = match error {
                     Ok(Err(e)) => (e.kind, e.message),
                     _ => (DbErrorKind::Other, "таймаут 10 с".to_owned()),
@@ -297,13 +383,36 @@ impl SqlSession {
         sql: &str,
         timeout_seconds: u64,
     ) -> Result<QueryResult, DbError> {
-        self.execute_authorized(sql, timeout_seconds, false).await
+        self.execute_sql(sql, timeout_seconds, false, None).await
     }
+    #[cfg(test)]
     pub async fn execute_authorized(
         &self,
         sql: &str,
         timeout_seconds: u64,
         write_approved: bool,
+    ) -> Result<QueryResult, DbError> {
+        self.execute_sql(sql, timeout_seconds, write_approved, None)
+            .await
+    }
+    pub async fn execute_with_recovery(
+        &self,
+        sql: &str,
+        timeout_seconds: u64,
+        write_approved: bool,
+    ) -> (Result<QueryResult, DbError>, bool) {
+        let mut reconnected = false;
+        let result = self
+            .execute_sql(sql, timeout_seconds, write_approved, Some(&mut reconnected))
+            .await;
+        (result, reconnected)
+    }
+    async fn execute_sql(
+        &self,
+        sql: &str,
+        timeout_seconds: u64,
+        write_approved: bool,
+        reconnected: Option<&mut bool>,
     ) -> Result<QueryResult, DbError> {
         let mysql = matches!(self.pool, DbPool::MySql(_));
         let mut inner = self.inner.lock().await;
@@ -329,7 +438,6 @@ impl SqlSession {
         if inner.state.manual && policy.managed_unsafe {
             return Err("В ручном режиме используйте Commit/Rollback на панели. Команды управления транзакциями, сессией и DDL выполняйте отдельно в Auto Commit: MySQL DDL может делать неявный commit.".into());
         }
-        self.connect(&mut inner).await?;
         let guarded_read = self.read_only || (self.production && !write_approved);
         if guarded_read
             && (risk != crate::sql_risk::SqlRisk::ReadOnly
@@ -340,6 +448,13 @@ impl SqlSession {
         }
         if inner.state.pending && inner.state.read_only && !guarded_read {
             return Err("Текущая транзакция доступна только для чтения. Выполните Rollback/Commit и повторите запись в новой транзакции.".into());
+        }
+        self.connect(&mut inner).await?;
+        if let Some(reconnected) = reconnected {
+            *reconnected = self.check_idle_postgres(&mut inner).await?;
+        }
+        if self.closed.load(Ordering::Acquire) || self.cancel_requested.load(Ordering::Acquire) {
+            return Err("Запрос отменён до выполнения SQL".into());
         }
         self.revision.fetch_add(1, Ordering::AcqRel);
         let auto_read = guarded_read && !inner.state.manual;
@@ -432,15 +547,47 @@ impl SqlSession {
                         }
                         Err(_) => {
                             connection_lost = true;
-                            Err(format!(
-                                "{reason}. Ответ сервера не получен, SQL-сессия закрыта. Незавершённая транзакция откатится при закрытии соединения. Сбросьте SQL-сессию через меню; результат уже выполненных команд Auto Commit проверьте отдельно."
-                            )
-                            .into())
+                            if mysql {
+                                Err(format!(
+                                    "{reason}. Ответ сервера не получен, SQL-сессия закрыта. Незавершённая транзакция откатится при закрытии соединения. Сбросьте SQL-сессию через меню; результат уже выполненных команд Auto Commit проверьте отдельно."
+                                )
+                                .into())
+                            } else {
+                                Err(DbError {
+                                    kind: DbErrorKind::Disconnected,
+                                    message: format!("{reason}. Ответ сервера не получен"),
+                                })
+                            }
                         }
                     }
                 }
             }
         };
+        inner.last_activity = Some(Instant::now());
+        if !mysql
+            && result
+                .as_ref()
+                .is_err_and(|error| error.kind == DbErrorKind::Disconnected)
+        {
+            connection_lost = true;
+            let error = result.unwrap_err();
+            let outcome = if execution_started.load(Ordering::Acquire) {
+                "Результат запроса неизвестен."
+            } else {
+                "SQL не отправлен."
+            };
+            let transaction = if pending_before_execution {
+                " Открытая транзакция потеряна."
+            } else {
+                ""
+            };
+            result = Err(DbError {
+                kind: DbErrorKind::Disconnected,
+                message: format!(
+                    "Соединение потеряно: {error}. {outcome}{transaction} Переподключитесь вручную."
+                ),
+            });
+        }
         if auto_read && !connection_lost {
             let rollback = if mysql {
                 "ROLLBACK AND NO CHAIN NO RELEASE"
@@ -458,10 +605,7 @@ impl SqlSession {
         }
         self.cancel_requested.store(false, Ordering::Release);
         if connection_lost {
-            inner.connection.take();
-            inner.state = TransactionState::default();
-            self.pending.store(false, Ordering::Release);
-            self.closed.store(true, Ordering::Release);
+            self.mark_closed(&mut inner);
         }
         if !connection_lost
             && policy.transaction_control
@@ -533,12 +677,14 @@ impl SqlSession {
         if inner.state.manual || inner.state.pending {
             return Err("Правки результата доступны в Auto Commit вне транзакции".into());
         }
-        crate::database::update_table_cells_on(
+        let result = crate::database::update_table_cells_on(
             inner.connection.as_mut().unwrap().query_connection(),
             object,
             edits,
         )
-        .await
+        .await;
+        inner.last_activity = Some(Instant::now());
+        result
     }
     pub async fn delete_row(
         &self,
@@ -559,12 +705,14 @@ impl SqlSession {
         if inner.state.manual || inner.state.pending {
             return Err("Удаление из результата доступно в Auto Commit вне транзакции".into());
         }
-        crate::database::delete_table_row_on(
+        let result = crate::database::delete_table_row_on(
             inner.connection.as_mut().unwrap().query_connection(),
             object,
             keys,
         )
-        .await
+        .await;
+        inner.last_activity = Some(Instant::now());
+        result
     }
     fn check_write(&self, approved: bool) -> Result<(), String> {
         if self.read_only {
@@ -668,6 +816,19 @@ fn statement_policy(sql: &str, mysql: bool) -> Result<Policy, String> {
     let tokens = Tokenizer::new(dialect, sql)
         .tokenize()
         .map_err(|e| e.to_string())?;
+    // Semicolons inside a PostgreSQL SQL-standard routine body can make its
+    // END (or a body statement) look like a top-level transaction command.
+    let significant = tokens
+        .iter()
+        .filter(|token| !matches!(token, Token::Whitespace(_)));
+    let has_atomic_body = !mysql
+        && significant
+            .clone()
+            .zip(significant.skip(1))
+            .any(|(first, second)| {
+                matches!(first, Token::Word(word) if word.keyword == Keyword::BEGIN)
+                    && matches!(second, Token::Word(word) if word.keyword == Keyword::ATOMIC)
+            });
     let mut policy = Policy::default();
     for statement in tokens.split(|t| matches!(t, Token::SemiColon)) {
         let first = statement
@@ -678,6 +839,13 @@ fn statement_policy(sql: &str, mysql: bool) -> Result<Policy, String> {
         }
         if let Some(Token::Word(word)) = first {
             let keyword = word.value.to_ascii_uppercase();
+            let closes_transaction =
+                matches!(keyword.as_str(), "COMMIT" | "END" | "ROLLBACK" | "ABORT");
+            if has_atomic_body && closes_transaction {
+                // Keep any pending transaction until a separate command confirms closure.
+                policy.managed_unsafe = true;
+                continue;
+            }
             let transaction = matches!(
                 keyword.as_str(),
                 "BEGIN"
@@ -706,7 +874,7 @@ fn statement_policy(sql: &str, mysql: bool) -> Result<Policy, String> {
             if matches!(keyword.as_str(), "BEGIN" | "START" | "SAVEPOINT") {
                 policy.final_pending = Some(true);
             }
-            if matches!(keyword.as_str(), "COMMIT" | "END" | "ROLLBACK" | "ABORT") {
+            if closes_transaction {
                 let to_savepoint = keyword == "ROLLBACK" && words.iter().any(|w| w == "TO");
                 let chain = words.windows(2).any(|w| w == ["AND", "CHAIN"]);
                 policy.final_pending = Some(to_savepoint || chain);
@@ -737,6 +905,12 @@ fn statement_policy(sql: &str, mysql: bool) -> Result<Policy, String> {
     if mysql && (sql.contains("/*!") || sql.to_ascii_uppercase().contains("/*M!")) {
         policy.managed_unsafe = true;
         policy.transaction_control = true;
+    }
+    // A session can turn standard_conforming_strings off. An escaped quote in
+    // a batch can move a transaction command across the string boundary.
+    if !mysql && sql.contains("\\'") && sql.trim_end().trim_end_matches(';').contains(';') {
+        policy.transaction_control = true;
+        policy.final_pending = Some(true);
     }
     Ok(policy)
 }
@@ -1056,3 +1230,7 @@ mod integration_tests {
         });
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/postgres_idle_eof.rs"]
+mod postgres_idle_eof;

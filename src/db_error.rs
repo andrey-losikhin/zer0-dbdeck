@@ -66,12 +66,15 @@ pub fn classify(error: &sqlx::Error) -> DbErrorKind {
     }
 }
 
-/// PostgreSQL: 57P01-57P03 (server shutdown), 25P03 (idle-in-transaction timeout kill),
-/// class 08 (connection exception). MySQL: 2006 (server gone away), 2013 (lost connection).
+/// PostgreSQL: 57P01-57P03 (server shutdown), 57P05, 25P03 and 25P04 (session-ending
+/// timeouts), class 08. MySQL: 2006 (server gone away), 2013 (lost connection).
 /// 25P02 (aborted transaction) is deliberately not here: the connection is alive.
 pub fn classify_code(sqlstate: Option<&str>, mysql_number: Option<u16>) -> DbErrorKind {
     let by_state = sqlstate.is_some_and(|state| {
-        matches!(state, "57P01" | "57P02" | "57P03" | "25P03") || state.starts_with("08")
+        matches!(
+            state,
+            "57P01" | "57P02" | "57P03" | "57P05" | "25P03" | "25P04"
+        ) || state.starts_with("08")
     });
     if by_state || matches!(mysql_number, Some(2006 | 2013)) {
         DbErrorKind::Disconnected
@@ -121,7 +124,9 @@ mod tests {
 
     #[test]
     fn disconnect_codes() {
-        for state in ["57P01", "57P02", "57P03", "08006", "08S01", "25P03"] {
+        for state in [
+            "57P01", "57P02", "57P03", "57P05", "08006", "08S01", "25P03", "25P04",
+        ] {
             let kind = classify_code(Some(state), None);
             assert_eq!(kind, DbErrorKind::Disconnected, "{state}");
         }

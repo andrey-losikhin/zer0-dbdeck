@@ -306,9 +306,19 @@ impl std::fmt::Debug for DbPool {
 }
 
 fn pg_pool_options() -> PgPoolOptions {
-    PgPoolOptions::new().max_connections(3).acquire_timeout(Duration::from_secs(8)).after_connect(|connection,_|Box::pin(async move {
-        connection.execute("SET application_name='DBDeck'; SET lock_timeout='5s'; SET idle_in_transaction_session_timeout='300s'").await?;Ok(())
-    }))
+    PgPoolOptions::new()
+        .max_connections(3)
+        .acquire_timeout(Duration::from_secs(8))
+        .after_connect(|connection, _| Box::pin(configure_pg_connection(connection)))
+}
+
+pub(crate) async fn configure_pg_connection(
+    connection: &mut sqlx::PgConnection,
+) -> Result<(), sqlx::Error> {
+    connection
+        .execute("SET application_name='DBDeck'; SET lock_timeout='5s'; SET idle_in_transaction_session_timeout='300s'")
+        .await?;
+    Ok(())
 }
 fn mysql_pool_options() -> MySqlPoolOptions {
     MySqlPoolOptions::new()
@@ -356,13 +366,25 @@ impl DbPool {
                     vec![explicit]
                 };
                 let mut last_error = String::new();
+                let mut retry_available = true;
                 for database in candidates {
-                    match pg_pool_options()
-                        .max_connections(3)
-                        .acquire_timeout(timeout)
-                        .connect_with(options.clone().database(database))
-                        .await
+                    let deadline = tokio::time::Instant::now() + timeout;
+                    let options = options.clone().database(database);
+                    let pool_options = pg_pool_options();
+                    let mut result = pool_options.clone().connect_with(options.clone()).await;
+                    // SQLx returns handshake I/O errors directly. Its after_connect hook
+                    // handles failures internally, so this retry applies to startup only.
+                    if retry_available
+                        && matches!(&result, Err(sqlx::Error::Io(error))
+                            if error.kind() == std::io::ErrorKind::UnexpectedEof)
                     {
+                        retry_available = false;
+                        result =
+                            tokio::time::timeout_at(deadline, pool_options.connect_with(options))
+                                .await
+                                .unwrap_or(Err(sqlx::Error::PoolTimedOut));
+                    }
+                    match result {
                         Ok(pool) => return Ok(Self::PostgreSql(pool)),
                         Err(error) => {
                             let unavailable = matches!(&error, sqlx::Error::Database(error)

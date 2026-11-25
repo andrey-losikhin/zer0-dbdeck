@@ -104,6 +104,7 @@ enum Event {
         Result<database::QueryResult, String>,
         sql_session::TransactionState,
         u128,
+        bool,
     ),
     SqlTransactionFinished(String, Result<sql_session::TransactionState, String>),
     SqlCompletionsLoaded(
@@ -137,6 +138,7 @@ enum ProfileStatus {
 enum RetryAction {
     Sql {
         tab_id: String,
+        dialect: sql_risk::Dialect,
         needed_approval: bool,
         in_transaction: bool,
     },
@@ -154,15 +156,15 @@ impl RetryAction {
     }
 }
 
-/// Only reads are retried: never a statement that needed write approval or ran
-/// inside an open transaction (its COMMIT/ROLLBACK state is unknown).
+/// PostgreSQL editor SQL is never replayed. MySQL keeps its existing retry policy.
 fn retry_allowed(action: &RetryAction) -> bool {
     match action {
         RetryAction::Sql {
+            dialect,
             needed_approval,
             in_transaction,
             ..
-        } => !needed_approval && !in_transaction,
+        } => *dialect == sql_risk::Dialect::MySql && !needed_approval && !in_transaction,
         RetryAction::LoadTable(_) | RetryAction::ExpandNode(_) => true,
     }
 }
@@ -2636,11 +2638,12 @@ fn run_sql_tab_policy(
     let Some((profile, _)) = ui.sessions.borrow().get(&session_key).cloned() else {
         return;
     };
-    let Some((session, state, idle)) = ui.sql_tabs.borrow().get(id).map(|t| {
+    let Some((session, state, idle, dialect)) = ui.sql_tabs.borrow().get(id).map(|t| {
         (
             t.session.clone(),
             t.transaction_state,
             t.run_button.is_sensitive(),
+            t.risk_dialect,
         )
     }) else {
         return;
@@ -2670,6 +2673,7 @@ fn run_sql_tab_policy(
         &session_key,
         (!explain).then(|| RetryAction::Sql {
             tab_id: id.to_owned(),
+            dialect,
             needed_approval: needs_approval,
             in_transaction: state.pending,
         }),
@@ -2677,7 +2681,7 @@ fn run_sql_tab_policy(
         if let Some(tab) = ui.sql_tabs.borrow_mut().get_mut(id) {
             tab.executed_sql = (!explain).then_some(sql);
             tab.status
-                .set_text("Соединение потеряно. Переподключитесь и повторите запрос.");
+                .set_text("Соединение потеряно. Переподключитесь.");
         }
         return;
     }
@@ -2792,14 +2796,12 @@ fn run_sql_tab_policy(
     runtime.spawn(async move {
         let _guard = guard;
         let started = std::time::Instant::now();
-        let result = if let Some(plan) = plan {
+        let (result, reconnected) = if let Some(plan) = plan {
             let result = session.execute_with_timeout(plan.sql(), timeout).await;
             session.close().await;
-            result
-        } else if approved {
-            session.execute_authorized(&sql, timeout, true).await
+            (result, false)
         } else {
-            session.execute_with_timeout(&sql, timeout).await
+            session.execute_with_recovery(&sql, timeout, approved).await
         };
         let result = report_lost(session.pool(), &sender, &session_key, result).await;
         let state = if explain {
@@ -2813,6 +2815,7 @@ fn run_sql_tab_policy(
             result,
             state,
             started.elapsed().as_millis(),
+            reconnected,
         ));
     });
 }
@@ -6471,6 +6474,7 @@ fn replace_tab_session(ui: &Rc<Ui>, id: &str) {
                 &tab.profile_id,
                 RetryAction::Sql {
                     tab_id: id.to_owned(),
+                    dialect: tab.risk_dialect,
                     needed_approval: tab.sent_needing_approval,
                     in_transaction: had_transaction,
                 },
@@ -6478,7 +6482,13 @@ fn replace_tab_session(ui: &Rc<Ui>, id: &str) {
         }
     }
     update_transaction_controls(tab, sql_session::TransactionState::default());
-    if had_transaction {
+    if was_running && matches!(profile.kind, DatabaseKind::PostgreSql) {
+        tab.status.set_text(if had_transaction {
+            "Транзакция потеряна. Результат запроса неизвестен."
+        } else {
+            "Соединение потеряно. Результат запроса неизвестен."
+        });
+    } else if had_transaction {
         tab.status.set_text("Транзакция потеряна");
     } else if was_running {
         tab.status.set_text("Запрос прерван: соединение потеряно");
@@ -6560,6 +6570,10 @@ fn spawn_idle_check(ui: &Rc<Ui>, key: &str, session_key: &str) {
     let session = key
         .strip_prefix("sql::")
         .and_then(|id| ui.sql_tabs.borrow().get(id).map(|tab| tab.session.clone()));
+    if session.is_some() && matches!(pool, DbPool::PostgreSql(_)) {
+        // The next SQL execution checks the detached connection under its session lock.
+        return;
+    }
     let sender = ui.sender.clone();
     let session_key = session_key.to_owned();
     // Deliberately no activity guard: the background check stays invisible.
@@ -7174,7 +7188,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                 );
             }
         }
-        Event::SqlQueryFinished(id, request_id, result, state, elapsed_ms) => {
+        Event::SqlQueryFinished(id, request_id, result, state, elapsed_ms, reconnected) => {
             ui.background_tasks
                 .finish(&request_id, Outcome::for_result(&result));
             let Some(mut tab) = ui.sql_tabs.borrow_mut().remove(&id) else {
@@ -7254,6 +7268,11 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                             "empty"
                         });
                     let summary = format!("{} · {elapsed_ms} мс", query_result_summary(&result));
+                    let summary = if reconnected {
+                        format!("Открыта новая SQL-сессия · {summary}")
+                    } else {
+                        summary
+                    };
                     tab.status.set_text(&if explain {
                         format!("Оценочный план (EXPLAIN) · {summary}")
                     } else if !result.data.columns.is_empty() && !editable {
@@ -7268,7 +7287,12 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     });
                     tab.error_message.set_text("");
                     tab.error_message.set_visible(false);
-                    let line = "Готово".to_owned();
+                    let line = if reconnected {
+                        "Открыта новая SQL-сессия"
+                    } else {
+                        "Готово"
+                    }
+                    .to_owned();
                     tab.result = Some(result.data);
                     if is_active {
                         ui.status.set_text(&line);
@@ -7282,6 +7306,7 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                             &tab.session_key,
                             RetryAction::Sql {
                                 tab_id: id.clone(),
+                                dialect: tab.risk_dialect,
                                 needed_approval: tab.sent_needing_approval,
                                 in_transaction: state.pending,
                             },
@@ -7289,8 +7314,12 @@ fn handle_event(ui: &Rc<Ui>, event: Event) {
                     }
                     tab.tabulator.set_locked(false);
                     tab.status.set_text("Запрос завершился с ошибкой");
-                    tab.error_message
-                        .set_text(&format!("Ошибка запроса: {error}"));
+                    let error = if reconnected {
+                        format!("Открыта новая SQL-сессия. Ошибка запроса: {error}")
+                    } else {
+                        format!("Ошибка запроса: {error}")
+                    };
+                    tab.error_message.set_text(&error);
                     tab.error_message.set_visible(true);
                     tab.last_status = None;
                     if is_active {
@@ -10153,6 +10182,7 @@ mod reconnect_tests {
     fn sql(needed_approval: bool, in_transaction: bool) -> RetryAction {
         RetryAction::Sql {
             tab_id: "tab".to_owned(),
+            dialect: sql_risk::Dialect::MySql,
             needed_approval,
             in_transaction,
         }
@@ -10161,6 +10191,16 @@ mod reconnect_tests {
     #[test]
     fn plain_read_sql_can_be_retried() {
         assert!(retry_allowed(&sql(false, false)));
+    }
+
+    #[test]
+    fn postgres_sql_stays_out_of_reconnect_retries() {
+        assert!(!retry_allowed(&RetryAction::Sql {
+            tab_id: "tab".to_owned(),
+            dialect: sql_risk::Dialect::PostgreSql,
+            needed_approval: false,
+            in_transaction: false,
+        }));
     }
 
     #[test]
