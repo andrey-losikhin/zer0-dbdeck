@@ -92,6 +92,9 @@ fn command(
 }
 
 fn client_program(profile: &ConnectionProfile, name: &str) -> Result<PathBuf, String> {
+    if !profile.transport.is_direct() {
+        return Err("Резервное копирование и восстановление внешними утилитами доступны только для прямых подключений".into());
+    }
     match &profile.native_tools_dir {
         Some(directory) if directory.is_absolute() && directory.is_dir() => {
             Ok(directory.join(name))

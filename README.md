@@ -143,9 +143,24 @@ transport; it defaults the profile to viewing and requires confirmation for writ
 Read-only SQL and table browsing run in server READ ONLY transactions. Known
 state-changing calls are rejected in read-only mode. These controls supplement
 server permissions: they do not sandbox arbitrary stored functions, prevent
-expensive queries, or replace a restricted database role. Use verified TLS or an
-appropriately secured external tunnel for untrusted networks. Built-in SSH tunneling
-is not implemented.
+expensive queries, or replace a restricted database role. Use verified TLS on
+untrusted networks, including when the SSH gateway or proxy forwards to another host.
+
+### SSH and proxies
+
+Expand **SSH and proxies** in the connection form. Keep the database host and port
+as seen from the gateway or proxy and enter the gateway address in the route
+settings. DBDeck supports direct connections, SSH, SOCKS5 and HTTP CONNECT.
+SOCKS5 and HTTP CONNECT use unauthenticated proxies on trusted networks.
+
+SSH requires OpenSSH (`openssh` on Arch/CachyOS). It uses public-key authentication
+with a local key or `ssh-agent`. Verify the gateway's host key before adding it to
+`known_hosts`. You can select a different user known-hosts file in the form.
+DBDeck uses the explicit gateway settings and skips `ssh_config`.
+
+TLS verification still uses the database hostname from the profile. Browsing,
+SQL and CSV operations follow the selected route. Native backup and restore
+with external database tools require a direct profile.
 
 Production confirmations are bound to the operation and SQL-session revision.
 A lost commit acknowledgement is not retried automatically. Check the server

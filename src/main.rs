@@ -8,6 +8,8 @@ mod csv_input;
 use csv::{write_csv_header, write_csv_row};
 mod backup_ui;
 mod connection_tls_ui;
+mod connection_transport;
+mod connection_transport_ui;
 mod database;
 mod database_structure;
 mod database_target_ui;
@@ -3770,6 +3772,20 @@ fn choose_sql_csv_export(ui: &Rc<Ui>, id: &str) {
 }
 
 fn profile_session_key(profile: &ConnectionProfile) -> String {
+    if !profile.transport.is_direct() {
+        return serde_json::to_string(&(
+            &profile.id,
+            profile.kind,
+            &profile.host,
+            profile.port,
+            &profile.database,
+            &profile.username,
+            profile.tls_mode,
+            &profile.tls_files,
+            &profile.transport,
+        ))
+        .expect("connection identity");
+    }
     if !profile.tls_files.is_empty() {
         return serde_json::to_string(&(
             &profile.id,
@@ -5268,6 +5284,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
     grid.attach(&color_row, 1, 10, 1, 1);
     grid.attach(&read_only, 0, 11, 2, 1);
     let tls_files = connection_tls_ui::Fields::new(&grid, 12);
+    let transport = connection_transport_ui::Fields::new(&grid, 14);
     content.append(&grid);
     let password_note = gtk::Label::new(Some(if existing.is_some() {
         "Оставьте пароль пустым, чтобы сохранить текущий. Новый пароль будет зашифрован в локальном хранилище."
@@ -5366,6 +5383,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
         read_only.set_active(profile.read_only);
         tls_files.load(&profile.tls_files);
         tls_files.load_tools(profile.native_tools_dir.as_deref());
+        transport.load(&profile.transport);
         let selected_color = connection_colors()
             .iter()
             .position(|(_, hex)| *hex == profile.color)
@@ -5385,6 +5403,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
     let environment_test = environment.clone();
     let tls_mode_test = tls_mode.clone();
     let tls_files_test = tls_files.clone();
+    let transport_test = transport.clone();
     let color_test = color_selection.clone();
     let read_only_test = read_only.clone();
     let password_test = password.clone();
@@ -5403,6 +5422,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
             &environment_test,
             &tls_mode_test,
             &tls_files_test,
+            transport_test.values(),
             color_test.get(),
             &read_only_test,
         ) {
@@ -5461,6 +5481,7 @@ fn show_connection_form(ui: &Rc<Ui>, existing: Option<ConnectionProfile>) {
             &environment,
             &tls_mode,
             &tls_files,
+            transport.values(),
             color_selection.get(),
             &read_only,
         ) {
@@ -5545,6 +5566,7 @@ fn profile_from_form(
     environment: &gtk::DropDown,
     tls_mode: &gtk::DropDown,
     tls_files: &connection_tls_ui::Fields,
+    transport: settings::Transport,
     color_index: usize,
     read_only: &gtk::CheckButton,
 ) -> Result<ConnectionProfile, String> {
@@ -5587,6 +5609,7 @@ fn profile_from_form(
         gopass_entry: None,
         tls_files: tls_files.values(),
         native_tools_dir: tls_files.tools_dir(),
+        transport,
     };
     profile.validate_transport()?;
     Ok(profile)

@@ -84,6 +84,35 @@ transaction. The test closes the SQL tab's connection through a loopback proxy.
 G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbdeck application_postgres_idle_recovery_messages -- --ignored --test-threads=1
 ```
 
+### SSH and proxy routes
+
+The standard test suite checks SOCKS5 and HTTP CONNECT handshakes, refusal of
+authenticated proxies, and private relay cleanup. With the three local fixture
+databases running and their passwords exported, check live queries through both
+proxy types and a new connection from a derived database pool:
+
+```sh
+cargo test --locked --test database_integration transport_proxy_routes_reach_database_and_keep_derived_pool_connected -- --ignored --exact
+```
+
+The SSH test expects a disposable loopback SSH server with public-key login and
+TCP forwarding, and a PostgreSQL fixture with a certificate for `localhost`
+without an IP SAN. Supply the SSH port, username, private key, trusted and
+untrusted host-key files as `DBDECK_TEST_SSH_PORT`, `DBDECK_TEST_SSH_USER`,
+`DBDECK_TEST_SSH_KEY`, `DBDECK_TEST_SSH_HOSTS`, and
+`DBDECK_TEST_SSH_UNTRUSTED_HOSTS`. Set `DBDECK_TEST_SSH_PG_PORT`,
+`DBDECK_TEST_SSH_PG_CA` and `DBDECK_PG_PASSWORD` for PostgreSQL.
+
+```sh
+cargo test --locked --test database_integration transport_ssh_verifies_gateway_and_database_tls -- --ignored --exact
+```
+
+The GTK check round-trips the route fields and checks the initial direct mode:
+
+```sh
+G_DEBUG=fatal-criticals tests/run-headless.sh cargo test --locked --bin zer0-dbdeck transport_form_round_trips_profiles -- --ignored --test-threads=1
+```
+
 ## Production-policy and streaming checks
 
 With fixture credentials exported:

@@ -18,6 +18,7 @@ Notable user-facing changes are recorded here. The project uses
 - SQL completion from catalog metadata, local SQL formatting and estimated query
   plans for PostgreSQL, MySQL and MariaDB.
 - Related rows by foreign key, table structure comparison and Markdown reports.
+- SSH, SOCKS5 and HTTP CONNECT routes for PostgreSQL and MySQL/MariaDB profiles.
 
 ### Changed
 

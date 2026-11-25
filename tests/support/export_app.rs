@@ -112,6 +112,7 @@ fn full_sql_csv_streams_and_preserves_destination() {
                 gopass_entry: None,
                 tls_files: Default::default(),
                 native_tools_dir: None,
+                transport: Default::default(),
             };
             let password = std::env::var(password_key).unwrap();
             let pool = DbPool::connect(&profile, &password).await.unwrap();
@@ -222,6 +223,7 @@ fn native_schema_and_full_backups_postgres_mariadb_mysql() {
             gopass_entry: None,
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         };
         let password = std::env::var(key).unwrap();
         let _ = runtime
@@ -403,6 +405,7 @@ fn sql_save_csv_and_backup_ui_handlers() {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     let pool = runtime
         .block_on(DbPool::connect(&profile, &password))
@@ -870,6 +873,7 @@ fn mysql_mariadb_import_temp_sql_and_error() {
             gopass_entry: None,
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         };
         let secret = std::env::var(variable).unwrap();
         let path = std::env::temp_dir().join(format!("dbdeck-temp-import-{}.sql", Uuid::new_v4()));

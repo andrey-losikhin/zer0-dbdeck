@@ -363,6 +363,7 @@ impl Cli {
             gopass_entry: Some(entry.to_owned()),
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         })
     }
 }

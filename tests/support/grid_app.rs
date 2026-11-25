@@ -718,6 +718,7 @@ fn run_application_grid_scenarios(scenario: GridScenario) {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     let session_key = profile_session_key(&profile);
     let group_key = workspace_ui::key(&profile, Some(&object.schema));
@@ -1915,6 +1916,7 @@ fn workspace_controls_layout_and_risk() {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     for (existing, title, screenshot) in [
         (None, "Новое подключение", "target/connection-new.png"),
@@ -2189,6 +2191,7 @@ fn sql_result_staging_and_delete() {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     let session = profile_session_key(&profile);
     ui.sessions.borrow_mut().insert(
@@ -2895,6 +2898,7 @@ fn sql_editor_assistance_and_connected_icon() {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     ui.store
         .borrow_mut()
@@ -3656,6 +3660,7 @@ fn postgres_server_browser_navigation_and_icons() {
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     };
     let pool = runtime
         .block_on(DbPool::connect(

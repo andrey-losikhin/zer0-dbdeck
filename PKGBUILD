@@ -13,6 +13,7 @@ makedepends=('pkgconf' 'rust')
 # GCC LTO objects from ring cannot be linked by Rust's LLVM linker.
 options=('!lto')
 optdepends=('libsecret: desktop keyring auto-unlock (requires a Secret Service provider)'
+            'openssh: SSH tunnel connections'
             'gopass: password store integration and auto-unlock'
             'postgresql-libs: PostgreSQL backup and restore tools'
             'mariadb-clients: MariaDB backup and restore tools')

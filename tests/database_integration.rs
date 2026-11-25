@@ -10,6 +10,8 @@ mod csv_input;
 mod transfer;
 use csv::{write_csv_header, write_csv_row};
 
+#[path = "../src/connection_transport.rs"]
+mod connection_transport;
 #[path = "../src/database.rs"]
 mod database;
 #[path = "../src/database_structure.rs"]
@@ -152,6 +154,7 @@ fn run_case(id: &str, kind: DatabaseKind, port: u16, password_key: &str) {
             tls_mode: TlsMode::Disabled,
             password_saved: false,
         gopass_entry: None, tls_files: Default::default(), native_tools_dir: None,
+        transport: Default::default(),
         };
         let password =
             std::env::var(password_key).unwrap_or_else(|_| panic!("set {password_key} from .env"));
@@ -668,6 +671,7 @@ fn inspect_structure_postgres_mariadb_mysql() {
                 gopass_entry: None,
                 tls_files: Default::default(),
                 native_tools_dir: None,
+                transport: Default::default(),
             };
             let pool = DbPool::connect(
                 &profile,
@@ -769,6 +773,7 @@ fn compare_table_structure_across_connections() {
                 gopass_entry: None,
                 tls_files: Default::default(),
                 native_tools_dir: None,
+                transport: Default::default(),
             };
             let postgres = matches!(kind, DatabaseKind::PostgreSql);
             let target_profile = ConnectionProfile {
@@ -924,6 +929,7 @@ fn multiple_namespaces_and_unformatted_sql() {
                 username: "dbdeck_test".into(), environment: EnvironmentTag::Local,
                 color: "#4f8fe8".into(), read_only: true, tls_mode: TlsMode::Disabled,
                 password_saved: false, gopass_entry: None, tls_files: Default::default(), native_tools_dir: None,
+                transport: Default::default(),
             };
             let pool = DbPool::connect(&profile, &std::env::var(key).unwrap()).await.unwrap();
             assert_eq!(pool.server_icon().await.unwrap(), match port { 55432 => "postgresql", 53306 => "mariadb", _ => "mysql" });
@@ -1001,6 +1007,7 @@ fn postgres_blank_database_lists_databases_and_opens_schemas() {
             gopass_entry: None,
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         };
         let password = std::env::var("DBDECK_PG_PASSWORD").unwrap();
         let root = DbPool::connect(&profile, &password).await.unwrap();
@@ -1060,6 +1067,7 @@ fn system_catalog_profile(kind: DatabaseKind, port: u16, database: &str) -> Conn
         gopass_entry: None,
         tls_files: Default::default(),
         native_tools_dir: None,
+        transport: Default::default(),
     }
 }
 
@@ -1338,6 +1346,7 @@ fn related_rows_follow_composite_foreign_keys() {
                 gopass_entry: None,
                 tls_files: Default::default(),
                 native_tools_dir: None,
+                transport: Default::default(),
             };
             let pool = match (engine, std::env::var_os("DBDECK_PG_TEST_SOCKET")) {
                 ("postgres", Some(socket)) => DbPool::PostgreSql(
@@ -1581,4 +1590,164 @@ async fn check_partition_related_rows(pool: &DbPool) {
     }
     relation_fixture_sql(pool, &format!("DROP TABLE public.{child}")).await;
     relation_fixture_sql(pool, &format!("DROP TABLE public.{parent}")).await;
+}
+
+#[test]
+#[ignore = "requires the three local Compose database fixtures"]
+fn transport_proxy_routes_reach_database_and_keep_derived_pool_connected() {
+    use settings::Transport;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::task::JoinSet;
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for (kind, target_port, password_key) in [
+                (DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD"),
+                (DatabaseKind::MariaDb, 53306, "DBDECK_MARIADB_PASSWORD"),
+                (DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD"),
+            ] {
+                let password = std::env::var(password_key).unwrap();
+                for socks in [true, false] {
+                    let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+                    let gateway_port = listener.local_addr().unwrap().port();
+                    let proxy = tokio::spawn(async move {
+                        let mut sessions = JoinSet::new();
+                        while let Ok((mut client, _)) = listener.accept().await {
+                            while sessions.try_join_next().is_some() {}
+                            sessions.spawn(async move {
+                                let target = format!("dbdeck-fixture.invalid:{target_port}");
+                                let mut server = TcpStream::connect(("127.0.0.1", target_port))
+                                    .await
+                                    .unwrap();
+                                if socks {
+                                    let mut greeting = [0; 3];
+                                    client.read_exact(&mut greeting).await.unwrap();
+                                    assert_eq!(greeting, [5, 1, 0]);
+                                    client.write_all(&[5, 0]).await.unwrap();
+                                    let mut command = [0; 5];
+                                    client.read_exact(&mut command).await.unwrap();
+                                    assert_eq!(command, [5, 1, 0, 3, 22]);
+                                    let mut host = [0; 22];
+                                    client.read_exact(&mut host).await.unwrap();
+                                    assert_eq!(&host, b"dbdeck-fixture.invalid");
+                                    assert_eq!(client.read_u16().await.unwrap(), target_port);
+                                    client
+                                        .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                                        .await
+                                        .unwrap();
+                                } else {
+                                    let expected = format!(
+                                        "CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n\r\n"
+                                    );
+                                    let mut request = vec![0; expected.len()];
+                                    client.read_exact(&mut request).await.unwrap();
+                                    assert_eq!(request, expected.as_bytes());
+                                    client
+                                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                                        .await
+                                        .unwrap();
+                                }
+                                let _ =
+                                    tokio::io::copy_bidirectional(&mut client, &mut server).await;
+                            });
+                        }
+                    });
+                    let host = "127.0.0.1".to_owned();
+                    let mut profile = system_catalog_profile(kind, target_port, "dbdeck_test");
+                    profile.host = "dbdeck-fixture.invalid".into();
+                    profile.transport = if socks {
+                        Transport::Socks5 {
+                            host,
+                            port: gateway_port,
+                        }
+                    } else {
+                        Transport::HttpConnect {
+                            host,
+                            port: gateway_port,
+                        }
+                    };
+                    let pool = DbPool::connect(&profile, &password).await.unwrap();
+                    pool.check().await.unwrap();
+                    let derived = pool.connect_database("dbdeck_test").await.unwrap();
+                    drop(pool);
+                    use sqlx::Connection;
+                    match derived {
+                        DbPool::PostgreSql(pool) => {
+                            let mut connection =
+                                sqlx::PgConnection::connect_with(&pool.connect_options())
+                                    .await
+                                    .unwrap();
+                            sqlx::query("SELECT 1")
+                                .execute(&mut connection)
+                                .await
+                                .unwrap();
+                        }
+                        DbPool::MySql(pool) => {
+                            let mut connection =
+                                sqlx::MySqlConnection::connect_with(&pool.connect_options())
+                                    .await
+                                    .unwrap();
+                            sqlx::query("SELECT 1")
+                                .execute(&mut connection)
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    proxy.abort();
+                    let _ = proxy.await;
+                }
+            }
+        });
+}
+
+#[test]
+#[ignore = "requires an isolated SSH gateway and TLS PostgreSQL; see docs/TESTING.md"]
+fn transport_ssh_verifies_gateway_and_database_tls() {
+    use settings::Transport;
+
+    let required =
+        |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    let mut profile = system_catalog_profile(
+        DatabaseKind::PostgreSql,
+        required("DBDECK_TEST_SSH_PG_PORT").parse().unwrap(),
+        "dbdeck_test",
+    );
+    profile.host = "localhost".into();
+    profile.tls_mode = TlsMode::VerifyFull;
+    profile.tls_files.ca = Some(required("DBDECK_TEST_SSH_PG_CA").into());
+    profile.transport = Transport::Ssh {
+        host: "127.0.0.1".into(),
+        port: required("DBDECK_TEST_SSH_PORT").parse().unwrap(),
+        username: required("DBDECK_TEST_SSH_USER"),
+        identity_file: Some(required("DBDECK_TEST_SSH_KEY").into()),
+        known_hosts: Some(required("DBDECK_TEST_SSH_HOSTS").into()),
+    };
+    let password = required("DBDECK_PG_PASSWORD");
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let pool = DbPool::connect(&profile, &password).await.unwrap();
+            pool.check().await.unwrap();
+
+            let mut wrong_db_name = profile.clone();
+            wrong_db_name.host = "127.0.0.1".into();
+            let error = DbPool::connect(&wrong_db_name, &password)
+                .await
+                .unwrap_err();
+            assert!(error.contains("certificate not valid for name"), "{error}");
+
+            let Transport::Ssh { known_hosts, .. } = &mut profile.transport else {
+                unreachable!();
+            };
+            *known_hosts = Some(required("DBDECK_TEST_SSH_UNTRUSTED_HOSTS").into());
+            let error = DbPool::connect(&profile, &password).await.unwrap_err();
+            assert!(error.contains("known_hosts"), "{error}");
+        });
 }

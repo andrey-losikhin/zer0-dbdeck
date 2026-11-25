@@ -21,6 +21,7 @@ Rust bridge; Rust controls database access, clipboard data and staged writes.
 | Footer task list and in-memory outcomes | `src/background_tasks.rs` |
 | Single tab strip in the header bar and connection block of the status bar | `src/tab_strip.rs` |
 | Database adapters, browsing, edits, export | `src/database.rs` |
+| SSH, SOCKS5 and HTTP CONNECT | `src/connection_transport.rs`, `src/connection_transport_ui.rs` |
 | Dedicated SQL connection and transactions | `src/sql_session.rs` |
 | SQL risk classification and source-table detection | `src/sql_risk.rs`, `src/query_edit.rs` |
 | SQL editor and completion | `src/sql_editor.rs` |
@@ -78,7 +79,10 @@ WCAG AA contrast are lightened. The SQL scheme is generated into a cache.
 SQLx provides separate PostgreSQL/MySQL adapters. Connection profiles distinguish
 MySQL and MariaDB for native tooling and user-facing behavior. Each SQL tab owns
 its connection; session settings and temporary tables are not shared with other
-tabs. Connection pools serve catalog/table operations.
+tabs. Connection pools serve catalog/table operations. Routed profiles use a
+private Unix relay socket. SQLx keeps the database hostname for TLS verification.
+Cloned pool options retain the relay for per-database pools; dropping the last
+owner closes the listener and its forwarding tasks.
 
 Read-only SQL and table SELECTs run in READ ONLY transactions with explicit
 rollback. Writes from the grid validate metadata/keys and check the original

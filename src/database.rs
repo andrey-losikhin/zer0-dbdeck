@@ -1,3 +1,5 @@
+use crate::connection_transport::Relay;
+use std::sync::Arc;
 #[path = "csv_import.rs"]
 mod csv_import;
 #[path = "query_edit.rs"]
@@ -305,11 +307,17 @@ impl std::fmt::Debug for DbPool {
     }
 }
 
-fn pg_pool_options() -> PgPoolOptions {
+fn pg_pool_options(relay: Option<Arc<Relay>>) -> PgPoolOptions {
     PgPoolOptions::new()
         .max_connections(3)
         .acquire_timeout(Duration::from_secs(8))
-        .after_connect(|connection, _| Box::pin(configure_pg_connection(connection)))
+        .after_connect(move |connection, _| {
+            let relay = relay.clone();
+            Box::pin(async move {
+                let _relay = relay;
+                configure_pg_connection(connection).await
+            })
+        })
 }
 
 pub(crate) async fn configure_pg_connection(
@@ -320,12 +328,14 @@ pub(crate) async fn configure_pg_connection(
         .await?;
     Ok(())
 }
-fn mysql_pool_options() -> MySqlPoolOptions {
+fn mysql_pool_options(relay: Option<Arc<Relay>>) -> MySqlPoolOptions {
     MySqlPoolOptions::new()
         .max_connections(3)
         .acquire_timeout(Duration::from_secs(8))
-        .after_connect(|connection, _| {
+        .after_connect(move |connection, _| {
+            let relay = relay.clone();
             Box::pin(async move {
+                let _relay = relay;
                 connection
                     .execute("SET SESSION lock_wait_timeout=5, innodb_lock_wait_timeout=5")
                     .await?;
@@ -337,6 +347,17 @@ fn mysql_pool_options() -> MySqlPoolOptions {
 impl DbPool {
     pub async fn connect(profile: &ConnectionProfile, password: &str) -> Result<Self, String> {
         profile.validate_transport()?;
+        let relay = Relay::start(profile)?;
+        let transport_error = |error: &sqlx::Error| {
+            if matches!(
+                error,
+                sqlx::Error::Io(_) | sqlx::Error::Protocol(_) | sqlx::Error::PoolTimedOut
+            ) && let Some(message) = relay.as_ref().and_then(|relay| relay.take_diagnostic())
+            {
+                return message;
+            }
+            format_database_error(&error.to_string())
+        };
         let timeout = Duration::from_secs(8);
         match profile.kind {
             DatabaseKind::PostgreSql => {
@@ -350,6 +371,9 @@ impl DbPool {
                         TlsMode::Require => sqlx::postgres::PgSslMode::Require,
                         TlsMode::VerifyFull => sqlx::postgres::PgSslMode::VerifyFull,
                     });
+                if let Some(relay) = &relay {
+                    options = options.socket(relay.socket_path(profile.kind));
+                }
                 if let Some(path) = &profile.tls_files.ca {
                     options = options.ssl_root_cert(path);
                 }
@@ -370,7 +394,7 @@ impl DbPool {
                 for database in candidates {
                     let deadline = tokio::time::Instant::now() + timeout;
                     let options = options.clone().database(database);
-                    let pool_options = pg_pool_options();
+                    let pool_options = pg_pool_options(relay.clone());
                     let mut result = pool_options.clone().connect_with(options.clone()).await;
                     // SQLx returns handshake I/O errors directly. Its after_connect hook
                     // handles failures internally, so this retry applies to startup only.
@@ -379,6 +403,9 @@ impl DbPool {
                             if error.kind() == std::io::ErrorKind::UnexpectedEof)
                     {
                         retry_available = false;
+                        if let Some(relay) = &relay {
+                            let _ = relay.take_diagnostic();
+                        }
                         result =
                             tokio::time::timeout_at(deadline, pool_options.connect_with(options))
                                 .await
@@ -389,7 +416,7 @@ impl DbPool {
                         Err(error) => {
                             let unavailable = matches!(&error, sqlx::Error::Database(error)
                                 if matches!(error.code().as_deref(), Some("3D000" | "42501")));
-                            last_error = format_database_error(&error.to_string());
+                            last_error = transport_error(&error);
                             if !explicit.is_empty() || !unavailable {
                                 return Err(last_error);
                             }
@@ -411,6 +438,9 @@ impl DbPool {
                         TlsMode::Require => sqlx::mysql::MySqlSslMode::Required,
                         TlsMode::VerifyFull => sqlx::mysql::MySqlSslMode::VerifyIdentity,
                     });
+                if let Some(relay) = &relay {
+                    options = options.socket(relay.socket_path(profile.kind));
+                }
                 if let Some(path) = &profile.tls_files.ca {
                     options = options.ssl_ca(path);
                 }
@@ -423,13 +453,13 @@ impl DbPool {
                 if !profile.database.trim().is_empty() {
                     options = options.database(profile.database.trim());
                 }
-                mysql_pool_options()
+                mysql_pool_options(relay.clone())
                     .max_connections(3)
                     .acquire_timeout(timeout)
                     .connect_with(options)
                     .await
                     .map(Self::MySql)
-                    .map_err(|error| format_database_error(&error.to_string()))
+                    .map_err(|error| transport_error(&error))
             }
         }
     }
@@ -496,17 +526,18 @@ impl DbPool {
     }
 
     /// A separate pool preserves the current database and all existing SQL sessions.
+    /// Cloning its options also retains the relay captured by the connection hook.
     pub async fn connect_database(&self, database: &str) -> Result<Self, String> {
         match self {
-            Self::PostgreSql(pool) => pg_pool_options()
-                .max_connections(3)
-                .acquire_timeout(Duration::from_secs(8))
+            Self::PostgreSql(pool) => pool
+                .options()
+                .clone()
                 .connect_with((*pool.connect_options()).clone().database(database))
                 .await
                 .map(Self::PostgreSql),
-            Self::MySql(pool) => mysql_pool_options()
-                .max_connections(3)
-                .acquire_timeout(Duration::from_secs(8))
+            Self::MySql(pool) => pool
+                .options()
+                .clone()
                 .connect_with((*pool.connect_options()).clone().database(database))
                 .await
                 .map(Self::MySql),

@@ -97,6 +97,93 @@ impl TlsFiles {
         self == &Self::default()
     }
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Transport {
+    #[default]
+    Direct,
+    Ssh {
+        host: String,
+        port: u16,
+        username: String,
+        identity_file: Option<PathBuf>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        known_hosts: Option<PathBuf>,
+    },
+    Socks5 {
+        host: String,
+        port: u16,
+    },
+    HttpConnect {
+        host: String,
+        port: u16,
+    },
+}
+
+impl Transport {
+    pub fn is_direct(&self) -> bool {
+        matches!(self, Self::Direct)
+    }
+
+    fn validate(&self, target: &str, target_port: u16) -> Result<(), String> {
+        let (host, port) = match self {
+            Self::Direct => return Ok(()),
+            Self::Socks5 { host, port } | Self::HttpConnect { host, port } => (host, port),
+            Self::Ssh {
+                host,
+                port,
+                username,
+                identity_file,
+                known_hosts,
+            } => {
+                if username.is_empty()
+                    || !username.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.')
+                    })
+                {
+                    return Err("Укажите корректное имя пользователя SSH".into());
+                }
+                if let Some(path) = identity_file
+                    && (!path.is_absolute() || !path.is_file())
+                {
+                    return Err("Укажите абсолютный путь к существующему ключу SSH".into());
+                }
+                if let Some(path) = known_hosts {
+                    if !path.is_absolute() || !path.is_file() {
+                        return Err(
+                            "Укажите абсолютный путь к существующему файлу known_hosts".into()
+                        );
+                    }
+                    // OpenSSH splits option values and expands path tokens.
+                    if path.to_string_lossy().contains(|c: char| {
+                        c.is_whitespace() || matches!(c, '$' | '%' | '"' | '\'' | '\\')
+                    }) {
+                        return Err("Для файла known_hosts используйте путь без пробелов и управляющих символов OpenSSH".into());
+                    }
+                }
+                (host, port)
+            }
+        };
+        if !valid_route_host(host) || *port == 0 {
+            return Err("Укажите хост и порт SSH-сервера или прокси".into());
+        }
+        if !valid_route_host(target) || target_port == 0 {
+            return Err("Укажите корректный хост и порт базы данных для туннеля".into());
+        }
+        Ok(())
+    }
+}
+
+fn valid_route_host(host: &str) -> bool {
+    host.parse::<std::net::IpAddr>().is_ok()
+        || (!host.is_empty()
+            && host.len() <= 253
+            && !host.starts_with(['-', '.'])
+            && host
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_')))
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionProfile {
     pub id: String,
@@ -119,6 +206,8 @@ pub struct ConnectionProfile {
     pub tls_files: TlsFiles,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub native_tools_dir: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Transport::is_direct")]
+    pub transport: Transport,
 }
 
 fn legacy_profile_may_have_password() -> bool {
@@ -127,6 +216,7 @@ fn legacy_profile_may_have_password() -> bool {
 
 impl ConnectionProfile {
     pub fn validate_transport(&self) -> Result<(), String> {
+        self.transport.validate(&self.host, self.port)?;
         if self.tls_files.client_cert.is_some() != self.tls_files.client_key.is_some() {
             return Err("Укажите вместе клиентский TLS-сертификат и закрытый ключ".into());
         }
@@ -1071,7 +1161,7 @@ mod tests {
 
     use super::{
         ConnectionProfile, CredentialVault, DatabaseKind, EnvironmentTag, SettingsStore, TlsMode,
-        decrypt, derive_key, encrypt,
+        Transport, decrypt, derive_key, encrypt,
     };
 
     fn test_dir() -> PathBuf {
@@ -1211,6 +1301,7 @@ mod tests {
             gopass_entry: None,
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         };
         source.save_profile(profile, "db-password").unwrap();
         let backup = root.join("dbdeck-backup.json");
@@ -1253,6 +1344,30 @@ mod tests {
         assert_eq!(restored.password("profile-1").unwrap(), "db-password");
         let _ = fs::remove_dir_all(root);
     }
+    #[test]
+    fn transport_defaults_to_direct_and_round_trips() {
+        let mut profile = profile("transport");
+        let json = serde_json::to_value(&profile).unwrap();
+        assert!(json.get("transport").is_none());
+        let old: ConnectionProfile = serde_json::from_value(json).unwrap();
+        assert_eq!(old.transport, Transport::Direct);
+
+        profile.transport = Transport::Ssh {
+            host: "gateway.example".into(),
+            port: 22,
+            username: "alice".into(),
+            identity_file: None,
+            known_hosts: None,
+        };
+        let encoded = serde_json::to_vec(&profile).unwrap();
+        let decoded: ConnectionProfile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.transport, profile.transport);
+        assert!(decoded.validate_transport().is_ok());
+
+        profile.host = "database.example\r\nAuthorization: test".into();
+        assert!(profile.validate_transport().is_err());
+    }
+
     fn profile(id: &str) -> ConnectionProfile {
         ConnectionProfile {
             id: id.to_owned(),
@@ -1270,6 +1385,7 @@ mod tests {
             gopass_entry: None,
             tls_files: Default::default(),
             native_tools_dir: None,
+            transport: Default::default(),
         }
     }
     fn isolated(root: &std::path::Path) -> SettingsStore {

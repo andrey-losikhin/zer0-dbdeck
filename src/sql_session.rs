@@ -1221,7 +1221,7 @@ mod integration_tests {
             .unwrap();
         runtime.block_on(async {
             for (kind, port, variable) in [(DatabaseKind::PostgreSql, 55432, "DBDECK_PG_PASSWORD"), (DatabaseKind::MySql, 53306, "DBDECK_MARIADB_PASSWORD"), (DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD")] {
-                let profile = ConnectionProfile { id: "sql-session-test".into(), name: "test".into(), kind, host: "127.0.0.1".into(), port, database: "dbdeck_test".into(), username: "dbdeck_test".into(), environment: EnvironmentTag::Local, color: "#000000".into(), read_only: false, tls_mode: TlsMode::Disabled, password_saved: false, gopass_entry: None, tls_files: Default::default(), native_tools_dir: None };
+                let profile = ConnectionProfile { id: "sql-session-test".into(), name: "test".into(), kind, host: "127.0.0.1".into(), port, database: "dbdeck_test".into(), username: "dbdeck_test".into(), environment: EnvironmentTag::Local, color: "#000000".into(), read_only: false, tls_mode: TlsMode::Disabled, password_saved: false, gopass_entry: None, tls_files: Default::default(), native_tools_dir: None, transport: Default::default() };
                 let pool = DbPool::connect(&profile, &std::env::var(variable).expect("set test database password")).await.unwrap();
                 pool.execute_sql("SELECT 1").await.unwrap();
                 let first = SqlSession::new(pool.clone());
