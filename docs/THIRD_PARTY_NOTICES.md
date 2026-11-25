@@ -11,6 +11,9 @@ licenses, attribution requirements or trademark rules for third-party material.
 | Solar UI icon adaptations | [480 Design](https://www.figma.com/community/file/1166831539721848736), [Solar set](https://icon-sets.iconify.design/solar/) | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/); 480 Design attribution, adaptations recolored/resized/converted to symbolic strokes |
 | Tokyo Night palette and derived styles | [Tokyo Night](https://github.com/tokyo-night/tokyo-night-vscode-theme) | [MIT](licenses/Tokyo-Night-MIT.txt) |
 | Catppuccin palette and derived styles | [Catppuccin](https://github.com/catppuccin/catppuccin) | [MIT](licenses/Catppuccin-MIT.txt) |
+| Gruvbox Dark palette and derived styles | [Pavel Pertsev / Gruvbox](https://github.com/morhetz/gruvbox) | [MIT/X11](licenses/Gruvbox-MIT.txt) |
+| Nord palette and derived styles | [Sven Greb / Nord](https://github.com/nordtheme/nord) | [MIT](licenses/Nord-MIT.txt) |
+| Rosé Pine palette and derived styles | [mvllow / Rosé Pine palette](https://github.com/rose-pine/palette) | [MIT](licenses/Rose-Pine-MIT.txt) |
 
 Rust dependencies are resolved in `Cargo.lock` and retain their package licenses.
 GTK, libadwaita, GtkSourceView, WebKitGTK and their system dependencies retain their

@@ -13,6 +13,9 @@ This product includes third-party material under separate licenses:
   stroke-converted adaptations. Source: https://www.figma.com/community/file/1166831539721848736
 - Tokyo Night palette by enkia and contributors, MIT License.
 - Catppuccin palette by Catppuccin, MIT License.
+- Gruvbox Dark palette by Pavel Pertsev (morhetz), MIT/X11 License.
+- Nord palette by Sven Greb, MIT License.
+- Rosé Pine palette by mvllow, MIT License.
 
 See docs/THIRD_PARTY_NOTICES.md and the referenced license files.
 Product names and vendor logos remain the property of their respective owners;
