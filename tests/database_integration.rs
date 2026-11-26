@@ -1705,6 +1705,55 @@ fn transport_proxy_routes_reach_database_and_keep_derived_pool_connected() {
 }
 
 #[test]
+#[ignore = "requires a loopback SSH gateway, isolated ssh-agent, and local MySQL/MariaDB fixtures; see docs/TESTING.md"]
+fn transport_ssh_agent_reaches_mysql_and_mariadb() {
+    use settings::Transport;
+
+    let required =
+        |name: &str| std::env::var(name).unwrap_or_else(|_| panic!("{name} is required"));
+    assert!(
+        !required("SSH_AUTH_SOCK").is_empty(),
+        "SSH_AUTH_SOCK is empty"
+    );
+    let untrusted_hosts = required("DBDECK_TEST_SSH_UNTRUSTED_HOSTS");
+    let transport = Transport::Ssh {
+        host: "127.0.0.1".into(),
+        port: required("DBDECK_TEST_SSH_PORT").parse().unwrap(),
+        username: required("DBDECK_TEST_SSH_USER"),
+        identity_file: None,
+        known_hosts: Some(required("DBDECK_TEST_SSH_HOSTS").into()),
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            for (kind, port, password_key) in [
+                (DatabaseKind::MariaDb, 53306, "DBDECK_MARIADB_PASSWORD"),
+                (DatabaseKind::MySql, 53307, "DBDECK_MYSQL_PASSWORD"),
+            ] {
+                let mut profile = system_catalog_profile(kind, port, "dbdeck_test");
+                profile.transport = transport.clone();
+                let password = required(password_key);
+                let pool = DbPool::connect(&profile, &password)
+                    .await
+                    .unwrap_or_else(|error| panic!("SSH connection to fixture on {port}: {error}"));
+                pool.check()
+                    .await
+                    .unwrap_or_else(|error| panic!("Query over SSH to fixture on {port}: {error}"));
+
+                let Transport::Ssh { known_hosts, .. } = &mut profile.transport else {
+                    unreachable!();
+                };
+                *known_hosts = Some(untrusted_hosts.clone().into());
+                let error = DbPool::connect(&profile, &password).await.unwrap_err();
+                assert!(error.contains("known_hosts"), "Fixture on {port}: {error}");
+            }
+        });
+}
+
+#[test]
 #[ignore = "requires an isolated SSH gateway and TLS PostgreSQL; see docs/TESTING.md"]
 fn transport_ssh_verifies_gateway_and_database_tls() {
     use settings::Transport;

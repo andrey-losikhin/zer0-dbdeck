@@ -39,7 +39,7 @@ set -a
 set +a
 docker compose up -d
 ./tests/apply-fixtures.sh
-cargo test --locked --test database_integration -- --ignored --test-threads=1
+cargo test --locked --test database_integration -- --ignored --test-threads=1 --skip transport_ssh_
 ```
 
 | Engine | Local port | Database/user | Password variable |
@@ -105,6 +105,18 @@ untrusted host-key files as `DBDECK_TEST_SSH_PORT`, `DBDECK_TEST_SSH_USER`,
 
 ```sh
 cargo test --locked --test database_integration transport_ssh_verifies_gateway_and_database_tls -- --ignored --exact
+```
+
+To test MariaDB and MySQL through `ssh-agent`, run both local Compose fixtures and
+export their password variables from the table above. Use the same loopback SSH
+gateway and host-key files, with forwarding to `127.0.0.1:53306` and
+`127.0.0.1:53307` allowed. Configure the gateway to accept only the disposable
+test key, stored at a non-default path. The test leaves the profile key path
+empty, runs `SELECT 1` against both engines, and checks that both reject an
+untrusted gateway key.
+
+```sh
+ssh-agent sh -ec 'ssh-add "$DBDECK_TEST_SSH_KEY"; cargo test --locked --test database_integration transport_ssh_agent_reaches_mysql_and_mariadb -- --ignored --exact'
 ```
 
 The GTK check round-trips the route fields and checks the initial direct mode:
